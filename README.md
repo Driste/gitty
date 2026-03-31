@@ -121,3 +121,11 @@ clone_all_repos:
     - ./gitty init --http
     - ./gitty sync --group="tenant/images" --nested
 ```
+
+## TODO
+
+- [ ] For gitlab pipelines, use the CI_ var for the git repo
+- [ ] Async pull down repos
+- [ ] Show repos current branches and if they are out of date, maybe a cache
+- [ ] Show how many projects are in each group
+- [ ] Show the current groups/projects and which will be removed or added when doing a subsequent run
