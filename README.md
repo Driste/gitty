@@ -48,7 +48,7 @@ gitty init [flags]
 **Example:**
 ```bash
 cd ~/my-workspace
-gitty init --url="[https://gitlab.mycompany.com](https://gitlab.mycompany.com)" --http
+gitty init --url="https://gitlab.mycompany.com" --http
 ```
 This generates a `gitty.toml` file in the current directory. `gitty` will use this directory as the root destination for all future sync commands.
 
