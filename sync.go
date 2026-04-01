@@ -6,45 +6,45 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"gitlab.com/gitlab-org/api/client-go"
 )
 
-func runSync(groupPath, tokenFlag string, dryRun, doGroups, doRepos, nested bool) {
-	if groupPath == "" {
-		fmt.Println("Error: --group is a required flag for sync.")
-		os.Exit(1)
-	}
+func runSync(groupFlag, tokenFlag string, dryRun, doGroups, doRepos, nested bool) {
 
 	if !doGroups && !doRepos {
 		doRepos = true
 	}
 
-	cfg, err := LoadConfig()
+	cfg, err := LoadLocalConfig()
 	if err != nil {
-		if os.IsNotExist(err) {
-			log.Fatalf("Error: %s not found. Please run 'gitty init' in this directory.", ConfigPath)
-		}
-		log.Fatalf("Configuration error: %v", err)
+		log.Fatalf("Error: No .gitty/config found in this directory. Run 'gitty init' first.")
 	}
 
-	destDir, err := os.Getwd()
-	if err != nil {
-		log.Fatalf("Failed to get current directory: %v", err)
+	fullTarget := cfg.RootPath
+	if groupFlag != "" {
+		if fullTarget != "" {
+			fullTarget = fullTarget + "/" + groupFlag
+		} else {
+			fullTarget = groupFlag
+		}
+	}
+
+	if fullTarget == "" {
+		log.Fatal("Error: Target group path is empty. Provide --path or sync from a managed subgroup directory.")
 	}
 
 	token := tokenFlag
 	if token == "" {
-		if envToken := os.Getenv("GITLAB_TOKEN"); envToken != "" {
-			token = envToken
-		} else if ciToken := os.Getenv("CI_JOB_TOKEN"); ciToken != "" {
-			token = ciToken
+		if t := os.Getenv("GITLAB_TOKEN"); t != "" {
+			token = t
+		} else {
+			token = os.Getenv("CI_JOB_TOKEN")
 		}
 	}
-
 	if token == "" {
-		fmt.Println("Error: A token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required.")
-		os.Exit(1)
+		log.Fatal("Error: A token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required.")
 	}
 
 	client, err := gitlab.NewClient(token, gitlab.WithBaseURL(cfg.URL))
@@ -57,137 +57,175 @@ func runSync(groupPath, tokenFlag string, dryRun, doGroups, doRepos, nested bool
 	}
 
 	if doGroups {
-		fmt.Printf("\n--- Syncing Groups ---\n")
-		fmt.Printf("Fetching subgroups for group: '%s' (Nested: %t)...\n", groupPath, nested)
-
-		var allGroups []*gitlab.Group
-
-		if nested {
-			opts := &gitlab.ListDescendantGroupsOptions{
-				ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1},
-			}
-			for {
-				groups, resp, err := client.Groups.ListDescendantGroups(groupPath, opts)
-				if err != nil {
-					log.Fatalf("Failed to fetch descendant groups: %v", err)
-				}
-				allGroups = append(allGroups, groups...)
-				if resp.NextPage == 0 {
-					break
-				}
-				opts.Page = resp.NextPage
-			}
-		} else {
-			opts := &gitlab.ListSubGroupsOptions{
-				ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1},
-			}
-			for {
-				groups, resp, err := client.Groups.ListSubGroups(groupPath, opts)
-				if err != nil {
-					log.Fatalf("Failed to fetch immediate subgroups: %v", err)
-				}
-				allGroups = append(allGroups, groups...)
-				if resp.NextPage == 0 {
-					break
-				}
-				opts.Page = resp.NextPage
-			}
-		}
-
-		rootGroup, _, err := client.Groups.GetGroup(groupPath, nil)
-		if err == nil && rootGroup != nil {
-			allGroups = append([]*gitlab.Group{rootGroup}, allGroups...)
-		}
-
-		fmt.Printf("Found %d groups. Creating directories in %s...\n", len(allGroups), destDir)
-
-		for _, g := range allGroups {
-			groupDest := filepath.Join(destDir, g.FullPath)
-			if dryRun {
-				fmt.Printf("  -> [DRY RUN] Would create directory: %s\n", groupDest)
-			} else {
-				if err := os.MkdirAll(groupDest, 0755); err != nil {
-					fmt.Printf("  -> Error creating directory %s: %v\n", g.FullPath, err)
-				} else {
-					fmt.Printf("  -> Ensured directory exists: %s\n", groupDest)
-				}
-			}
-		}
-		fmt.Println("Finished group directories sync!")
+		syncGroups(client, fullTarget, cfg, dryRun, nested)
 	}
-
 	if doRepos {
-		fmt.Printf("\n--- Syncing Repositories ---\n")
-		fmt.Printf("Fetching projects for group: '%s' (Nested: %t)...\n", groupPath, nested)
+		syncRepos(client, fullTarget, cfg, dryRun, nested)
+	}
+}
 
-		var allProjects []*gitlab.Project
+// syncGroups fetches subgroups and creates directories with their own .gitty/configs
+func syncGroups(client *gitlab.Client, target string, cfg *Config, dryRun, nested bool) {
+	fmt.Printf("\n--- Syncing Groups ---\n")
+	fmt.Printf("Fetching subgroups for: '%s' (Nested: %t)...\n", target, nested)
 
-		opts := &gitlab.ListGroupProjectsOptions{
-			IncludeSubGroups: &nested,
-			ListOptions: gitlab.ListOptions{
-				PerPage: 100,
-				Page:    1,
-			},
+	var allGroups []*gitlab.Group
+
+	if nested {
+		opts := &gitlab.ListDescendantGroupsOptions{
+			ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1},
 		}
-
 		for {
-			projects, resp, err := client.Groups.ListGroupProjects(groupPath, opts)
+			groups, resp, err := client.Groups.ListDescendantGroups(target, opts)
 			if err != nil {
-				log.Fatalf("Failed to fetch group projects: %v", err)
+				log.Fatalf("Failed to fetch descendant groups: %v", err)
 			}
-			allProjects = append(allProjects, projects...)
-
+			allGroups = append(allGroups, groups...)
 			if resp.NextPage == 0 {
 				break
 			}
 			opts.Page = resp.NextPage
 		}
+	} else {
+		opts := &gitlab.ListSubGroupsOptions{
+			ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1},
+		}
+		for {
+			groups, resp, err := client.Groups.ListSubGroups(target, opts)
+			if err != nil {
+				log.Fatalf("Failed to fetch immediate subgroups: %v", err)
+			}
+			allGroups = append(allGroups, groups...)
+			if resp.NextPage == 0 {
+				break
+			}
+			opts.Page = resp.NextPage
+		}
+	}
 
-		fmt.Printf("Found %d projects. Starting clone/pull process in %s...\n", len(allProjects), destDir)
+	rootGroup, _, err := client.Groups.GetGroup(target, nil)
+	if err == nil && rootGroup != nil {
+		allGroups = append([]*gitlab.Group{rootGroup}, allGroups...)
+	}
 
-		for _, p := range allProjects {
-			cloneURL := p.SSHURLToRepo
-			if cfg.HTTP {
-				cloneURL = p.HTTPURLToRepo
+	fmt.Printf("Found %d groups to sync.\n", len(allGroups))
+
+	for _, g := range allGroups {
+		relPath := getLocalRelPath(g.FullPath, cfg.RootPath)
+		groupDest := filepath.Join(".", relPath)
+
+		if dryRun {
+			fmt.Printf("  -> [DRY RUN] Would create group and config for: %s\n", g.FullPath)
+		} else {
+			if err := os.MkdirAll(groupDest, 0755); err != nil {
+				fmt.Printf("  -> Error creating directory %s: %v\n", groupDest, err)
+				continue
 			}
 
-			repoDest := filepath.Join(destDir, p.PathWithNamespace)
-			fmt.Printf("\nProcessing %s...\n", p.PathWithNamespace)
-
-			if _, err := os.Stat(repoDest); !os.IsNotExist(err) {
-				if dryRun {
-					fmt.Printf("  -> [DRY RUN] Would execute 'git pull' in %s\n", repoDest)
-				} else {
-					fmt.Printf("  -> Directory exists. Attempting 'git pull'\n")
-					cmd := exec.Command("git", "pull")
-					cmd.Dir = repoDest
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
-					if err := cmd.Run(); err != nil {
-						fmt.Printf("  -> Error pulling %s: %v\n", p.Name, err)
-					}
-				}
+			subCfg := &Config{
+				URL:      cfg.URL,
+				HTTP:     cfg.HTTP,
+				RootPath: g.FullPath,
+			}
+			
+			if err := SaveConfigTo(groupDest, subCfg); err != nil {
+				fmt.Printf("  -> Error saving config to %s: %v\n", groupDest, err)
 			} else {
-				if dryRun {
-					fmt.Printf("  -> [DRY RUN] Would create dirs and clone %s to %s\n", cloneURL, repoDest)
-				} else {
-					fmt.Printf("  -> Cloning %s\n", cloneURL)
-
-					parentDir := filepath.Dir(repoDest)
-					if err := os.MkdirAll(parentDir, 0755); err != nil {
-						fmt.Printf("  -> Error creating parent directories: %v\n", err)
-						continue
-					}
-
-					cmd := exec.Command("git", "clone", cloneURL, repoDest)
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
-					if err := cmd.Run(); err != nil {
-						fmt.Printf("  -> Error cloning %s: %v\n", p.Name, err)
-					}
-				}
+				fmt.Printf("  -> Ensured context for: %s\n", g.FullPath)
 			}
 		}
-		fmt.Println("\nFinished repository sync!")
 	}
+	fmt.Println("Finished group directory sync!")
+}
+
+// syncRepos fetches projects and clones or pulls them
+func syncRepos(client *gitlab.Client, target string, cfg *Config, dryRun, nested bool) {
+	fmt.Printf("\n--- Syncing Repositories ---\n")
+	fmt.Printf("Fetching projects for: '%s' (Nested: %t)...\n", target, nested)
+
+	var allProjects []*gitlab.Project
+
+	opts := &gitlab.ListGroupProjectsOptions{
+		IncludeSubGroups: &nested,
+		ListOptions: gitlab.ListOptions{
+			PerPage: 100,
+			Page:    1,
+		},
+	}
+
+	for {
+		projects, resp, err := client.Groups.ListGroupProjects(target, opts)
+		if err != nil {
+			log.Fatalf("Failed to fetch group projects: %v", err)
+		}
+		allProjects = append(allProjects, projects...)
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	fmt.Printf("Found %d projects.\n", len(allProjects))
+
+	for _, p := range allProjects {
+		cloneURL := p.SSHURLToRepo
+		if cfg.HTTP {
+			cloneURL = p.HTTPURLToRepo
+		}
+
+		// Calculate destination relative to where we ran the command
+		relPath := getLocalRelPath(p.PathWithNamespace, cfg.RootPath)
+		repoDest := filepath.Join(".", relPath)
+
+		fmt.Printf("\nProcessing %s...\n", p.PathWithNamespace)
+
+		if _, err := os.Stat(repoDest); !os.IsNotExist(err) {
+			if dryRun {
+				fmt.Printf("  -> [DRY RUN] Would execute 'git pull' in %s\n", repoDest)
+			} else {
+				fmt.Printf("  -> Directory exists. Attempting 'git pull'\n")
+				runGit(repoDest, "pull")
+			}
+		} else {
+			if dryRun {
+				fmt.Printf("  -> [DRY RUN] Would clone %s to %s\n", cloneURL, repoDest)
+			} else {
+				fmt.Printf("  -> Cloning %s\n", cloneURL)
+
+				parentDir := filepath.Dir(repoDest)
+				if err := os.MkdirAll(parentDir, 0755); err != nil {
+					fmt.Printf("  -> Error creating parent directories: %v\n", err)
+					continue
+				}
+
+				runGit(".", "clone", cloneURL, repoDest)
+			}
+		}
+	}
+	fmt.Println("\nFinished repository sync!")
+}
+
+// runGit executes a git command ensuring the user's environment is preserved
+func runGit(dir string, args ...string) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ() // Preserves SSH_AUTH_SOCK, global ~/.gitconfig, etc.
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("  -> Git execution error: %v\n", err)
+	}
+}
+
+// getLocalRelPath strips the local context's RootPath from the GitLab API path
+// so that folders are built correctly relative to the current directory.
+func getLocalRelPath(apiFullPath, configRoot string) string {
+	if configRoot == "" {
+		return apiFullPath
+	}
+	
+	rel := strings.TrimPrefix(apiFullPath, configRoot)
+	rel = strings.TrimPrefix(rel, "/")
+	return rel
 }

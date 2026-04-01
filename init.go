@@ -7,21 +7,17 @@ import (
 )
 
 func runInit(url string, useHTTP bool) {
-	if _, err := os.Stat(ConfigPath); err == nil {
-		fmt.Printf("Error: gitty is already initialized in this directory (%s exists).\n", ConfigPath)
-		os.Exit(1)
-	}
-
+	wd, _ := os.Getwd()
 	cfg := &Config{
-		URL:  url,
-		HTTP: useHTTP,
+		URL:      url,
+		HTTP:     useHTTP,
+		RootPath: "", // The base of your workspace
 	}
 
-	if err := SaveConfig(cfg); err != nil {
-		log.Fatalf("Failed to initialize gitty: %v", err)
+	if err := SaveConfigTo(wd, cfg); err != nil {
+		log.Fatalf("Failed to initialize: %v", err)
 	}
 
-	fmt.Printf("Successfully initialized gitty in %s\n", ConfigPath)
-	fmt.Printf("URL: %s\nHTTP: %t\n", cfg.URL, cfg.HTTP)
-	fmt.Println("You can now run 'gitty sync --group=<path>' to pull down repositories.")
+	fmt.Printf("Initialized gitty root at %s\n", wd)
+	fmt.Println("You can now run 'gitty sync --path=<path>' to pull down repositories.")
 }

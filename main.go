@@ -17,7 +17,7 @@ func main() {
 	initHTTP := initCmd.Bool("http", false, "Use HTTP(S) for cloning instead of SSH")
 
 	syncCmd := flag.NewFlagSet("sync", flag.ExitOnError)
-	syncGroup := syncCmd.String("group", "", "GitLab Group Path (e.g., tenant/images) (required)")
+	syncPath := syncCmd.String("path", "", "GitLab Group Path (e.g., tenant/images) (required)")
 	syncToken := syncCmd.String("token", "", "GitLab Access Token (falls back to env vars)")
 	syncDryRun := syncCmd.Bool("dry-run", false, "Print what would happen without actually making changes")
 	syncGroups := syncCmd.Bool("groups", false, "Fetch and create group/subgroup directory structures")
@@ -30,7 +30,7 @@ func main() {
 		runInit(*initURL, *initHTTP)
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
-		runSync(*syncGroup, *syncToken, *syncDryRun, *syncGroups, *syncRepos, *syncNested)
+		runSync(*syncPath, *syncToken, *syncDryRun, *syncGroups, *syncRepos, *syncNested)
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		printUsage()

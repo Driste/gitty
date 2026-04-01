@@ -59,13 +59,13 @@ This generates a `gitty.toml` file in the current directory. `gitty` will use th
 Once your workspace is initialized, you can pull down your groups and repositories. 
 
 ```bash
-gitty sync --group="your/gitlab/group/path" [flags]
+gitty sync --path="your/gitlab/group/path" [flags]
 ```
 
 ### Sync Flags
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--group` | `""` | **(Required)** The GitLab group or subgroup path (e.g., `tenant/images`). |
+| `--path` | `""` | **(Required)** The GitLab group or subgroup path (e.g., `tenant/images`). |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
 | `--repos` | `false` | Only fetch and clone/pull repositories. *(Note: If neither `--groups` nor `--repos` is passed, it defaults to `--repos`)*. |
@@ -73,9 +73,9 @@ gitty sync --group="your/gitlab/group/path" [flags]
 | `--dry-run`| `false` | Print what would happen without creating directories or executing git commands. |
 
 ### How `--groups` and `--repos` work together:
-* `gitty sync --group="tenant"`: Syncs **only** the immediate repositories inside `tenant`.
-* `gitty sync --group="tenant" --groups`: Creates **only** the empty directory structure for the `tenant` group and its immediate subgroups.
-* `gitty sync --group="tenant" --groups --repos`: Creates the empty directory structure for subgroups, **and** syncs the immediate repositories.
+* `gitty sync --path="tenant"`: Syncs **only** the immediate repositories inside `tenant`.
+* `gitty sync --path="tenant" --groups`: Creates **only** the empty directory structure for the `tenant` group and its immediate subgroups.
+* `gitty sync --path="tenant" --groups --repos`: Creates the empty directory structure for subgroups, **and** syncs the immediate repositories.
 
 ---
 
@@ -86,25 +86,25 @@ Sync all repositories directly inside `tenant/images` (does not pull repos insid
 ```bash
 export GITLAB_TOKEN="glpat-YOUR_PERSONAL_TOKEN"
 
-gitty sync --group="tenant/images"
+gitty sync --path="tenant/images"
 ```
 
 ### 2. Full Recursive Sync (Nested)
 Sync **everything** (all repositories in the group and all repositories in every subgroup beneath it).
 ```bash
-gitty sync --group="tenant/images" --nested
+gitty sync --path="tenant/images" --nested
 ```
 
 ### 3. Recreate Group Hierarchy
 Only create the folder structure for all subgroups beneath `engineering`, leaving them empty.
 ```bash
-gitty sync --group="engineering" --groups --nested
+gitty sync --path="engineering" --groups --nested
 ```
 
 ### 4. Dry Run
 Safely check what repositories would be downloaded recursively before actually doing it.
 ```bash
-gitty sync --group="tenant/images" --nested --dry-run
+gitty sync --path="tenant/images" --nested --dry-run
 ```
 
 ### 5. GitLab CI/CD Pipeline
@@ -119,11 +119,12 @@ clone_all_repos:
   script:
     - go build -o gitty main.go
     - ./gitty init --http
-    - ./gitty sync --group="tenant/images" --nested
+    - ./gitty sync --path="tenant/images" --nested
 ```
 
 ## TODO
 
+- [x] Add a gitty config to each group so that you can go into them and pull from that path
 - [ ] For gitlab pipelines, use the CI_ var for the git repo
 - [ ] Async pull down repos
 - [ ] Show repos current branches and if they are out of date, maybe a cache

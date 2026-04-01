@@ -1,45 +1,49 @@
 package main
 
 import (
-	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/pelletier/go-toml/v2"
 )
 
 const (
 	ConfigDir  = ".gitty"
-	ConfigPath = ".gitty/config"
+	ConfigName = "config"
 )
 
 type Config struct {
-	URL  string `toml:"url"`
-	HTTP bool   `toml:"http"`
+	URL      string `toml:"url"`
+	HTTP     bool   `toml:"http"`
+	RootPath string `toml:"root_path"`
 }
 
-func LoadConfig() (*Config, error) {
-	data, err := os.ReadFile(ConfigPath)
+// LoadLocalConfig only looks in the IMMEDIATE current directory for .gitty/config
+func LoadLocalConfig() (*Config, error) {
+	curr, _ := os.Getwd()
+	path := filepath.Join(curr, ConfigDir, ConfigName)
+	
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
 	var cfg Config
 	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse %s: %w", ConfigPath, err)
+		return nil, err
 	}
-
 	return &cfg, nil
 }
 
-func SaveConfig(cfg *Config) error {
-	if err := os.MkdirAll(ConfigDir, 0755); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
+// SaveConfigTo writes the config and creates the .gitty folder
+func SaveConfigTo(dir string, cfg *Config) error {
+	confDir := filepath.Join(dir, ConfigDir)
+	if err := os.MkdirAll(confDir, 0755); err != nil {
+		return err
 	}
-
 	data, err := toml.Marshal(cfg)
 	if err != nil {
-		return fmt.Errorf("failed to generate TOML: %w", err)
+		return err
 	}
-
-	return os.WriteFile(ConfigPath, data, 0644)
+	return os.WriteFile(filepath.Join(confDir, ConfigName), data, 0644)
 }
