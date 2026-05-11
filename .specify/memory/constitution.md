@@ -1,34 +1,39 @@
 <!--
 SYNC IMPACT REPORT
 ==================
-Version change: (uninitialized template) → 1.0.0
-Bump rationale: First ratified constitution; baseline principles established.
+Version change: 1.0.0 → 1.0.1
+Bump rationale: PATCH — wording correction in Principle III. The workspace
+config file is `.gitty/config` (a TOML file inside a `.gitty/` directory),
+matching the code that has shipped since the project's initial commit.
+Earlier text named it `gitty.toml`, which never existed on disk. No
+semantic changes; principle scope, governance, and quality gates are
+unchanged.
 
 Modified principles:
-  - (none — initial ratification)
+  - III. Config-Anchored Workspaces — every `gitty.toml` reference replaced
+    with `.gitty/config`. No change in meaning.
 
 Added sections:
-  - Core Principles
-    - I. CLI-First UX & Safe-by-Default Sync
-    - II. Minimal Dependencies & Structured Observability
-    - III. Config-Anchored Workspaces
-  - Additional Constraints
-  - Development Workflow & Quality Gates
-  - Governance
+  - (none)
 
 Removed sections:
   - (none)
 
 Templates requiring updates:
-  - ✅ .specify/templates/plan-template.md  (Constitution Check is a dynamic gate referencing this file; aligned)
-  - ✅ .specify/templates/spec-template.md  (no constitution-mandated section conflicts)
-  - ✅ .specify/templates/tasks-template.md (no principle-driven task categories require change)
-  - ✅ .specify/templates/checklist-template.md (no conflicts)
-  - ✅ README.md (already documents config-first design + dry-run UX consistent with principles)
-  - ✅ CLAUDE.md (delegates to current plan; no constitution references to update)
+  - ✅ .specify/templates/plan-template.md  (no references to the file name)
+  - ✅ .specify/templates/spec-template.md  (no references)
+  - ✅ .specify/templates/tasks-template.md (no references)
+  - ✅ .specify/templates/checklist-template.md (no references)
+  - ✅ README.md (updated in feature 001-arch-cleanup to use .gitty/config)
+  - ✅ CLAUDE.md (delegates to current plan; no constitution references)
 
 Follow-up TODOs:
   - (none)
+
+Prior history:
+  - 1.0.0 (2026-03-31, ratified): First ratified constitution. Principles
+    I/II/III established along with Additional Constraints, Development
+    Workflow & Quality Gates, and Governance.
 -->
 
 # Gitty Constitution
@@ -76,14 +81,15 @@ what happened from terminal logs alone — there is no dashboard.
 
 ### III. Config-Anchored Workspaces
 
-`gitty.toml` is the source of truth for a workspace. Flags override config for a single
-invocation but MUST NOT silently mutate it.
+`.gitty/config` (a TOML file inside a `.gitty/` directory at the workspace root) is
+the source of truth for a workspace. Flags override config for a single invocation
+but MUST NOT silently mutate it.
 
-- Every sync command MUST resolve its workspace root by locating `gitty.toml`; running
-  outside an initialized workspace MUST fail with a clear remediation message
-  pointing to `gitty init`.
+- Every sync command MUST resolve its workspace root by locating `.gitty/config`;
+  running outside an initialized workspace MUST fail with a clear remediation
+  message pointing to `gitty init`.
 - Flags such as `--url` and `--http` override the config for the current run only.
-  Persisting a new value to `gitty.toml` requires an explicit `init`-class command.
+  Persisting a new value to `.gitty/config` requires an explicit `init`-class command.
 - The on-disk directory layout MUST mirror the GitLab namespace path exactly. Renaming,
   flattening, or de-duplicating namespaces is forbidden — namespace collisions are
   prevented by preserving the full path.
@@ -159,4 +165,4 @@ proposed change, the principle wins unless the constitution is amended first.
   I and III. `CLAUDE.md` delegates to the active plan in `specs/` for feature-specific
   context.
 
-**Version**: 1.0.0 | **Ratified**: 2026-03-31 | **Last Amended**: 2026-05-09
+**Version**: 1.0.1 | **Ratified**: 2026-03-31 | **Last Amended**: 2026-05-09

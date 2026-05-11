@@ -2,7 +2,7 @@
 
 A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, subgroups, and repositories directly to your local machine.
 
-`gitty` uses a local `gitty.toml` configuration file to anchor your workspace, preserving the exact namespace directory structure of your GitLab environment to prevent naming collisions.
+`gitty` uses a local `.gitty/config` file (TOML, written into a `.gitty/` directory) to anchor your workspace, preserving the exact namespace directory structure of your GitLab environment to prevent naming collisions.
 
 ## Features
 * **Workspace Config**: Initialize a workspace with `gitty init` so you don't have to repeatedly pass your GitLab URL or SSH/HTTP preferences.
@@ -50,7 +50,27 @@ gitty init [flags]
 cd ~/my-workspace
 gitty init --url="https://gitlab.mycompany.com" --http
 ```
-This generates a `gitty.toml` file in the current directory. `gitty` will use this directory as the root destination for all future sync commands.
+This generates a `.gitty/config` file inside a `.gitty/` directory in the current directory. `gitty` will use this directory as the root destination for all future sync commands.
+
+---
+
+## Architecture
+
+`gitty`'s code is organized so each user-visible behavior lives in exactly one place:
+
+```text
+gitty/
+├── main.go                 # 5 lines. Calls cli.Main.
+└── internal/
+    ├── cli/                # Parse argv, dispatch subcommands, wire streams.
+    ├── config/             # Read/write .gitty/config.
+    ├── gitlabapi/          # GitLab REST surface; returns plain Group/Project structs.
+    ├── paths/              # Pure namespace-path → local-directory resolution.
+    ├── gitexec/            # Single replaceable surface for invoking `git`.
+    └── sync/               # Orchestration; the only package that depends on multiple internal packages.
+```
+
+See [`specs/001-arch-cleanup/quickstart.md`](specs/001-arch-cleanup/quickstart.md) for a five-minute contributor tour, including a "where do I look for X?" index and the stream conventions (stdout = plan output, stderr = progress/errors).
 
 ---
 
