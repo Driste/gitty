@@ -4,23 +4,34 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"gitty/internal/gitlabapi"
 )
 
 // Main is the testable entrypoint. main() calls
 // os.Exit(cli.Main(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)).
+//
+// The context used for sync invocations listens for SIGINT and SIGTERM via
+// signal.NotifyContext, so Ctrl-C cancels in-flight git children and exits
+// the process cleanly (FR-009). Tests use the mainWithDeps seam to inject
+// their own context.
 func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	return mainWithDeps(args, stdin, stdout, stderr, os.Getenv, gitlabapi.NewReal, defaultRunnerCtor)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return mainWithDeps(ctx, args, stdin, stdout, stderr, os.Getenv, gitlabapi.NewReal, defaultRunnerCtor)
 }
 
-// mainWithDeps is the test seam. It accepts injectable constructors for the
-// GitLab client and the git runner so tests can drive the full dispatch
-// flow with fakes.
+// mainWithDeps is the test seam. It accepts an explicit context plus
+// injectable constructors for the GitLab client and the git runner so tests
+// can drive the full dispatch flow with fakes and cancellable contexts.
 func mainWithDeps(
+	ctx context.Context,
 	args []string,
 	stdin io.Reader,
 	stdout, stderr io.Writer,
@@ -41,7 +52,7 @@ func mainWithDeps(
 		}
 		return code
 	case "sync":
-		code, err := runSync(args[1:], stdout, stderr, env, newClient, newRunner)
+		code, err := runSync(ctx, args[1:], stdout, stderr, env, newClient, newRunner)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 		}

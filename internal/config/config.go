@@ -1,8 +1,9 @@
 // Package config persists Gitty workspace configuration on disk.
 //
 // A workspace is anchored by a TOML file at <workspaceDir>/.gitty/config
-// holding the GitLab base URL, the SSH-vs-HTTP preference, and the
-// GitLab namespace path the directory is bound to.
+// holding the GitLab base URL, the SSH-vs-HTTP preference, the GitLab
+// namespace path the directory is bound to, and the default concurrency
+// for `gitty sync`.
 package config
 
 import (
@@ -18,6 +19,9 @@ const (
 	Dir = ".gitty"
 	// File is the config filename inside Dir; full path is <workspace>/.gitty/config.
 	File = "config"
+	// DefaultJobs is the default concurrency for `gitty sync` when the
+	// jobs field is missing or non-positive in .gitty/config.
+	DefaultJobs = 4
 )
 
 // Config is the on-disk workspace config.
@@ -25,6 +29,7 @@ type Config struct {
 	URL      string `toml:"url"`
 	HTTP     bool   `toml:"http"`
 	RootPath string `toml:"root_path"`
+	Jobs     int    `toml:"jobs"`
 }
 
 // Load reads <workspaceDir>/.gitty/config and returns its parsed Config.
@@ -33,6 +38,10 @@ type Config struct {
 // the substring "no .gitty/config" and a hint to run `gitty init`. Other
 // errors (unreadable file, malformed TOML, missing required URL) are wrapped
 // with the file path so the caller can surface them verbatim.
+//
+// Jobs is normalized post-Unmarshal: a value <= 0 (including the Go zero
+// value, which is what toml.Unmarshal produces when the key is absent) is
+// rewritten to DefaultJobs. Callers never see a non-positive Jobs.
 func Load(workspaceDir string) (*Config, error) {
 	path := filepath.Join(workspaceDir, Dir, File)
 	data, err := os.ReadFile(path)
@@ -48,6 +57,9 @@ func Load(workspaceDir string) (*Config, error) {
 	}
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("invalid .gitty/config in %s: url is required", workspaceDir)
+	}
+	if cfg.Jobs <= 0 {
+		cfg.Jobs = DefaultJobs
 	}
 	return &cfg, nil
 }

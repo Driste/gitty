@@ -1,12 +1,17 @@
 package gitexec
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // fakeRunner satisfies Runner without invoking the git binary. It records
-// every Run call into Calls so tests can assert ordering and arguments.
+// every Run call into Calls so tests can assert ordering and arguments,
+// and returns whatever Stderr/Err the test author configured.
 type fakeRunner struct {
-	Calls []FakeCall
-	Err   error
+	Calls  []FakeCall
+	Stderr []byte
+	Err    error
 }
 
 type FakeCall struct {
@@ -14,23 +19,31 @@ type FakeCall struct {
 	Args []string
 }
 
-func (f *fakeRunner) Run(dir string, args ...string) error {
+func (f *fakeRunner) Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	f.Calls = append(f.Calls, FakeCall{Dir: dir, Args: append([]string{}, args...)})
-	return f.Err
+	return f.Stderr, f.Err
 }
 
-// TestRunnerInterfaceContract proves that any code accepting Runner can be
-// driven by a hand-written fake — no `git` binary required. This is the
-// executable example future contributors copy when adding tests for code
-// paths that invoke git.
+// TestRunnerInterfaceContract proves any code accepting Runner can be
+// driven by a hand-written fake — no `git` binary required.
 func TestRunnerInterfaceContract(t *testing.T) {
-	var r Runner = &fakeRunner{}
+	var r Runner = &fakeRunner{Stderr: []byte("fatal: nope\n")}
+	ctx := context.Background()
 
-	if err := r.Run("/some/dir", "clone", "git@host:foo.git", "foo"); err != nil {
+	stderr, err := r.Run(ctx, "/some/dir", "clone", "git@host:foo.git", "foo")
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if err := r.Run("/some/dir/foo", "pull"); err != nil {
+	if string(stderr) != "fatal: nope\n" {
+		t.Errorf("stderr passthrough wrong: %q", stderr)
+	}
+
+	stderr, err = r.Run(ctx, "/some/dir/foo", "pull")
+	if err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+	if string(stderr) != "fatal: nope\n" {
+		t.Errorf("stderr passthrough wrong: %q", stderr)
 	}
 
 	fr := r.(*fakeRunner)

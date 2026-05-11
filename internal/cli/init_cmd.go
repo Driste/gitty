@@ -22,7 +22,7 @@ func runInit(args []string, stdout, stderr io.Writer) (int, error) {
 	if err != nil {
 		return 1, fmt.Errorf("getwd: %w", err)
 	}
-	cfg := &config.Config{URL: *url, HTTP: *useHTTP, RootPath: ""}
+	cfg := &config.Config{URL: *url, HTTP: *useHTTP, RootPath: "", Jobs: config.DefaultJobs}
 	if err := config.Save(wd, cfg); err != nil {
 		return 1, fmt.Errorf("Failed to initialize: %w", err)
 	}

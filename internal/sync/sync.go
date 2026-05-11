@@ -13,6 +13,7 @@
 package sync
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,9 @@ import (
 )
 
 // Request is the parsed CLI input that drives one sync invocation.
+//
+// Jobs is the resolved effective concurrency, already validated and clamped
+// to [1, 64] by the cli package. Sync itself does no further validation.
 type Request struct {
 	GroupFlag string
 	Token     string
@@ -33,6 +37,7 @@ type Request struct {
 	DoGroups  bool
 	DoRepos   bool
 	Nested    bool
+	Jobs      int
 }
 
 // Deps is the set of injectable collaborators Sync needs. The cli package
@@ -50,8 +55,8 @@ type Deps struct {
 // Sync executes one `gitty sync` invocation given an already-loaded Config.
 // Stream destinations follow Constitution Principle I (FR-010): the
 // `--dry-run` plan goes to deps.Stdout; banners, progress, and errors go
-// to deps.Stderr.
-func Sync(req Request, cfg *config.Config, deps Deps) error {
+// to deps.Stderr. The provided context cancels in-flight git children.
+func Sync(ctx context.Context, req Request, cfg *config.Config, deps Deps) error {
 	target := composeTarget(cfg.RootPath, req.GroupFlag)
 	if target == "" {
 		return errors.New("Error: Target group path is empty. Provide --path or sync from a managed subgroup directory.")
@@ -62,14 +67,17 @@ func Sync(req Request, cfg *config.Config, deps Deps) error {
 	}
 
 	if req.DoGroups {
-		if err := syncGroupsSection(req, cfg, target, deps); err != nil {
+		if err := syncGroupsSection(ctx, req, cfg, target, deps); err != nil {
 			return err
 		}
 	}
 	if req.DoRepos {
-		if err := syncReposSection(req, cfg, target, deps); err != nil {
+		if err := syncReposSection(ctx, req, cfg, target, deps); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -91,7 +99,7 @@ func composeTarget(rootPath, groupFlag string) string {
 	return rootPath + "/" + groupFlag
 }
 
-func syncGroupsSection(req Request, cfg *config.Config, target string, deps Deps) error {
+func syncGroupsSection(ctx context.Context, req Request, cfg *config.Config, target string, deps Deps) error {
 	fmt.Fprintf(deps.Stderr, "\n--- Syncing Groups ---\n")
 	fmt.Fprintf(deps.Stderr, "Fetching subgroups for: '%s' (Nested: %t)...\n", target, req.Nested)
 
@@ -123,7 +131,7 @@ func syncGroupsSection(req Request, cfg *config.Config, target string, deps Deps
 			fmt.Fprintf(deps.Stderr, "  -> Error creating directory %s: %v\n", local, err)
 			continue
 		}
-		sub := &config.Config{URL: cfg.URL, HTTP: cfg.HTTP, RootPath: g.FullPath}
+		sub := &config.Config{URL: cfg.URL, HTTP: cfg.HTTP, RootPath: g.FullPath, Jobs: cfg.Jobs}
 		if err := config.Save(local, sub); err != nil {
 			fmt.Fprintf(deps.Stderr, "  -> Error saving config to %s: %v\n", local, err)
 		} else {
@@ -134,7 +142,7 @@ func syncGroupsSection(req Request, cfg *config.Config, target string, deps Deps
 	return nil
 }
 
-func syncReposSection(req Request, cfg *config.Config, target string, deps Deps) error {
+func syncReposSection(ctx context.Context, req Request, cfg *config.Config, target string, deps Deps) error {
 	fmt.Fprintf(deps.Stderr, "\n--- Syncing Repositories ---\n")
 	fmt.Fprintf(deps.Stderr, "Fetching projects for: '%s' (Nested: %t)...\n", target, req.Nested)
 
@@ -144,6 +152,29 @@ func syncReposSection(req Request, cfg *config.Config, target string, deps Deps)
 	}
 	fmt.Fprintf(deps.Stderr, "Found %d projects.\n", len(projects))
 
+	if req.DryRun {
+		for _, prj := range projects {
+			url := prj.SSHURLToRepo
+			if cfg.HTTP {
+				url = prj.HTTPURLToRepo
+			}
+			if url == "" {
+				fmt.Fprintf(deps.Stderr, "  -> Skipping %s: clone URL is empty\n", prj.PathWithNamespace)
+				continue
+			}
+			local := filepath.Join(".", paths.Local(prj.PathWithNamespace, cfg.RootPath))
+			if deps.Exists(local) {
+				fmt.Fprintf(deps.Stdout, "  -> [DRY RUN] Would execute 'git pull' in %s\n", local)
+			} else {
+				fmt.Fprintf(deps.Stdout, "  -> [DRY RUN] Would clone %s to %s\n", url, local)
+			}
+		}
+		fmt.Fprintln(deps.Stderr, "\nFinished repository sync!")
+		return nil
+	}
+
+	// Build the job list, filtering empty-URL projects (defense from 001).
+	jobs := make([]Job, 0, len(projects))
 	for _, prj := range projects {
 		url := prj.SSHURLToRepo
 		if cfg.HTTP {
@@ -154,34 +185,27 @@ func syncReposSection(req Request, cfg *config.Config, target string, deps Deps)
 			continue
 		}
 		local := filepath.Join(".", paths.Local(prj.PathWithNamespace, cfg.RootPath))
+		jobs = append(jobs, Job{
+			NamespacePath: prj.PathWithNamespace,
+			LocalDir:      local,
+			CloneURL:      url,
+			Exists:        deps.Exists(local),
+		})
+	}
 
-		fmt.Fprintf(deps.Stderr, "\nProcessing %s...\n", prj.PathWithNamespace)
+	effectiveJobs := req.Jobs
+	if effectiveJobs < 1 {
+		effectiveJobs = 1
+	}
 
-		if deps.Exists(local) {
-			if req.DryRun {
-				fmt.Fprintf(deps.Stdout, "  -> [DRY RUN] Would execute 'git pull' in %s\n", local)
-			} else {
-				fmt.Fprintln(deps.Stderr, "  -> Directory exists. Attempting 'git pull'")
-				if err := deps.Runner.Run(local, "pull"); err != nil {
-					fmt.Fprintf(deps.Stderr, "  -> Git execution error: %v\n", err)
-				}
-			}
-		} else {
-			if req.DryRun {
-				fmt.Fprintf(deps.Stdout, "  -> [DRY RUN] Would clone %s to %s\n", url, local)
-			} else {
-				fmt.Fprintf(deps.Stderr, "  -> Cloning %s\n", url)
-				parent := filepath.Dir(local)
-				if err := os.MkdirAll(parent, 0755); err != nil {
-					fmt.Fprintf(deps.Stderr, "  -> Error creating parent directories: %v\n", err)
-					continue
-				}
-				if err := deps.Runner.Run(".", "clone", url, local); err != nil {
-					fmt.Fprintf(deps.Stderr, "  -> Git execution error: %v\n", err)
-				}
-			}
+	pool := newPool(ctx, deps.Runner, deps.Stderr, effectiveJobs)
+	for _, job := range jobs {
+		if err := pool.Submit(job); err != nil {
+			break // context cancelled; stop dispatching
 		}
 	}
+	poolErr := pool.Wait()
+
 	fmt.Fprintln(deps.Stderr, "\nFinished repository sync!")
-	return nil
+	return poolErr
 }

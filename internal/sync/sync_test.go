@@ -2,9 +2,11 @@ package sync
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"gitty/internal/config"
@@ -39,12 +41,25 @@ type fakeRunCall struct {
 }
 
 type fakeRunner struct {
-	calls []fakeRunCall
+	mu     sync.Mutex
+	calls  []fakeRunCall
+	stderr []byte
+	err    error
 }
 
-func (f *fakeRunner) Run(dir string, args ...string) error {
+func (f *fakeRunner) Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, fakeRunCall{dir: dir, args: append([]string{}, args...)})
-	return nil
+	return f.stderr, f.err
+}
+
+func (f *fakeRunner) snapshot() []fakeRunCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]fakeRunCall, len(f.calls))
+	copy(out, f.calls)
+	return out
 }
 
 // --- Tests ---
@@ -99,7 +114,7 @@ func TestSync_DoGroupsAndRepos(t *testing.T) {
 	runner := &fakeRunner{}
 	var stdout, stderr bytes.Buffer
 
-	cfg := &config.Config{URL: "https://example.com", HTTP: false, RootPath: "tenant"}
+	cfg := &config.Config{URL: "https://example.com", HTTP: false, RootPath: "tenant", Jobs: 1}
 	deps := Deps{
 		Client: c,
 		Runner: runner,
@@ -107,9 +122,9 @@ func TestSync_DoGroupsAndRepos(t *testing.T) {
 		Stderr: &stderr,
 		Exists: func(string) bool { return false }, // every project missing → clone
 	}
-	req := Request{DoGroups: true, DoRepos: true}
+	req := Request{DoGroups: true, DoRepos: true, Jobs: 1}
 
-	if err := Sync(req, cfg, deps); err != nil {
+	if err := Sync(context.Background(), req, cfg, deps); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
 
@@ -122,11 +137,13 @@ func TestSync_DoGroupsAndRepos(t *testing.T) {
 	}
 
 	// Repo materialization: two clone invocations recorded.
-	if len(runner.calls) != 2 {
-		t.Fatalf("expected 2 git invocations, got %d: %+v", len(runner.calls), runner.calls)
+	calls := runner.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 git invocations, got %d: %+v", len(calls), calls)
 	}
+	// With Jobs=1 the pool is effectively serial and preserves project order.
 	for i, want := range []string{"git@host:tenant/api.git", "git@host:tenant/web.git"} {
-		call := runner.calls[i]
+		call := calls[i]
 		if call.dir != "." {
 			t.Errorf("call %d dir = %q, want \".\"", i, call.dir)
 		}
@@ -156,7 +173,7 @@ func TestSync_DryRunStreamSplit(t *testing.T) {
 	runner := &fakeRunner{}
 	var stdout, stderr bytes.Buffer
 
-	cfg := &config.Config{URL: "https://example.com", HTTP: false, RootPath: "tenant"}
+	cfg := &config.Config{URL: "https://example.com", HTTP: false, RootPath: "tenant", Jobs: 4}
 	deps := Deps{
 		Client: c,
 		Runner: runner,
@@ -164,16 +181,17 @@ func TestSync_DryRunStreamSplit(t *testing.T) {
 		Stderr: &stderr,
 		Exists: func(string) bool { return false },
 	}
-	req := Request{DryRun: true, DoRepos: true}
+	req := Request{DryRun: true, DoRepos: true, Jobs: 4}
 
-	if err := Sync(req, cfg, deps); err != nil {
+	if err := Sync(context.Background(), req, cfg, deps); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
 
 	// FR-010: dry-run plan lines on stdout, no plan lines on stderr,
 	// no real git invocations recorded.
-	if len(runner.calls) != 0 {
-		t.Errorf("dry-run should record zero git calls, got %+v", runner.calls)
+	calls := runner.snapshot()
+	if len(calls) != 0 {
+		t.Errorf("dry-run should record zero git calls, got %+v", calls)
 	}
 	if !contains(stdout.String(), "DRY RUN") {
 		t.Errorf("stdout missing DRY RUN banner:\n%s", stdout.String())

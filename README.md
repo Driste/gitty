@@ -10,6 +10,7 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Recursive or Flat**: Sync only the immediate group, or use the `--nested` flag to recursively pull everything underneath it.
 * **Smart Updates**: Automatically runs `git pull` if the local directory exists, or `git clone` if it doesn't.
 * **Dry Runs**: Test your sync commands safely with `--dry-run` to see exactly what folders will be created and which repos will be cloned.
+* **Parallel Sync**: Clone or pull multiple repositories concurrently. The default concurrency is set in `.gitty/config` (`jobs = 4`) and can be overridden per invocation with `--jobs N`.
 * **CI/CD Ready**: Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN` environment variables.
 
 ---
@@ -52,6 +53,17 @@ gitty init --url="https://gitlab.mycompany.com" --http
 ```
 This generates a `.gitty/config` file inside a `.gitty/` directory in the current directory. `gitty` will use this directory as the root destination for all future sync commands.
 
+The generated config looks like:
+
+```toml
+url = "https://gitlab.com"
+http = false
+root_path = ""
+jobs = 4
+```
+
+Edit `jobs` to change the default concurrency for `gitty sync` in this workspace. The `--jobs N` flag overrides it for a single invocation.
+
 ---
 
 ## Architecture
@@ -91,6 +103,7 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | `--repos` | `false` | Only fetch and clone/pull repositories. *(Note: If neither `--groups` nor `--repos` is passed, it defaults to `--repos`)*. |
 | `--nested` | `false` | Include nested subgroups and projects recursively. |
 | `--dry-run`| `false` | Print what would happen without creating directories or executing git commands. |
+| `--jobs`   | (from `.gitty/config`, typically `4`) | Max concurrent clone/pull operations. Valid range `[1, 64]`. Overrides the `jobs` field of `.gitty/config` for this invocation only; does not persist back. |
 
 ### How `--groups` and `--repos` work together:
 * `gitty sync --path="tenant"`: Syncs **only** the immediate repositories inside `tenant`.
