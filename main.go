@@ -31,6 +31,8 @@ func main() {
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
 		runSync(*syncPath, *syncToken, *syncDryRun, *syncGroups, *syncRepos, *syncNested)
+	case "agent":
+		runAgent(os.Args[2:])
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -43,5 +45,6 @@ func printUsage() {
 	fmt.Println("\nCommands:")
 	fmt.Println("  init    Initialize a gitty.toml config file in the current directory")
 	fmt.Println("  sync    Sync (clone/pull) a GitLab group based on the gitty.toml config")
+	fmt.Println("  agent   Print an MCP-style schema describing how an LLM/agent should use gitty")
 	fmt.Println("\nRun 'gitty <command> -h' for specific flags.")
 }

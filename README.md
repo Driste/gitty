@@ -122,6 +122,55 @@ clone_all_repos:
     - ./gitty sync --path="tenant/images" --nested
 ```
 
+---
+
+## Agent Schema (`gitty agent schema`)
+
+`gitty agent schema` prints a machine-readable, MCP-style JSON description of
+every gitty command — its purpose, arguments, defaults, and how to turn those
+arguments into a command line. Feed this to an LLM or agent so it knows how to
+drive `gitty` as a tool without you having to hand-write a tool definition.
+
+```bash
+gitty agent schema
+```
+
+The output is a single JSON document shaped like an MCP tool list:
+
+```json
+{
+  "name": "gitty",
+  "version": "1.0.0",
+  "description": "A configurable CLI to synchronize ... GitLab groups ...",
+  "tools": [
+    {
+      "name": "sync",
+      "description": "Sync a GitLab group based on the workspace's .gitty/config ...",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path":   { "type": "string",  "description": "GitLab group or subgroup path ..." },
+          "nested": { "type": "boolean", "description": "Recurse into nested subgroups ...", "default": false }
+        },
+        "required": ["path"]
+      },
+      "invocation": {
+        "command": "gitty",
+        "baseArgs": ["sync"],
+        "flagStyle": "--<name>=<value> for strings, --<name> for booleans"
+      }
+    }
+  ]
+}
+```
+
+Each tool's `inputSchema` is JSON Schema, and `invocation` tells the agent how
+to map the arguments onto an argv array (e.g. the `sync` tool with
+`{"path": "tenant/images", "nested": true}` becomes
+`gitty sync --path=tenant/images --nested`).
+
+---
+
 ## TODO
 
 - [x] Add a gitty config to each group so that you can go into them and pull from that path
