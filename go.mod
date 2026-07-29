@@ -3,7 +3,7 @@ module gitty
 go 1.24.4
 
 require (
-	github.com/pelletier/go-toml/v2 v2.3.0
+	github.com/pelletier/go-toml/v2 v2.4.3
 	gitlab.com/gitlab-org/api/client-go v1.46.0
 )
 
