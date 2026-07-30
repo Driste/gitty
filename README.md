@@ -170,6 +170,72 @@ clone_all_repos:
 
 ---
 
+## Inspecting a workspace (`gitty status`)
+
+Reports the branch and freshness of every checkout in the workspace, one line
+per repository. It is read-only and needs no token or network access — results
+reflect the last sync unless you pass `--fetch`.
+
+```bash
+gitty status
+gitty status --fetch     # refresh remote-tracking refs first (needs a token for HTTP remotes)
+```
+
+```
+status tenant/images/app branch=main ahead=0 behind=3 dirty=false
+status tenant/images/lib branch=main ahead=1 behind=0 dirty=true
+status tenant/images/spike branch=experiment ahead=0 behind=0 dirty=false upstream=none
+summary repos=3 dirty=1 ahead=1 behind=1 errors=0
+```
+
+`dirty=true` means the working tree has changes (including untracked files).
+`upstream=none` marks a branch with no tracking ref, where ahead/behind are
+unknowable rather than zero.
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--fetch` | `false` | Refresh remote-tracking refs before reporting, so `behind` reflects the remote right now. |
+| `--token` | `""` | Only needed with `--fetch`. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. |
+| `--anon` | `false` | With `--fetch`, contact public repositories without a token. |
+| `--jobs` | `4` | Repositories inspected concurrently (1-16). |
+| `--verbose` | `false` | Print each git invocation to stderr (URLs redacted). |
+
+---
+
+## Previewing a group (`gitty ls`)
+
+Lists the remote groups and projects under a target, with a project count per
+group, marking each project `new` (a sync would clone it) or `present`
+(already checked out). It never invokes git and never writes to the workspace —
+use it to see what a sync *would* bring down, and how much.
+
+```bash
+gitty ls --path="tenant/images" --nested
+gitty ls --path="tenant/images" --nested --format=tree
+gitty ls --path="tenant/images" --nested --format=json
+```
+
+```
+group tenant/images projects=2
+project tenant/images/app present
+project tenant/images/lib new
+summary groups=1 projects=2 new=1 present=1
+```
+
+`--format=tree` renders the same data as an indented namespace tree with `+`
+(would clone) and `=` (present) markers; `--format=json` emits a structured
+document for programmatic use.
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--path` | `""` | **(Required)** GitLab group or subgroup path, unless run from a managed subgroup directory. |
+| `--token` | `""` | GitLab access token. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. Required unless `--anon`. |
+| `--anon` | `false` | List public groups and projects anonymously. |
+| `--nested` | `false` | Recurse into nested subgroups. Per-group project counts are only complete in this mode. |
+| `--format` | `text` | `text` (greppable event lines), `tree` (indented tree), or `json`. |
+
+---
+
 ## Agent Schema (`gitty agent schema`)
 
 `gitty agent schema` prints a machine-readable, MCP-style JSON description of
@@ -240,8 +306,8 @@ go test -short ./...
 ## TODO
 
 - [x] Add a gitty config to each group so that you can go into them and pull from that path
-- [ ] For gitlab pipelines, use the CI_ var for the git repo
-- [ ] Async pull down repos
-- [ ] Show repos current branches and if they are out of date, maybe a cache
-- [ ] Show how many projects are in each group
-- [ ] Show the current groups/projects and which will be removed or added when doing a subsequent run
+- [x] For gitlab pipelines, use the CI_ var for the git repo (`CI_JOB_TOKEN` authenticates git; `init` defaults to `CI_SERVER_URL`)
+- [x] Async pull down repos (`--jobs`)
+- [x] Show repos current branches and if they are out of date, maybe a cache (`gitty status`, with `--fetch`)
+- [x] Show how many projects are in each group (`gitty ls`)
+- [ ] Show the current groups/projects and which will be removed or added when doing a subsequent run (`gitty ls` covers *added*; *removed* still needs orphan detection)

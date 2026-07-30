@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "1.1.0"
+const AgentSchemaVersion = "1.2.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -159,6 +159,82 @@ func buildAgentSchema() AgentSchema {
 				Invocation: Invocation{
 					Command:   "gitty",
 					BaseArgs:  []string{"sync"},
+					FlagStyle: "--<name>=<value> for strings, --<name> for booleans",
+				},
+			},
+			{
+				Name:        "status",
+				Description: "Report the branch and freshness of every git checkout in the workspace, one 'status <path> branch=... ahead=N behind=N dirty=BOOL' line per repository. Read-only: it never clones, pulls, or modifies the workspace.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"fetch": {
+							Type:        "boolean",
+							Description: "Refresh remote-tracking refs before reporting, so ahead/behind reflect the remote right now instead of the last sync. Requires network access and, for HTTP remotes, a token.",
+							Default:     false,
+						},
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token, only needed with fetch. Falls back to the GITLAB_TOKEN or CI_JOB_TOKEN environment variables.",
+						},
+						"anon": {
+							Type:        "boolean",
+							Description: "With fetch, contact public repositories anonymously instead of requiring a token.",
+							Default:     false,
+						},
+						"jobs": {
+							Type:        "integer",
+							Description: "Number of concurrent repositories to inspect (1-16).",
+							Default:     4,
+						},
+						"verbose": {
+							Type:        "boolean",
+							Description: "Print each git invocation and its output to stderr, with URLs redacted.",
+							Default:     false,
+						},
+					},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"status"},
+					FlagStyle: "--<name>=<value> for strings, --<name> for booleans",
+				},
+			},
+			{
+				Name:        "ls",
+				Description: "List the remote groups and projects under a target, marking each project 'new' (a sync would clone it) or 'present' (already checked out). Read-only: it contacts the GitLab API but never invokes git or writes to the workspace.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"path": {
+							Type:        "string",
+							Description: "GitLab group or subgroup path to list (e.g., 'tenant/images'). Required unless run from a managed subgroup directory that already has its own config.",
+						},
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token. Falls back to the GITLAB_TOKEN or CI_JOB_TOKEN environment variables. Required unless anon is set.",
+						},
+						"anon": {
+							Type:        "boolean",
+							Description: "List public groups and projects anonymously, without a token.",
+							Default:     false,
+						},
+						"nested": {
+							Type:        "boolean",
+							Description: "Recurse into nested subgroups instead of listing only the immediate group. Per-group project counts are only complete in this mode.",
+							Default:     false,
+						},
+						"format": {
+							Type:        "string",
+							Description: "Output format: 'text' for greppable 'group'/'project' event lines, 'tree' for an indented namespace tree, or 'json' for a structured document. Prefer json when consuming programmatically.",
+							Default:     "text",
+						},
+					},
+					Required: []string{"path"},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"ls"},
 					FlagStyle: "--<name>=<value> for strings, --<name> for booleans",
 				},
 			},
