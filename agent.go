@@ -99,7 +99,12 @@ func buildAgentSchema() AgentSchema {
 						},
 						"token": {
 							Type:        "string",
-							Description: "GitLab access token. Falls back to the GITLAB_TOKEN or CI_JOB_TOKEN environment variables when omitted.",
+							Description: "GitLab access token. Falls back to the GITLAB_TOKEN or CI_JOB_TOKEN environment variables when omitted. Required unless --anon is set.",
+						},
+						"anon": {
+							Type:        "boolean",
+							Description: "Access public groups and repositories anonymously, without a token. Only public resources are visible in this mode.",
+							Default:     false,
 						},
 						"groups": {
 							Type:        "boolean",

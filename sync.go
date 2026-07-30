@@ -11,7 +11,7 @@ import (
 	"gitlab.com/gitlab-org/api/client-go"
 )
 
-func runSync(groupFlag, tokenFlag string, dryRun, doGroups, doRepos, nested bool) {
+func runSync(groupFlag, tokenFlag string, dryRun, doGroups, doRepos, nested, anon bool) {
 
 	if !doGroups && !doRepos {
 		doRepos = true
@@ -43,8 +43,11 @@ func runSync(groupFlag, tokenFlag string, dryRun, doGroups, doRepos, nested bool
 			token = os.Getenv("CI_JOB_TOKEN")
 		}
 	}
+	if token == "" && !anon {
+		log.Fatal("Error: A token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required. Use --anon to sync public resources without a token.")
+	}
 	if token == "" {
-		log.Fatal("Error: A token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required.")
+		fmt.Println("Running anonymously (--anon): only public groups and repositories are accessible.")
 	}
 
 	client, err := gitlab.NewClient(token, gitlab.WithBaseURL(cfg.URL))
