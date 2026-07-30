@@ -35,14 +35,7 @@ func runSync(groupFlag, tokenFlag string, dryRun, doGroups, doRepos, nested, ano
 		log.Fatal("Error: Target group path is empty. Provide --path or sync from a managed subgroup directory.")
 	}
 
-	token := tokenFlag
-	if token == "" {
-		if t := os.Getenv("GITLAB_TOKEN"); t != "" {
-			token = t
-		} else {
-			token = os.Getenv("CI_JOB_TOKEN")
-		}
-	}
+	token := resolveToken(tokenFlag)
 	if token == "" && !anon {
 		log.Fatal("Error: A token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required. Use --anon to sync public resources without a token.")
 	}
@@ -115,6 +108,10 @@ func syncGroups(client *gitlab.Client, target string, cfg *Config, dryRun, neste
 
 	for _, g := range allGroups {
 		relPath := getLocalRelPath(g.FullPath, cfg.RootPath)
+		if !isWithinWorkspace(relPath) {
+			fmt.Printf("  -> Skipping %s: resolved path %q escapes the workspace\n", g.FullPath, relPath)
+			continue
+		}
 		groupDest := filepath.Join(".", relPath)
 
 		if dryRun {
@@ -179,6 +176,10 @@ func syncRepos(client *gitlab.Client, target string, cfg *Config, dryRun, nested
 
 		// Calculate destination relative to where we ran the command
 		relPath := getLocalRelPath(p.PathWithNamespace, cfg.RootPath)
+		if !isWithinWorkspace(relPath) {
+			fmt.Printf("\nSkipping %s: resolved path %q escapes the workspace\n", p.PathWithNamespace, relPath)
+			continue
+		}
 		repoDest := filepath.Join(".", relPath)
 
 		fmt.Printf("\nProcessing %s...\n", p.PathWithNamespace)
@@ -221,14 +222,52 @@ func runGit(dir string, args ...string) {
 	}
 }
 
+// resolveToken picks the GitLab access token from the --token flag first, then
+// the GITLAB_TOKEN environment variable, then CI_JOB_TOKEN. It returns "" when
+// none is set.
+func resolveToken(flagToken string) string {
+	if flagToken != "" {
+		return flagToken
+	}
+	if t := os.Getenv("GITLAB_TOKEN"); t != "" {
+		return t
+	}
+	return os.Getenv("CI_JOB_TOKEN")
+}
+
 // getLocalRelPath strips the local context's RootPath from the GitLab API path
-// so that folders are built correctly relative to the current directory.
+// so that folders are built correctly relative to the current directory. The
+// prefix is only stripped on a path-segment boundary, so a configRoot of
+// "acme/team" does not accidentally match "acme/team-x/repo".
 func getLocalRelPath(apiFullPath, configRoot string) string {
 	if configRoot == "" {
 		return apiFullPath
 	}
-	
-	rel := strings.TrimPrefix(apiFullPath, configRoot)
-	rel = strings.TrimPrefix(rel, "/")
-	return rel
+	if apiFullPath == configRoot {
+		return ""
+	}
+	if rel := strings.TrimPrefix(apiFullPath, configRoot+"/"); rel != apiFullPath {
+		return rel
+	}
+	// configRoot is not a path-segment prefix of apiFullPath; leave it as-is
+	// rather than mangling the path.
+	return apiFullPath
+}
+
+// isWithinWorkspace reports whether a relative destination path stays inside the
+// current workspace. It rejects absolute paths and any path that escapes the
+// workspace root via "..". This guards against a malicious or misconfigured
+// GitLab instance returning namespace paths that would write outside the tree.
+func isWithinWorkspace(rel string) bool {
+	if rel == "" {
+		return true
+	}
+	if filepath.IsAbs(rel) {
+		return false
+	}
+	clean := filepath.Clean(rel)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
 }
