@@ -23,7 +23,7 @@ Ensure you have Go installed, then clone this repository and build the binary:
 go mod tidy
 
 # Build the executable
-go build -o gitty main.go
+go build -o gitty .
 
 # (Optional) Install globally
 sudo mv gitty /usr/local/bin/
