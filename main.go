@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 )
 
@@ -31,7 +32,9 @@ func main() {
 		runInit(*initURL, *initHTTP)
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
-		runSync(*syncPath, *syncToken, *syncDryRun, *syncGroups, *syncRepos, *syncNested, *syncAnon)
+		if err := runSync(*syncPath, *syncToken, *syncDryRun, *syncGroups, *syncRepos, *syncNested, *syncAnon); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
 	case "agent":
 		runAgent(os.Args[2:])
 	default:

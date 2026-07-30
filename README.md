@@ -8,9 +8,10 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Workspace Config**: Initialize a workspace with `gitty init` so you don't have to repeatedly pass your GitLab URL or SSH/HTTP preferences.
 * **Granular Syncing**: Choose to sync only repositories, only empty group directory structures, or both.
 * **Recursive or Flat**: Sync only the immediate group, or use the `--nested` flag to recursively pull everything underneath it.
-* **Smart Updates**: Automatically runs `git pull` if the local directory exists, or `git clone` if it doesn't.
+* **Smart Updates**: Automatically runs `git pull --ff-only` if the local directory exists, or `git clone` if it doesn't. Fast-forward-only pulls avoid surprise merge commits — a diverged or dirty checkout fails loudly and is reported instead of silently merged.
 * **Dry Runs**: Test your sync commands safely with `--dry-run` to see exactly what folders will be created and which repos will be cloned.
-* **CI/CD Ready**: Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN` environment variables.
+* **CI/CD Ready**: Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN` environment variables, and exits non-zero when any group or repository fails to sync so a broken pipeline stage is never reported green.
+* **Safe Destinations**: Refuses to write outside the workspace (namespace paths containing `..` or absolute paths are skipped) and verifies each clone URL points at the configured GitLab host before running `git clone`.
 
 ---
 
