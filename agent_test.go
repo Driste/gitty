@@ -30,6 +30,12 @@ func TestBuildAgentSchemaShape(t *testing.T) {
 			t.Errorf("schema is missing the %q tool", name)
 		}
 	}
+
+	for _, code := range []string{"0", "1", "2", "130"} {
+		if _, ok := s.ExitCodes[code]; !ok {
+			t.Errorf("schema exitCodes missing %q", code)
+		}
+	}
 }
 
 func TestSyncToolAdvertisesAnon(t *testing.T) {
