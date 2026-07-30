@@ -256,7 +256,7 @@ func newTestSyncer(cfg *Config, src gitlabSource, git gitRunner) (*syncer, *byte
 	return s, stdout, stderr
 }
 
-var eventLineRe = regexp.MustCompile(`^(clone|pull|group|reclone|skip|error|plan|summary) `)
+var eventLineRe = regexp.MustCompile(`^(clone|pull|group|project|reclone|skip|status|error|plan|summary) `)
 
 // assertEventLines fails if any stdout line does not match the event grammar.
 func assertEventLines(t *testing.T, stdout *bytes.Buffer) {

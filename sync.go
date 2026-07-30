@@ -201,66 +201,21 @@ func runSync(ctx context.Context, opts syncOptions) error {
 		return usageErrf("--jobs must be between 1 and %d, got %d", maxJobs, opts.Jobs)
 	}
 
-	cfg, err := LoadLocalConfig()
+	s, fullTarget, err := setupWorkspace(opts.Path, opts.Token, opts.Anon)
 	if err != nil {
-		return usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
+		return err
 	}
-
-	fullTarget := cfg.RootPath
-	if opts.Path != "" {
-		if fullTarget != "" {
-			fullTarget = fullTarget + "/" + opts.Path
-		} else {
-			fullTarget = opts.Path
-		}
-	}
-
-	if fullTarget == "" {
-		return usageErrf("target group path is empty; provide --path or sync from a managed subgroup directory")
-	}
-
-	cred := resolveCredential(opts.Token)
-	token := cred.token
-	if token == "" && !opts.Anon {
-		return usageErrf("a token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required; use --anon to sync public resources without a token")
-	}
-
-	client, err := gitlab.NewClient(token, gitlab.WithBaseURL(cfg.URL))
-	if err != nil {
-		return fmt.Errorf("failed to create GitLab client: %w", err)
-	}
-
-	// Resolve our own binary path up front when HTTP-auth injection may
-	// apply, so a broken /proc/self/exe fails the run with a clear error
-	// instead of failing every clone mid-sync.
-	exePath := ""
-	if cfg.HTTP && token != "" {
-		exePath, err = os.Executable()
-		if err != nil {
-			return fmt.Errorf("resolving gitty's own path for git authentication: %w", err)
-		}
-	}
-
-	s := &syncer{
-		cfg:           cfg,
-		src:           gitlabClientSource{client: client},
-		git:           execGit,
-		dryRun:        opts.DryRun,
-		nested:        opts.Nested,
-		verbose:       opts.Verbose,
-		recloneBroken: opts.RecloneBroken,
-		jobs:          opts.Jobs,
-		cred:          cred,
-		exePath:       exePath,
-		out:           os.Stdout,
-		errOut:        os.Stderr,
-	}
+	s.dryRun = opts.DryRun
+	s.nested = opts.Nested
+	s.verbose = opts.Verbose
+	s.recloneBroken = opts.RecloneBroken
+	s.jobs = opts.Jobs
 
 	if s.verbose && s.credentialEnv() != nil {
 		s.diagf("HTTP auth: injecting %s credential (username %s) via askpass", s.cred.source, s.cred.username)
 	}
 
-	if token == "" {
+	if s.cred.token == "" {
 		s.diagf("Running anonymously (--anon): only public groups and repositories are accessible.")
 	}
 	if opts.DryRun {
@@ -364,32 +319,9 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 
 	// Dispatch to a bounded worker pool. jobs=1 preserves serial FIFO
 	// behavior; workers rely on the syncer mutex for line-atomic output.
-	jobs := s.jobs
-	if jobs < 1 {
-		jobs = 1
-	}
-	work := make(chan *gitlab.Project)
-	var wg sync.WaitGroup
-	for i := 0; i < jobs; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for p := range work {
-				s.syncOneRepo(ctx, p)
-			}
-		}()
-	}
-	for _, p := range allProjects {
-		if ctx.Err() != nil {
-			break
-		}
-		select {
-		case work <- p:
-		case <-ctx.Done():
-		}
-	}
-	close(work)
-	wg.Wait()
+	forEachConcurrent(ctx, s.jobs, allProjects, func(p *gitlab.Project) {
+		s.syncOneRepo(ctx, p)
+	})
 }
 
 // destState classifies a repo's local destination path.
@@ -479,25 +411,9 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 			s.event("pull", p.PathWithNamespace)
 			return
 		}
-		env := s.credentialEnv()
-		args := []string{"pull", "--ff-only"}
-		if env != nil {
-			// The URL git will actually use is the checkout's origin, which a
-			// user may have re-pointed since the clone: never send our
-			// credential toward a host other than the configured instance.
-			originOut, err := s.git(ctx, repoDest, nil, "remote", "get-url", "origin")
-			if err != nil {
-				s.event("error", p.PathWithNamespace, "reading origin remote failed")
-				s.diagf("%s: git remote get-url origin: %v", p.PathWithNamespace, err)
-				return
-			}
-			origin := strings.TrimSpace(string(originOut))
-			if ok, err := hostsMatch(s.cfg.URL, origin); err != nil || !ok {
-				s.event("error", p.PathWithNamespace, "origin host does not match the configured instance")
-				s.diagf("%s: origin %q does not match instance %q; not sending credentials", p.PathWithNamespace, redactURL(origin), s.cfg.URL)
-				return
-			}
-			args = append([]string{"-c", "credential.helper="}, args...)
+		env, args, ok := s.authForCheckout(ctx, p.PathWithNamespace, repoDest, "pull", "--ff-only")
+		if !ok {
+			return
 		}
 		if err := s.runGit(ctx, p.PathWithNamespace, repoDest, env, args...); err == nil {
 			s.event("pull", p.PathWithNamespace)
@@ -605,6 +521,33 @@ func resolveCredential(flagToken string) credential {
 // resolveToken returns just the token from the fixed resolution order.
 func resolveToken(flagToken string) string {
 	return resolveCredential(flagToken).token
+}
+
+// authForCheckout prepares a network git command to run inside an existing
+// checkout: it returns the credential environment and the final argv. When
+// credentials would be injected it first verifies the checkout's own origin
+// still points at the configured instance — a user may have re-pointed it
+// since the clone, and the token must never travel to another host. ok=false
+// means the caller must not run the command (an error event was emitted).
+func (s *syncer) authForCheckout(ctx context.Context, path, dir string, args ...string) ([]string, []string, bool) {
+	env := s.credentialEnv()
+	if env == nil {
+		return nil, args, true
+	}
+
+	originOut, err := s.git(ctx, dir, nil, "remote", "get-url", "origin")
+	if err != nil {
+		s.event("error", path, "reading origin remote failed")
+		s.diagf("%s: git remote get-url origin: %v", path, err)
+		return nil, nil, false
+	}
+	origin := strings.TrimSpace(string(originOut))
+	if ok, err := hostsMatch(s.cfg.URL, origin); err != nil || !ok {
+		s.event("error", path, "origin host does not match the configured instance")
+		s.diagf("%s: origin %q does not match instance %q; not sending credentials", path, redactURL(origin), s.cfg.URL)
+		return nil, nil, false
+	}
+	return env, append([]string{"-c", "credential.helper="}, args...), true
 }
 
 // credentialEnv builds the extra environment for a git invocation that may

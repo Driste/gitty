@@ -569,7 +569,7 @@ func assertGreppableStdout(t *testing.T, stdout string) {
 	}
 }
 
-var e2eEventRe = regexp.MustCompile(`^(clone|pull|group|reclone|skip|error|plan|summary) `)
+var e2eEventRe = regexp.MustCompile(`^(clone|pull|group|project|reclone|skip|status|error|plan|summary) `)
 
 func TestE2ETokenFromEnvironment(t *testing.T) {
 	skipIfShort(t)
@@ -760,6 +760,176 @@ func TestE2EPaginationClonesAllPages(t *testing.T) {
 	}
 	if got := readFileT(t, filepath.Join(ws, "acme", "beta", "b.txt")); got != "beta" {
 		t.Errorf("beta file = %q", got)
+	}
+}
+
+func TestE2EStatus(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/statusrepo", map[string]string{"README.md": "v1"})
+	cleanWork := f.addRepo(t, "acme/cleanrepo", map[string]string{"c.txt": "c"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(120, "acme/statusrepo"), f.project(121, "acme/cleanrepo")}
+
+	ws := initWorkspace(t, f)
+	if stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon"); code != 0 {
+		t.Fatalf("setup sync failed:\n%s\n%s", stdout, stderr)
+	}
+
+	// Freshly cloned: clean, on a branch, in sync with its upstream.
+	stdout, stderr, code := runGitty(t, ws, nil, "status")
+	if code != 0 {
+		t.Fatalf("status exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	assertGreppableStdout(t, stdout)
+	if !strings.Contains(stdout, "status acme/cleanrepo branch=main ahead=0 behind=0 dirty=false\n") {
+		t.Errorf("unexpected clean status line:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "summary repos=2 dirty=0 ahead=0 behind=0 errors=0") {
+		t.Errorf("unexpected summary:\n%s", stdout)
+	}
+
+	// Dirty the tree and add a local commit: dirty=true and ahead=1.
+	local := filepath.Join(ws, "acme", "statusrepo")
+	if err := os.WriteFile(filepath.Join(local, "README.md"), []byte("local edit"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, local, "commit", "-am", "local commit")
+	if err := os.WriteFile(filepath.Join(local, "untracked.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, code = runGitty(t, ws, nil, "status")
+	if code != 0 {
+		t.Fatalf("status exit = %d:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "status acme/statusrepo branch=main ahead=1 behind=0 dirty=true\n") {
+		t.Errorf("expected ahead=1 dirty=true for the edited repo:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "summary repos=2 dirty=1 ahead=1 behind=0 errors=0") {
+		t.Errorf("unexpected summary:\n%s", stdout)
+	}
+
+	// An upstream commit is invisible until --fetch refreshes the refs.
+	f.pushUpdate(t, cleanWork, "acme/cleanrepo", "c.txt", "c2")
+	stdout, _, code = runGitty(t, ws, nil, "status")
+	if code != 0 {
+		t.Fatalf("status exit = %d:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "status acme/cleanrepo branch=main ahead=0 behind=0 dirty=false\n") {
+		t.Errorf("stale status should not show behind before --fetch:\n%s", stdout)
+	}
+
+	stdout, stderr, code = runGitty(t, ws, nil, "status", "--fetch", "--anon")
+	if code != 0 {
+		t.Fatalf("status --fetch exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "status acme/cleanrepo branch=main ahead=0 behind=1 dirty=false\n") {
+		t.Errorf("--fetch should reveal behind=1:\n%s", stdout)
+	}
+}
+
+func TestE2EStatusReportsNoUpstream(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/norepo", map[string]string{"a.txt": "a"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(122, "acme/norepo")}
+
+	ws := initWorkspace(t, f)
+	if _, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon"); code != 0 {
+		t.Fatalf("setup sync failed:\n%s", stderr)
+	}
+	// A branch with no upstream must say so rather than reporting 0/0.
+	gitRun(t, filepath.Join(ws, "acme", "norepo"), "checkout", "-b", "orphan-branch")
+
+	stdout, _, code := runGitty(t, ws, nil, "status")
+	if code != 0 {
+		t.Fatalf("status exit = %d:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "status acme/norepo branch=orphan-branch ahead=0 behind=0 dirty=false upstream=none\n") {
+		t.Errorf("expected upstream=none:\n%s", stdout)
+	}
+}
+
+func TestE2ELs(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/alpha", map[string]string{"a.txt": "a"})
+	f.addRepo(t, "acme/team/beta", map[string]string{"b.txt": "b"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.groups["acme/team"] = apiGroup{ID: 2, FullPath: "acme/team"}
+	f.descendants["acme"] = []apiGroup{f.groups["acme/team"]}
+	f.projects["acme"] = []apiProject{f.project(130, "acme/alpha")}
+	f.projects["acme/team"] = []apiProject{f.project(131, "acme/team/beta")}
+
+	ws := initWorkspace(t, f)
+
+	// Nothing cloned yet: every project is new, and ls must not create anything.
+	stdout, stderr, code := runGitty(t, ws, nil, "ls", "--path=acme", "--nested", "--anon")
+	if code != 0 {
+		t.Fatalf("ls exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	assertGreppableStdout(t, stdout)
+	for _, want := range []string{
+		"group acme projects=1\n",
+		"project acme/alpha new\n",
+		"group acme/team projects=1\n",
+		"project acme/team/beta new\n",
+		"summary groups=2 projects=2 new=2 present=0\n",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("ls output missing %q:\n%s", want, stdout)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "alpha")); !os.IsNotExist(err) {
+		t.Error("ls must not create anything in the workspace")
+	}
+
+	// After a sync the same listing reports them present.
+	if _, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--nested", "--anon"); code != 0 {
+		t.Fatalf("sync failed:\n%s", stderr)
+	}
+	stdout, _, code = runGitty(t, ws, nil, "ls", "--path=acme", "--nested", "--anon")
+	if code != 0 {
+		t.Fatalf("ls exit = %d:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "project acme/alpha present\n") ||
+		!strings.Contains(stdout, "summary groups=2 projects=2 new=0 present=2\n") {
+		t.Errorf("ls should report both projects present:\n%s", stdout)
+	}
+
+	// Tree format: indented, with counts and +/= markers.
+	stdout, _, code = runGitty(t, ws, nil, "ls", "--path=acme", "--nested", "--anon", "--format=tree")
+	if code != 0 {
+		t.Fatalf("ls --format=tree exit = %d:\n%s", code, stdout)
+	}
+	for _, want := range []string{"acme (1 project)\n", "  = alpha\n", "  team (1 project)\n", "    = beta\n"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("tree output missing %q:\n%s", want, stdout)
+		}
+	}
+
+	// JSON format parses and carries the same facts.
+	stdout, _, code = runGitty(t, ws, nil, "ls", "--path=acme", "--nested", "--anon", "--format=json")
+	if code != 0 {
+		t.Fatalf("ls --format=json exit = %d:\n%s", code, stdout)
+	}
+	var report lsReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("ls json output is not valid JSON: %v\n%s", err, stdout)
+	}
+	if report.Target != "acme" || report.Summary.Projects != 2 || report.Summary.Present != 2 {
+		t.Errorf("json report = %+v", report)
+	}
+
+	// An unknown format is a usage error.
+	_, stderr, code = runGitty(t, ws, nil, "ls", "--path=acme", "--anon", "--format=yaml")
+	if code != 2 || !strings.Contains(stderr, "--format") {
+		t.Errorf("bad format exit = %d, want 2 mentioning --format:\n%s", code, stderr)
 	}
 }
 

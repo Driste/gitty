@@ -40,6 +40,20 @@ func main() {
 	syncRecloneBroken := syncCmd.Bool("reclone-broken", false, "Move aside non-repo directories that block a clone (renamed, never deleted) and re-clone")
 	syncJobs := syncCmd.Int("jobs", 4, "Number of concurrent repo clone/pull operations (1-16)")
 
+	statusCmd := flag.NewFlagSet("status", flag.ExitOnError)
+	statusToken := statusCmd.String("token", "", "GitLab Access Token (only needed with --fetch)")
+	statusAnon := statusCmd.Bool("anon", false, "With --fetch, contact public repositories anonymously")
+	statusFetch := statusCmd.Bool("fetch", false, "Refresh remote-tracking refs first so ahead/behind reflect the remote now")
+	statusVerbose := statusCmd.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
+	statusJobs := statusCmd.Int("jobs", 4, "Number of concurrent repositories to inspect (1-16)")
+
+	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
+	lsPath := lsCmd.String("path", "", "GitLab Group Path (e.g., tenant/images)")
+	lsToken := lsCmd.String("token", "", "GitLab Access Token (falls back to env vars)")
+	lsAnon := lsCmd.Bool("anon", false, "List public resources anonymously (no token required)")
+	lsNested := lsCmd.Bool("nested", false, "Include nested subgroups/projects recursively")
+	lsFormat := lsCmd.String("format", "text", "Output format: text, tree, or json")
+
 	switch os.Args[1] {
 	case "init":
 		initCmd.Parse(os.Args[2:])
@@ -77,6 +91,30 @@ func main() {
 		})
 		stop()
 		exitOnError(err)
+	case "status":
+		statusCmd.Parse(os.Args[2:])
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err := runStatus(ctx, statusOptions{
+			Token:   *statusToken,
+			Anon:    *statusAnon,
+			Fetch:   *statusFetch,
+			Verbose: *statusVerbose,
+			Jobs:    *statusJobs,
+		})
+		stop()
+		exitOnError(err)
+	case "ls":
+		lsCmd.Parse(os.Args[2:])
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err := runLs(ctx, lsOptions{
+			Path:   *lsPath,
+			Token:  *lsToken,
+			Anon:   *lsAnon,
+			Nested: *lsNested,
+			Format: *lsFormat,
+		})
+		stop()
+		exitOnError(err)
 	case "agent":
 		runAgent(os.Args[2:])
 	default:
@@ -103,6 +141,8 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "\nCommands:")
 	fmt.Fprintln(os.Stderr, "  init    Initialize a .gitty/config file in the current directory")
 	fmt.Fprintln(os.Stderr, "  sync    Sync (clone/pull) a GitLab group based on the .gitty/config")
+	fmt.Fprintln(os.Stderr, "  status  Report the branch and freshness of every checkout in the workspace")
+	fmt.Fprintln(os.Stderr, "  ls      List the remote groups/projects for a target and what a sync would clone")
 	fmt.Fprintln(os.Stderr, "  agent   Print an MCP-style schema describing how an LLM/agent should use gitty")
 	fmt.Fprintln(os.Stderr, "\nRun 'gitty <command> -h' for specific flags.")
 }
