@@ -23,6 +23,7 @@ func main() {
 	syncGroups := syncCmd.Bool("groups", false, "Fetch and create group/subgroup directory structures")
 	syncRepos := syncCmd.Bool("repos", false, "Fetch and clone/pull repositories")
 	syncNested := syncCmd.Bool("nested", false, "Include nested subgroups/projects recursively")
+	syncAnon := syncCmd.Bool("anon", false, "Access public resources anonymously (no token required)")
 
 	switch os.Args[1] {
 	case "init":
@@ -30,7 +31,7 @@ func main() {
 		runInit(*initURL, *initHTTP)
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
-		runSync(*syncPath, *syncToken, *syncDryRun, *syncGroups, *syncRepos, *syncNested)
+		runSync(*syncPath, *syncToken, *syncDryRun, *syncGroups, *syncRepos, *syncNested, *syncAnon)
 	case "agent":
 		runAgent(os.Args[2:])
 	default:
