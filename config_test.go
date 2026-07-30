@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,24 +46,32 @@ func TestLoadLocalConfigMissing(t *testing.T) {
 
 func TestRunSyncErrorsWithoutConfig(t *testing.T) {
 	t.Chdir(t.TempDir())
-	err := runSync("acme", "", false, false, true, false, false)
+	err := runSync(context.Background(), syncOptions{Path: "acme", Repos: true, Jobs: 1})
 	if err == nil {
 		t.Fatal("expected an error when no .gitty/config exists")
+	}
+	if exitCode(err) != 2 {
+		t.Errorf("missing config should be a usage error (exit 2), got %d", exitCode(err))
 	}
 }
 
 func TestRunSyncErrorsWithoutTokenOrAnon(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	runInit("https://gitlab.com", true)
+	if err := runInit("https://gitlab.com", true, false); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
 
 	// Ensure no ambient tokens satisfy the requirement.
 	t.Setenv("GITLAB_TOKEN", "")
 	t.Setenv("CI_JOB_TOKEN", "")
 
-	err := runSync("acme", "", false, false, true, false, false)
+	err := runSync(context.Background(), syncOptions{Path: "acme", Repos: true, Jobs: 1})
 	if err == nil {
 		t.Fatal("expected an error when no token is provided and --anon is not set")
+	}
+	if exitCode(err) != 2 {
+		t.Errorf("missing token should be a usage error (exit 2), got %d", exitCode(err))
 	}
 }
 
@@ -70,7 +79,9 @@ func TestRunInitWritesConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	runInit("https://gitlab.custom.io", true)
+	if err := runInit("https://gitlab.custom.io", true, false); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
 
 	cfg, err := LoadLocalConfig()
 	if err != nil {

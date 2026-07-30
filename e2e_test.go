@@ -9,6 +9,7 @@ package main
 // Run with: go test ./...   (skipped under -short)
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,10 +18,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -54,26 +58,36 @@ func skipIfShort(t *testing.T) {
 	}
 }
 
-// runGitty executes the built binary in dir and returns combined output and
-// the exit code. Ambient tokens are cleared and the proxy is bypassed for
-// localhost so tests stay hermetic; extraEnv entries win over the defaults.
-func runGitty(t *testing.T, dir string, extraEnv []string, args ...string) (string, int) {
-	t.Helper()
-	cmd := exec.Command(gittyBin, args...)
-	cmd.Dir = dir
-	cmd.Env = append(append(os.Environ(),
+// gittyEnv builds the subprocess environment: ambient tokens are cleared and
+// the proxy is bypassed for localhost so tests stay hermetic; extraEnv entries
+// win over the defaults.
+func gittyEnv(extraEnv []string) []string {
+	return append(append(os.Environ(),
 		"GITLAB_TOKEN=", "CI_JOB_TOKEN=",
 		"NO_PROXY=127.0.0.1,localhost", "no_proxy=127.0.0.1,localhost",
 	), extraEnv...)
-	out, err := cmd.CombinedOutput()
+}
+
+// runGitty executes the built binary in dir and returns its stdout, stderr,
+// and exit code separately — event lines live on stdout, diagnostics on
+// stderr, and tests assert against the correct stream.
+func runGitty(t *testing.T, dir string, extraEnv []string, args ...string) (string, string, int) {
+	t.Helper()
+	cmd := exec.Command(gittyBin, args...)
+	cmd.Dir = dir
+	cmd.Env = gittyEnv(extraEnv)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
 	if err != nil {
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {
-			t.Fatalf("running gitty %v: %v\n%s", args, err, out)
+			t.Fatalf("running gitty %v: %v\nstdout:\n%s\nstderr:\n%s", args, err, stdout.String(), stderr.String())
 		}
-		return string(out), ee.ExitCode()
+		return stdout.String(), stderr.String(), ee.ExitCode()
 	}
-	return string(out), 0
+	return stdout.String(), stderr.String(), 0
 }
 
 // gitRun executes git with a fixed identity for repo fixtures.
@@ -116,13 +130,29 @@ type fakeGitLab struct {
 	requireToken string
 	pageSize     int
 
+	// gitDelayNs slows every /git/ request so tests can catch a sync mid-git
+	// (SIGINT, concurrency); atomic because tests adjust it while the server
+	// handles requests. gitHits counts /git/ requests; gitInflight and
+	// gitMaxInflight track a concurrency high-water mark.
+	gitDelayNs     atomic.Int64
+	gitHits        atomic.Int32
+	gitInflight    atomic.Int32
+	gitMaxInflight atomic.Int32
+
+	// gitAuthUser/gitAuthPass, when set (before the server starts), require
+	// HTTP Basic auth on every /git/ request — the e2e proof that askpass
+	// credential injection reaches the git transport.
+	gitAuthUser string
+	gitAuthPass string
+
 	groups      map[string]apiGroup
 	subgroups   map[string][]apiGroup
 	descendants map[string][]apiGroup
 	projects    map[string][]apiProject
 
-	mu        sync.Mutex
-	lastToken string
+	mu          sync.Mutex
+	lastToken   string
+	lastGitAuth string // "user:pass" of the last authenticated /git/ request
 }
 
 func newFakeGitLab(t *testing.T) *fakeGitLab {
@@ -141,6 +171,31 @@ func newFakeGitLab(t *testing.T) *fakeGitLab {
 
 func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/git/") {
+		f.gitHits.Add(1)
+		cur := f.gitInflight.Add(1)
+		defer f.gitInflight.Add(-1)
+		for {
+			max := f.gitMaxInflight.Load()
+			if cur <= max || f.gitMaxInflight.CompareAndSwap(max, cur) {
+				break
+			}
+		}
+		if d := f.gitDelayNs.Load(); d > 0 {
+			time.Sleep(time.Duration(d))
+		}
+		if f.gitAuthUser != "" {
+			user, pass, ok := r.BasicAuth()
+			if ok {
+				f.mu.Lock()
+				f.lastGitAuth = user + ":" + pass
+				f.mu.Unlock()
+			}
+			if !ok || user != f.gitAuthUser || pass != f.gitAuthPass {
+				w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+				http.Error(w, "authentication required", http.StatusUnauthorized)
+				return
+			}
+		}
 		http.StripPrefix("/git/", http.FileServer(http.Dir(f.gitRoot))).ServeHTTP(w, r)
 		return
 	}
@@ -299,14 +354,30 @@ func (f *fakeGitLab) pushUpdate(t *testing.T, work, name, file, content string) 
 	gitRun(t, bare, "update-server-info")
 }
 
+// startGitty launches the binary without waiting, for tests that signal it
+// mid-run. The returned buffers fill as the process writes.
+func startGitty(t *testing.T, dir string, extraEnv []string, args ...string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer) {
+	t.Helper()
+	cmd := exec.Command(gittyBin, args...)
+	cmd.Dir = dir
+	cmd.Env = gittyEnv(extraEnv)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting gitty %v: %v", args, err)
+	}
+	return cmd, &stdout, &stderr
+}
+
 // initWorkspace creates a temp workspace and runs `gitty init` against the
 // fake server, returning the workspace path.
 func initWorkspace(t *testing.T, f *fakeGitLab) string {
 	t.Helper()
 	ws := t.TempDir()
-	out, code := runGitty(t, ws, nil, "init", "--http", "--url="+f.srv.URL)
+	stdout, stderr, code := runGitty(t, ws, nil, "init", "--http", "--url="+f.srv.URL)
 	if code != 0 {
-		t.Fatalf("gitty init failed (exit %d):\n%s", code, out)
+		t.Fatalf("gitty init failed (exit %d):\n%s\n%s", code, stdout, stderr)
 	}
 	return ws
 }
@@ -326,12 +397,12 @@ func TestE2EInitWritesConfig(t *testing.T) {
 	skipIfShort(t)
 	ws := t.TempDir()
 
-	out, code := runGitty(t, ws, nil, "init", "--http", "--url=https://gitlab.example.com")
+	stdout, stderr, code := runGitty(t, ws, nil, "init", "--http", "--url=https://gitlab.example.com")
 	if code != 0 {
-		t.Fatalf("init exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("init exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(out, "Initialized gitty root") {
-		t.Errorf("init output missing confirmation:\n%s", out)
+	if !strings.Contains(stdout, "Initialized gitty root") {
+		t.Errorf("init stdout missing confirmation:\n%s", stdout)
 	}
 
 	var cfg Config
@@ -343,17 +414,53 @@ func TestE2EInitWritesConfig(t *testing.T) {
 	}
 }
 
+func TestE2EInitRefusesClobber(t *testing.T) {
+	skipIfShort(t)
+	ws := t.TempDir()
+
+	if stdout, stderr, code := runGitty(t, ws, nil, "init", "--http", "--url=https://one.example.com"); code != 0 {
+		t.Fatalf("first init failed:\n%s\n%s", stdout, stderr)
+	}
+	before := readFileT(t, filepath.Join(ws, ConfigDir, ConfigName))
+
+	_, stderr, code := runGitty(t, ws, nil, "init", "--url=https://two.example.com")
+	if code != 2 {
+		t.Fatalf("second init should exit 2 without --force, got %d:\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "--force") {
+		t.Errorf("refusal should mention --force:\n%s", stderr)
+	}
+	if after := readFileT(t, filepath.Join(ws, ConfigDir, ConfigName)); after != before {
+		t.Error("refused init modified the config")
+	}
+
+	if stdout, stderr, code := runGitty(t, ws, nil, "init", "--url=https://two.example.com", "--force"); code != 0 {
+		t.Fatalf("forced init failed:\n%s\n%s", stdout, stderr)
+	}
+	if !strings.Contains(readFileT(t, filepath.Join(ws, ConfigDir, ConfigName)), "two.example.com") {
+		t.Error("forced init did not take effect")
+	}
+}
+
+func TestE2EInitRejectsBadURL(t *testing.T) {
+	skipIfShort(t)
+	_, stderr, code := runGitty(t, t.TempDir(), nil, "init", "--url=not-a-url")
+	if code != 2 || !strings.Contains(stderr, "invalid --url") {
+		t.Errorf("exit = %d, want 2 with invalid-url message:\n%s", code, stderr)
+	}
+}
+
 func TestE2EAgentSchemaOutput(t *testing.T) {
 	skipIfShort(t)
 
-	out, code := runGitty(t, t.TempDir(), nil, "agent", "schema")
+	stdout, stderr, code := runGitty(t, t.TempDir(), nil, "agent", "schema")
 	if code != 0 {
-		t.Fatalf("agent schema exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("agent schema exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
 
 	var schema AgentSchema
-	if err := json.Unmarshal([]byte(out), &schema); err != nil {
-		t.Fatalf("agent schema output is not valid JSON: %v\n%s", err, out)
+	if err := json.Unmarshal([]byte(stdout), &schema); err != nil {
+		t.Fatalf("agent schema stdout is not valid JSON: %v\n%s", err, stdout)
 	}
 	if schema.Name != "gitty" {
 		t.Errorf("schema name = %q, want gitty", schema.Name)
@@ -371,32 +478,32 @@ func TestE2ECLIErrors(t *testing.T) {
 	skipIfShort(t)
 
 	t.Run("no arguments", func(t *testing.T) {
-		out, code := runGitty(t, t.TempDir(), nil)
-		if code != 1 || !strings.Contains(out, "Usage:") {
-			t.Errorf("exit = %d, want 1 with usage:\n%s", code, out)
+		_, stderr, code := runGitty(t, t.TempDir(), nil)
+		if code != 2 || !strings.Contains(stderr, "Usage:") {
+			t.Errorf("exit = %d, want 2 with usage on stderr:\n%s", code, stderr)
 		}
 	})
 
 	t.Run("unknown command", func(t *testing.T) {
-		out, code := runGitty(t, t.TempDir(), nil, "frobnicate")
-		if code != 1 || !strings.Contains(out, "Unknown command") {
-			t.Errorf("exit = %d, want 1 with unknown-command message:\n%s", code, out)
+		_, stderr, code := runGitty(t, t.TempDir(), nil, "frobnicate")
+		if code != 2 || !strings.Contains(stderr, "Unknown command") {
+			t.Errorf("exit = %d, want 2 with unknown-command message on stderr:\n%s", code, stderr)
 		}
 	})
 
 	t.Run("sync without workspace config", func(t *testing.T) {
-		out, code := runGitty(t, t.TempDir(), nil, "sync", "--path=acme", "--anon")
-		if code != 1 || !strings.Contains(out, ".gitty/config") {
-			t.Errorf("exit = %d, want 1 mentioning missing config:\n%s", code, out)
+		_, stderr, code := runGitty(t, t.TempDir(), nil, "sync", "--path=acme", "--anon")
+		if code != 2 || !strings.Contains(stderr, ".gitty/config") {
+			t.Errorf("exit = %d, want 2 mentioning missing config on stderr:\n%s", code, stderr)
 		}
 	})
 
 	t.Run("sync without token or anon", func(t *testing.T) {
 		f := newFakeGitLab(t)
 		ws := initWorkspace(t, f)
-		out, code := runGitty(t, ws, nil, "sync", "--path=acme")
-		if code != 1 || !strings.Contains(out, "token") {
-			t.Errorf("exit = %d, want 1 mentioning token requirement:\n%s", code, out)
+		_, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme")
+		if code != 2 || !strings.Contains(stderr, "token") {
+			t.Errorf("exit = %d, want 2 mentioning token requirement on stderr:\n%s", code, stderr)
 		}
 	})
 }
@@ -412,10 +519,14 @@ func TestE2ESyncCloneThenPull(t *testing.T) {
 
 	ws := initWorkspace(t, f)
 
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--token=sekret")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--token=sekret")
 	if code != 0 {
-		t.Fatalf("initial sync exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("initial sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
+	if !strings.Contains(stdout, "clone acme/portal\n") {
+		t.Errorf("stdout missing clone event:\n%s", stdout)
+	}
+	assertGreppableStdout(t, stdout)
 	readme := filepath.Join(ws, "acme", "portal", "README.md")
 	if got := readFileT(t, readme); got != "v1" {
 		t.Errorf("cloned README = %q, want v1", got)
@@ -431,17 +542,34 @@ func TestE2ESyncCloneThenPull(t *testing.T) {
 	// Publish an upstream change, then re-sync: the existing checkout must be
 	// fast-forwarded, not re-cloned.
 	f.pushUpdate(t, work, "acme/portal", "README.md", "v2")
-	out, code = runGitty(t, ws, nil, "sync", "--path=acme", "--token=sekret")
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "--path=acme", "--token=sekret")
 	if code != 0 {
-		t.Fatalf("re-sync exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("re-sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(out, "git pull --ff-only") {
-		t.Errorf("re-sync output missing ff-only pull:\n%s", out)
+	if !strings.Contains(stdout, "pull acme/portal\n") {
+		t.Errorf("stdout missing pull event:\n%s", stdout)
 	}
+	assertGreppableStdout(t, stdout)
 	if got := readFileT(t, readme); got != "v2" {
 		t.Errorf("pulled README = %q, want v2", got)
 	}
 }
+
+// assertGreppableStdout enforces the constitution's output contract: every
+// stdout line is one machine-readable event with a stable prefix.
+func assertGreppableStdout(t *testing.T, stdout string) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimRight(stdout, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		if !e2eEventRe.MatchString(line) {
+			t.Errorf("stdout line is not a stable event: %q", line)
+		}
+	}
+}
+
+var e2eEventRe = regexp.MustCompile(`^(clone|pull|group|reclone|skip|error|plan|summary) `)
 
 func TestE2ETokenFromEnvironment(t *testing.T) {
 	skipIfShort(t)
@@ -451,9 +579,9 @@ func TestE2ETokenFromEnvironment(t *testing.T) {
 	f.requireToken = "envsecret"
 
 	ws := initWorkspace(t, f)
-	out, code := runGitty(t, ws, []string{"GITLAB_TOKEN=envsecret"}, "sync", "--path=acme", "--dry-run")
+	stdout, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=envsecret"}, "sync", "--path=acme", "--dry-run")
 	if code != 0 {
-		t.Fatalf("sync with env token exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("sync with env token exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
 
 	f.mu.Lock()
@@ -473,12 +601,15 @@ func TestE2EAnonSync(t *testing.T) {
 	f.projects["acme"] = []apiProject{f.project(11, "acme/public")}
 
 	ws := initWorkspace(t, f)
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
 	if code != 0 {
-		t.Fatalf("anon sync exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("anon sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(out, "Running anonymously") {
-		t.Errorf("anon sync output missing anonymous notice:\n%s", out)
+	if !strings.Contains(stderr, "Running anonymously") {
+		t.Errorf("anon notice should be on stderr:\n%s", stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/public\n") {
+		t.Errorf("stdout missing clone event:\n%s", stdout)
 	}
 	if got := readFileT(t, filepath.Join(ws, "acme", "public", "file.txt")); got != "public" {
 		t.Errorf("cloned file = %q, want public", got)
@@ -500,9 +631,12 @@ func TestE2EGroupsSyncAndNestedContext(t *testing.T) {
 	ws := initWorkspace(t, f)
 
 	// Recreate the full group hierarchy with per-directory configs.
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--groups", "--nested", "--anon")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--groups", "--nested", "--anon")
 	if code != 0 {
-		t.Fatalf("groups sync exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("groups sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "group acme/team/sub\n") {
+		t.Errorf("stdout missing group event:\n%s", stdout)
 	}
 	for _, g := range []string{"acme", "acme/team", "acme/team/sub"} {
 		confPath := filepath.Join(ws, filepath.FromSlash(g), ConfigDir, ConfigName)
@@ -521,9 +655,9 @@ func TestE2EGroupsSyncAndNestedContext(t *testing.T) {
 	// Nested-context sync: run from inside a managed subgroup directory with
 	// no --path; the local config's root_path anchors the sync.
 	subDir := filepath.Join(ws, "acme", "team")
-	out, code = runGitty(t, subDir, nil, "sync", "--repos", "--anon")
+	stdout, stderr, code = runGitty(t, subDir, nil, "sync", "--repos", "--anon")
 	if code != 0 {
-		t.Fatalf("nested-context sync exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("nested-context sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
 	if got := readFileT(t, filepath.Join(subDir, "toolrepo", "tool.txt")); got != "tooling" {
 		t.Errorf("nested-context cloned file = %q, want tooling", got)
@@ -544,18 +678,18 @@ func TestE2ENestedRepoSync(t *testing.T) {
 	ws := initWorkspace(t, f)
 
 	// Flat sync first: only the immediate project should appear.
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
 	if code != 0 {
-		t.Fatalf("flat sync exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("flat sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
 	if _, err := os.Stat(filepath.Join(ws, "acme", "team", "toolrepo")); !os.IsNotExist(err) {
 		t.Error("flat sync must not clone subgroup projects")
 	}
 
 	// Nested sync pulls in the subgroup project too.
-	out, code = runGitty(t, ws, nil, "sync", "--path=acme", "--nested", "--anon")
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "--path=acme", "--nested", "--anon")
 	if code != 0 {
-		t.Fatalf("nested sync exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("nested sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
 	if got := readFileT(t, filepath.Join(ws, "acme", "rootrepo", "root.txt")); got != "root" {
 		t.Errorf("root repo file = %q, want root", got)
@@ -576,15 +710,19 @@ func TestE2EDryRunCreatesNothing(t *testing.T) {
 	f.projects["acme"] = []apiProject{f.project(40, "acme/portal")}
 
 	ws := initWorkspace(t, f)
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--groups", "--repos", "--nested", "--anon", "--dry-run")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--groups", "--repos", "--nested", "--anon", "--dry-run")
 	if code != 0 {
-		t.Fatalf("dry-run exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("dry-run exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
-	for _, want := range []string{"DRY RUN MODE ENABLED", "Would create group", "Would clone"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("dry-run output missing %q:\n%s", want, out)
+	if !strings.Contains(stderr, "DRY RUN MODE ENABLED") {
+		t.Errorf("dry-run banner should be on stderr:\n%s", stderr)
+	}
+	for _, want := range []string{"plan group acme\n", "plan clone acme/portal\n"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("dry-run stdout missing %q:\n%s", want, stdout)
 		}
 	}
+	assertGreppableStdout(t, stdout)
 
 	entries, err := os.ReadDir(ws)
 	if err != nil {
@@ -610,12 +748,12 @@ func TestE2EPaginationClonesAllPages(t *testing.T) {
 	f.projects["acme"] = []apiProject{f.project(50, "acme/alpha"), f.project(51, "acme/beta")}
 
 	ws := initWorkspace(t, f)
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
 	if code != 0 {
-		t.Fatalf("paginated sync exit = %d, want 0:\n%s", code, out)
+		t.Fatalf("paginated sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(out, "Found 2 projects.") {
-		t.Errorf("expected both pages aggregated into 2 projects:\n%s", out)
+	if !strings.Contains(stderr, "Found 2 projects.") {
+		t.Errorf("expected both pages aggregated into 2 projects:\n%s", stderr)
 	}
 	if got := readFileT(t, filepath.Join(ws, "acme", "alpha", "a.txt")); got != "alpha" {
 		t.Errorf("alpha file = %q", got)
@@ -625,18 +763,85 @@ func TestE2EPaginationClonesAllPages(t *testing.T) {
 	}
 }
 
+func TestE2EVerbose(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/vrepo", map[string]string{"v.txt": "v"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(95, "acme/vrepo")}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--verbose")
+	if code != 0 {
+		t.Fatalf("verbose sync exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "exec git clone") {
+		t.Errorf("verbose exec line missing from stderr:\n%s", stderr)
+	}
+	if strings.Contains(stdout, "exec git") {
+		t.Errorf("verbose exec line leaked to stdout:\n%s", stdout)
+	}
+	assertGreppableStdout(t, stdout)
+}
+
+func TestE2ESummaryLine(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/one", map[string]string{"a.txt": "a"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(90, "acme/one")}
+
+	ws := initWorkspace(t, f)
+
+	lastLine := func(s string) string {
+		lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+		return lines[len(lines)-1]
+	}
+
+	// Dry run and real run must produce the identical summary (parity).
+	dryOut, _, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run exit = %d", code)
+	}
+	realOut, _, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("real sync exit = %d", code)
+	}
+	want := "summary cloned=1 pulled=0 skipped=0 errors=0"
+	if got := lastLine(dryOut); got != want {
+		t.Errorf("dry-run summary = %q, want %q", got, want)
+	}
+	if got := lastLine(realOut); got != want {
+		t.Errorf("real summary = %q, want %q", got, want)
+	}
+
+	// A second run pulls instead of cloning.
+	stdout, _, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("re-sync exit = %d", code)
+	}
+	if got := lastLine(stdout); got != "summary cloned=0 pulled=1 skipped=0 errors=0" {
+		t.Errorf("re-sync summary = %q", got)
+	}
+}
+
 func TestE2EUnknownGroupFailsNonZero(t *testing.T) {
 	skipIfShort(t)
 
 	f := newFakeGitLab(t)
 	ws := initWorkspace(t, f)
 
-	out, code := runGitty(t, ws, nil, "sync", "--path=ghost", "--anon")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=ghost", "--anon")
 	if code != 1 {
-		t.Errorf("sync of unknown group exit = %d, want 1:\n%s", code, out)
+		t.Errorf("sync of unknown group exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(out, "404") || !strings.Contains(out, "error(s)") {
-		t.Errorf("expected 404 and aggregate error in output:\n%s", out)
+	if !strings.Contains(stdout, "error ghost listing projects failed") {
+		t.Errorf("expected listing error event on stdout:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "404") || !strings.Contains(stderr, "error(s)") {
+		t.Errorf("expected 404 detail and aggregate error on stderr:\n%s", stderr)
 	}
 }
 
@@ -653,12 +858,12 @@ func TestE2EForeignCloneHostRejected(t *testing.T) {
 	}}
 
 	ws := initWorkspace(t, f)
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
 	if code != 1 {
-		t.Errorf("foreign-host sync exit = %d, want 1:\n%s", code, out)
+		t.Errorf("foreign-host sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(out, "does not match the configured instance") {
-		t.Errorf("expected host-mismatch message:\n%s", out)
+	if !strings.Contains(stdout, "error acme/hijack clone URL host does not match") {
+		t.Errorf("expected host-mismatch error event on stdout:\n%s", stdout)
 	}
 	if _, err := os.Stat(filepath.Join(ws, "acme", "hijack")); !os.IsNotExist(err) {
 		t.Error("foreign-host project must not be cloned")
@@ -682,20 +887,341 @@ func TestE2EWorkspaceEscapeBlocked(t *testing.T) {
 	if err := os.MkdirAll(ws, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if out, code := runGitty(t, ws, nil, "init", "--http", "--url="+f.srv.URL); code != 0 {
-		t.Fatalf("init failed:\n%s", out)
+	if stdout, stderr, code := runGitty(t, ws, nil, "init", "--http", "--url="+f.srv.URL); code != 0 {
+		t.Fatalf("init failed:\n%s\n%s", stdout, stderr)
 	}
 
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
 	if code != 1 {
-		t.Errorf("escape sync exit = %d, want 1:\n%s", code, out)
+		t.Errorf("escape sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(out, "escapes the workspace") {
-		t.Errorf("expected escape message:\n%s", out)
+	if !strings.Contains(stdout, "error ../evil resolved path escapes the workspace") {
+		t.Errorf("expected escape error event on stdout:\n%s", stdout)
 	}
 	if _, err := os.Stat(filepath.Join(base, "evil")); !os.IsNotExist(err) {
 		t.Error("escaping project must not be written outside the workspace")
 	}
+}
+
+func TestE2EConcurrentJobs(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.gitDelayNs.Store(int64(50 * time.Millisecond))
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	for i := 0; i < 6; i++ {
+		name := fmt.Sprintf("acme/conc%d", i)
+		f.addRepo(t, name, map[string]string{"f.txt": name})
+		f.projects["acme"] = append(f.projects["acme"], f.project(100+i, name))
+	}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--jobs=4")
+	if code != 0 {
+		t.Fatalf("concurrent sync exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	for i := 0; i < 6; i++ {
+		if !strings.Contains(stdout, fmt.Sprintf("clone acme/conc%d\n", i)) {
+			t.Errorf("missing clone event for conc%d:\n%s", i, stdout)
+		}
+	}
+	assertGreppableStdout(t, stdout)
+	// The high-water mark proves genuine overlap without flaky wall-clock
+	// timing assertions.
+	if max := f.gitMaxInflight.Load(); max < 2 {
+		t.Errorf("git request high-water mark = %d, want >= 2 (no concurrency observed)", max)
+	}
+
+	// Out-of-range --jobs is a usage error.
+	_, stderr, code = runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--jobs=0")
+	if code != 2 || !strings.Contains(stderr, "--jobs") {
+		t.Errorf("jobs=0 exit = %d, want 2 mentioning --jobs:\n%s", code, stderr)
+	}
+
+	// --jobs=1 remains valid serial behavior.
+	f.gitDelayNs.Store(0)
+	stdout, _, code = runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--jobs=1")
+	if code != 0 {
+		t.Fatalf("jobs=1 sync exit = %d:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "summary cloned=0 pulled=6 skipped=0 errors=0") {
+		t.Errorf("jobs=1 re-sync summary unexpected:\n%s", stdout)
+	}
+}
+
+func TestE2EBrokenCheckoutRecovery(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/portal", map[string]string{"README.md": "v1"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(97, "acme/portal")}
+
+	ws := initWorkspace(t, f)
+	if stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon"); code != 0 {
+		t.Fatalf("initial sync failed:\n%s\n%s", stdout, stderr)
+	}
+
+	// Break the checkout: a directory with content but no .git wedges a plain
+	// pull forever.
+	local := filepath.Join(ws, "acme", "portal")
+	if err := os.RemoveAll(filepath.Join(local, ".git")); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	if code != 1 {
+		t.Errorf("broken checkout sync exit = %d, want 1:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "error acme/portal broken checkout") {
+		t.Errorf("expected broken-checkout error event:\n%s", stdout)
+	}
+
+	// Dry-run with the flag plans the reclone but must not move anything.
+	stdout, _, code = runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--reclone-broken", "--dry-run")
+	if code != 0 {
+		t.Errorf("dry-run reclone exit = %d, want 0:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "plan reclone acme/portal") {
+		t.Errorf("expected plan reclone event:\n%s", stdout)
+	}
+	if _, err := os.Stat(local + ".gitty-broken-1"); !os.IsNotExist(err) {
+		t.Error("dry-run must not create the aside directory")
+	}
+
+	// Real reclone: the broken dir is renamed aside (preserved) and a fresh
+	// clone takes its place.
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--reclone-broken")
+	if code != 0 {
+		t.Fatalf("reclone sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "reclone acme/portal\n") {
+		t.Errorf("expected reclone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(local+".gitty-broken-1", "README.md")); got != "v1" {
+		t.Errorf("aside dir should preserve original contents, got %q", got)
+	}
+	if got := readFileT(t, filepath.Join(local, "README.md")); got != "v1" {
+		t.Errorf("fresh clone content = %q", got)
+	}
+	gitRun(t, local, "rev-parse", "--is-inside-work-tree")
+}
+
+func TestE2ESIGINTInterruptsAndRecovers(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.gitDelayNs.Store(int64(200 * time.Millisecond))
+	f.addRepo(t, "acme/first", map[string]string{"a.txt": "a"})
+	f.addRepo(t, "acme/second", map[string]string{"b.txt": "b"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(98, "acme/first"), f.project(99, "acme/second")}
+
+	ws := initWorkspace(t, f)
+	cmd, stdout, stderr := startGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+
+	// Wait until the sync is demonstrably mid-git, then interrupt. Polling the
+	// server's hit counter makes this deterministic — no timing guesses.
+	deadline := time.Now().Add(15 * time.Second)
+	for f.gitHits.Load() < 1 {
+		if time.Now().After(deadline) {
+			cmd.Process.Kill()
+			t.Fatal("timed out waiting for git traffic")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("signaling gitty: %v", err)
+	}
+
+	err := cmd.Wait()
+	code := 0
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("waiting for gitty: %v", err)
+		}
+		code = ee.ExitCode()
+	}
+	if code != 130 {
+		t.Errorf("interrupted exit = %d, want 130\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "interrupted") {
+		t.Errorf("stderr missing interrupted notice:\n%s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "summary ") {
+		t.Errorf("summary line must still print on interrupt:\n%s", stdout.String())
+	}
+
+	// Recovery proof: a follow-up sync completes clean and both repos exist.
+	f.gitDelayNs.Store(0)
+	out, stderrStr, rcode := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	if rcode != 0 {
+		t.Fatalf("recovery sync exit = %d, want 0:\n%s\n%s", rcode, out, stderrStr)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "first", "a.txt")); got != "a" {
+		t.Errorf("first repo content = %q", got)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "second", "b.txt")); got != "b" {
+		t.Errorf("second repo content = %q", got)
+	}
+}
+
+// assertNoTokenAnywhere fails if the token appears in the given output
+// streams or in any file under root (covers .git/config, credential stores,
+// FETCH_HEAD — everything).
+func assertNoTokenAnywhere(t *testing.T, token, root string, streams ...string) {
+	t.Helper()
+	for i, s := range streams {
+		if strings.Contains(s, token) {
+			t.Errorf("token leaked into output stream %d:\n%s", i, s)
+		}
+	}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, ierr := d.Info(); ierr != nil || info.Size() > 1<<20 {
+			return nil
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr == nil && bytes.Contains(data, []byte(token)) {
+			t.Errorf("token found on disk at %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+}
+
+func TestE2EHTTPAuthClonePull(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-e2e-sekret"
+	f := newFakeGitLab(t)
+	f.gitAuthUser, f.gitAuthPass = "oauth2", token
+	f.requireToken = token
+	work := f.addRepo(t, "acme/authrepo", map[string]string{"README.md": "v1"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(110, "acme/authrepo")}
+
+	ws := initWorkspace(t, f)
+
+	// Clone against the auth-requiring git server, with --verbose to maximize
+	// the leak surface under test.
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--token="+token, "--verbose")
+	if code != 0 {
+		t.Fatalf("authenticated clone exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "authrepo", "README.md")); got != "v1" {
+		t.Errorf("cloned README = %q", got)
+	}
+	f.mu.Lock()
+	gitAuth := f.lastGitAuth
+	f.mu.Unlock()
+	if gitAuth != "oauth2:"+token {
+		t.Errorf("git server saw auth %q, want oauth2:%s", gitAuth, token)
+	}
+	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
+
+	// Authenticated pull: upstream change picked up through the injected path.
+	f.pushUpdate(t, work, "acme/authrepo", "README.md", "v2")
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "--path=acme", "--token="+token, "--verbose")
+	if code != 0 {
+		t.Fatalf("authenticated pull exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "authrepo", "README.md")); got != "v2" {
+		t.Errorf("pulled README = %q, want v2", got)
+	}
+	if !strings.Contains(stdout, "pull acme/authrepo\n") {
+		t.Errorf("missing pull event:\n%s", stdout)
+	}
+	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
+}
+
+func TestE2ECIJobTokenUsername(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "ci-job-tok-123"
+	f := newFakeGitLab(t)
+	f.gitAuthUser, f.gitAuthPass = "gitlab-ci-token", token
+	f.requireToken = token
+	f.addRepo(t, "acme/cirepo", map[string]string{"ci.txt": "ci"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(111, "acme/cirepo")}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, []string{"CI_JOB_TOKEN=" + token}, "sync", "--path=acme")
+	if code != 0 {
+		t.Fatalf("CI-token clone exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	f.mu.Lock()
+	gitAuth := f.lastGitAuth
+	f.mu.Unlock()
+	if gitAuth != "gitlab-ci-token:"+token {
+		t.Errorf("git server saw auth %q, want gitlab-ci-token:%s", gitAuth, token)
+	}
+	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
+}
+
+func TestE2EBadTokenFailsFast(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.gitAuthUser, f.gitAuthPass = "oauth2", "right-token"
+	f.addRepo(t, "acme/lockedrepo", map[string]string{"x.txt": "x"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(112, "acme/lockedrepo")}
+
+	ws := initWorkspace(t, f)
+	// Wrong token: the API side accepts (requireToken unset) but the git
+	// server 401s. Must fail promptly — no hanging on a terminal prompt —
+	// with an error event and exit 1.
+	stdout, _, code := runGitty(t, ws, nil, "sync", "--path=acme", "--token=wrong-token")
+	if code != 1 {
+		t.Errorf("bad-token sync exit = %d, want 1:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "error acme/lockedrepo git clone failed") {
+		t.Errorf("expected clone failure event:\n%s", stdout)
+	}
+}
+
+func TestE2EAmbientCredentialHelperIgnored(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-helper-test"
+	f := newFakeGitLab(t)
+	f.gitAuthUser, f.gitAuthPass = "oauth2", token
+	f.addRepo(t, "acme/helperrepo", map[string]string{"h.txt": "h"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(113, "acme/helperrepo")}
+
+	// A fake HOME with a configured `store` credential helper holding WRONG
+	// credentials for our host. The empty-helper reset must ignore it on read
+	// AND prevent it from capturing our token on write.
+	home := t.TempDir()
+	gitconfig := "[credential]\n\thelper = store\n"
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(gitconfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+	credFile := filepath.Join(home, ".git-credentials")
+	host := strings.TrimPrefix(f.srv.URL, "http://")
+	if err := os.WriteFile(credFile, []byte("http://oauth2:stale-wrong@"+host+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ws := initWorkspace(t, f)
+	env := []string{"HOME=" + home, "XDG_CONFIG_HOME="}
+	stdout, stderr, code := runGitty(t, ws, env, "sync", "--path=acme", "--token="+token)
+	if code != 0 {
+		t.Fatalf("sync with ambient helper exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	// The store helper must not have captured our token.
+	if creds := readFileT(t, credFile); strings.Contains(creds, token) {
+		t.Errorf("ambient store helper captured the injected token:\n%s", creds)
+	}
+	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
 }
 
 func TestE2EDivergedCheckoutFailsPull(t *testing.T) {
@@ -707,8 +1233,8 @@ func TestE2EDivergedCheckoutFailsPull(t *testing.T) {
 	f.projects["acme"] = []apiProject{f.project(80, "acme/portal")}
 
 	ws := initWorkspace(t, f)
-	if out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon"); code != 0 {
-		t.Fatalf("initial sync failed:\n%s", out)
+	if stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon"); code != 0 {
+		t.Fatalf("initial sync failed:\n%s\n%s", stdout, stderr)
 	}
 
 	// Diverge: a different commit upstream and a local commit in the checkout.
@@ -719,12 +1245,15 @@ func TestE2EDivergedCheckoutFailsPull(t *testing.T) {
 	}
 	gitRun(t, local, "commit", "-am", "local divergence")
 
-	out, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
 	if code != 1 {
-		t.Errorf("diverged sync exit = %d, want 1:\n%s", code, out)
+		t.Errorf("diverged sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(out, "git pull failed") {
-		t.Errorf("expected pull failure message:\n%s", out)
+	if !strings.Contains(stdout, "error acme/portal git pull failed") {
+		t.Errorf("expected pull failure event on stdout:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "--- git pull --ff-only for acme/portal failed") {
+		t.Errorf("expected attributed git output block on stderr:\n%s", stderr)
 	}
 	// The local commit must survive: --ff-only never merges or overwrites.
 	if got := readFileT(t, filepath.Join(local, "README.md")); got != "v2-local" {
