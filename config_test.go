@@ -43,6 +43,29 @@ func TestLoadLocalConfigMissing(t *testing.T) {
 	}
 }
 
+func TestRunSyncErrorsWithoutConfig(t *testing.T) {
+	t.Chdir(t.TempDir())
+	err := runSync("acme", "", false, false, true, false, false)
+	if err == nil {
+		t.Fatal("expected an error when no .gitty/config exists")
+	}
+}
+
+func TestRunSyncErrorsWithoutTokenOrAnon(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	runInit("https://gitlab.com", true)
+
+	// Ensure no ambient tokens satisfy the requirement.
+	t.Setenv("GITLAB_TOKEN", "")
+	t.Setenv("CI_JOB_TOKEN", "")
+
+	err := runSync("acme", "", false, false, true, false, false)
+	if err == nil {
+		t.Fatal("expected an error when no token is provided and --anon is not set")
+	}
+}
+
 func TestRunInitWritesConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
