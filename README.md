@@ -179,6 +179,26 @@ to map the arguments onto an argv array (e.g. the `sync` tool with
 
 ---
 
+## Development
+
+Run the full test suite (unit + end-to-end):
+
+```bash
+go test ./...
+```
+
+The end-to-end tests build the real `gitty` binary and drive it as a subprocess
+against a local fake GitLab API server that also serves actual git repositories
+over HTTP, so clone/pull behavior, exit codes, pagination, and the safety
+guards are all exercised without a network connection or token. Skip them for a
+fast unit-only run with:
+
+```bash
+go test -short ./...
+```
+
+---
+
 ## TODO
 
 - [x] Add a gitty config to each group so that you can go into them and pull from that path
