@@ -27,8 +27,10 @@ disk and keep them updated. It:
   stderr. Parse stdout only.
 
 Use it for: bulk-cloning an org/group, keeping a local mirror in sync,
-bootstrapping a workspace in CI. Do NOT use it for: pushing changes, managing
-merge requests, or per-repository operations — it only clones/pulls.
+bootstrapping a workspace in CI, checking which local checkouts are stale or
+dirty (`status`), and previewing what a sync would bring down (`ls`). Do NOT
+use it for: pushing changes, managing merge requests, or per-repository
+operations — it only clones/pulls.
 
 ## Installation
 
@@ -113,6 +115,53 @@ How `--groups` and `--repos` interact:
 - `--path=tenant --groups` → creates only the empty subgroup directory tree.
 - `--path=tenant --groups --repos` → both.
 
+### `gitty status` — report local checkout state
+
+Walks the workspace and prints one line per git checkout. Read-only; no token
+or network needed unless `--fetch` is passed.
+
+| Flag        | Type    | Default | Description |
+| :---------- | :------ | :------ | :---------- |
+| `--fetch`   | boolean | `false` | Refresh remote-tracking refs first so `behind` reflects the remote now. Needs network, and a token for HTTP remotes. |
+| `--token`   | string  | `""`    | Only used with `--fetch`. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. |
+| `--anon`    | boolean | `false` | With `--fetch`, contact public repositories without a token. |
+| `--jobs`    | integer | `4`     | Repositories inspected concurrently (1-16). |
+| `--verbose` | boolean | `false` | Print git invocations to stderr (URLs redacted). |
+
+```
+status tenant/images/app branch=main ahead=0 behind=3 dirty=false
+status tenant/images/spike branch=exp ahead=0 behind=0 dirty=false upstream=none
+summary repos=2 dirty=0 ahead=0 behind=1 errors=0
+```
+
+`dirty=true` includes untracked files. `upstream=none` means the branch has no
+tracking ref, so ahead/behind are unknowable rather than zero — do not read
+`0/0` as "in sync" when that marker is present.
+
+### `gitty ls` — preview a group's contents
+
+Lists remote groups/projects under a target and whether each project is
+already checked out. Contacts the API; never runs git or writes to disk.
+
+| Flag       | Type    | Default | Description |
+| :--------- | :------ | :------ | :---------- |
+| `--path`   | string  | `""`    | Group path to list. Required unless run from a managed subgroup directory. |
+| `--token`  | string  | `""`    | Access token; falls back to env vars. Required unless `--anon`. |
+| `--anon`   | boolean | `false` | List public resources without a token. |
+| `--nested` | boolean | `false` | Recurse into subgroups. Per-group counts are only complete in this mode. |
+| `--format` | string  | `text`  | `text` (event lines), `tree` (indented), or `json`. Prefer `json` when parsing. |
+
+```
+group tenant/images projects=2
+project tenant/images/app present
+project tenant/images/lib new
+summary groups=1 projects=2 new=1 present=1
+```
+
+Use `ls` to answer "what would a sync clone, and how much?" without touching
+the filesystem; use `sync --dry-run` when you want the plan in sync's own
+event vocabulary.
+
 ### `gitty agent schema` — emit a machine-readable tool schema
 
 Prints an MCP-style JSON description of every gitty command (name, description,
@@ -167,9 +216,13 @@ gitty sync --path=tenant/images --nested
 2. Ensure a workspace exists: if there is no `.gitty/config`, run `gitty init`
    (choose `--http` for CI/token-based cloning).
 3. Ensure a token is available via `--token` or the `GITLAB_TOKEN` /
-   `CI_JOB_TOKEN` environment variable.
-4. Run `gitty sync --path=<group>` (add `--nested` for the full tree). Prefer
+   `CI_JOB_TOKEN` environment variable (or pass `--anon` for public groups).
+4. Optionally run `gitty ls --path=<group> --nested --format=json` to see how
+   many projects the group holds and which are not yet cloned.
+5. Run `gitty sync --path=<group>` (add `--nested` for the full tree). Prefer
    `--dry-run` first to preview the actions.
+6. Run `gitty status` afterwards (or later) to see which checkouts are dirty or
+   behind; add `--fetch` for remote-accurate `behind` counts.
 
 ## CI/CD example (GitLab)
 
