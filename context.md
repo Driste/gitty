@@ -12,11 +12,19 @@ disk and keep them updated. It:
 
 - Preserves the GitLab namespace as a directory tree (e.g. `tenant/images/app`
   becomes `./tenant/images/app`), preventing name collisions.
-- Clones repositories that do not exist locally and runs `git pull` on the ones
-  that do — a single command idempotently brings a workspace up to date.
+- Clones repositories that do not exist locally and runs `git pull --ff-only`
+  on the ones that do — a single command idempotently brings a workspace up to
+  date, and diverged/dirty checkouts fail loudly instead of being merged.
 - Anchors a workspace with a `.gitty/config` file so the GitLab URL and
   SSH/HTTP preference do not have to be repeated on every invocation.
-- Works in CI: it automatically reads `GITLAB_TOKEN` or `CI_JOB_TOKEN`.
+- Works in CI: it automatically reads `GITLAB_TOKEN` or `CI_JOB_TOKEN`, uses
+  the token for HTTP git authentication (as `oauth2` / `gitlab-ci-token`
+  respectively), and exits non-zero when any item fails.
+- Emits one machine-readable event per line on stdout (`clone <path>`,
+  `pull <path>`, `group <path>`, `reclone <path>`, `error <path> <reason>`,
+  `plan <action> <path>` under --dry-run, and a final
+  `summary cloned=N pulled=N skipped=N errors=N`); human diagnostics go to
+  stderr. Parse stdout only.
 
 Use it for: bulk-cloning an org/group, keeping a local mirror in sync,
 bootstrapping a workspace in CI. Do NOT use it for: pushing changes, managing
@@ -42,7 +50,12 @@ sha256sum -c SHA256SUMS --ignore-missing
   with `root_path` set to that subgroup, so you can `cd` into it and run
   `gitty sync` without repeating `--path`.
 - **Token resolution order** for `sync`: `--token` flag → `GITLAB_TOKEN` env →
-  `CI_JOB_TOKEN` env. A token is required.
+  `CI_JOB_TOKEN` env. A token is required unless `--anon` is passed (public
+  resources only). In `--http` mode the token also authenticates git itself,
+  handed over via an internal askpass re-exec — never on the command line and
+  never written to disk.
+- **Exit codes**: `0` success, `1` completed with per-item failures, `2` usage
+  or configuration error (do not retry unchanged), `130` interrupted.
 
 ## Commands
 
@@ -50,10 +63,11 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 Writes `.gitty/config` in the current directory. Run once in the root folder.
 
-| Flag     | Type    | Default                 | Description |
-| :------- | :------ | :---------------------- | :---------- |
-| `--url`  | string  | `https://gitlab.com`    | Base URL of the GitLab instance (change for self-hosted). |
-| `--http` | boolean | `false`                 | Clone over HTTPS instead of SSH. Recommended for CI runners. |
+| Flag      | Type    | Default                 | Description |
+| :-------- | :------ | :---------------------- | :---------- |
+| `--url`   | string  | `https://gitlab.com`    | Base URL of the GitLab instance (change for self-hosted). Must be http(s). Inside a GitLab CI job, defaults to `CI_SERVER_URL` when not passed. |
+| `--http`  | boolean | `false`                 | Clone over HTTPS instead of SSH. Recommended for CI runners. |
+| `--force` | boolean | `false`                 | Overwrite an existing `.gitty/config`; without it, re-init refuses (exit 2). |
 
 ```bash
 cd ~/my-workspace
@@ -65,14 +79,18 @@ gitty init --url="https://gitlab.mycompany.com" --http
 Requires a workspace created by `init`. Clones missing repos and pulls existing
 ones.
 
-| Flag        | Type    | Default | Description |
-| :---------- | :------ | :------ | :---------- |
-| `--path`    | string  | `""`    | GitLab group/subgroup path, e.g. `tenant/images`. Required unless run from a managed subgroup directory that already has its own config. |
-| `--token`   | string  | `""`    | GitLab access token. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. |
-| `--groups`  | boolean | `false` | Create the subgroup directory structure locally (each with its own config). |
-| `--repos`   | boolean | `false` | Clone/pull repositories. Defaults to `true` when neither `--groups` nor `--repos` is passed. |
-| `--nested`  | boolean | `false` | Recurse into nested subgroups/projects instead of only the immediate group. |
-| `--dry-run` | boolean | `false` | Print planned actions without creating directories or running git. |
+| Flag               | Type    | Default | Description |
+| :----------------- | :------ | :------ | :---------- |
+| `--path`           | string  | `""`    | GitLab group/subgroup path, e.g. `tenant/images`. Required unless run from a managed subgroup directory that already has its own config. |
+| `--token`          | string  | `""`    | GitLab access token. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. Required unless `--anon`. |
+| `--anon`           | boolean | `false` | Sync public groups/repositories anonymously, without a token. |
+| `--groups`         | boolean | `false` | Create the subgroup directory structure locally (each with its own config). |
+| `--repos`          | boolean | `false` | Clone/pull repositories. Defaults to `true` when neither `--groups` nor `--repos` is passed. |
+| `--nested`         | boolean | `false` | Recurse into nested subgroups/projects instead of only the immediate group. |
+| `--dry-run`        | boolean | `false` | Print planned actions (`plan <action> <path>` events) without creating directories or running git. Summary line matches the real run. |
+| `--jobs`           | integer | `4`     | Concurrent repo clone/pull operations (1-16). |
+| `--verbose`        | boolean | `false` | Print each git invocation and its output to stderr (URLs redacted). |
+| `--reclone-broken` | boolean | `false` | Move aside non-repo destinations (renamed `<dir>.gitty-broken-<n>`, never deleted) and clone fresh; without it they are `error` events. |
 
 ```bash
 export GITLAB_TOKEN="glpat-XXXXXXXX"
@@ -170,8 +188,15 @@ clone_all_repos:
 ## Notes and gotchas
 
 - `sync` must be run from a workspace directory; if there is no `.gitty/config`
-  it exits with an error telling you to run `gitty init` first.
-- Cloning uses the local git environment (`SSH_AUTH_SOCK`, `~/.gitconfig`), so
-  SSH cloning requires working SSH keys; otherwise use `--http`.
-- The tool never deletes local repositories; it only clones new ones and pulls
-  existing ones.
+  it exits 2 with an error telling you to run `gitty init` first.
+- SSH cloning uses the local git environment (`SSH_AUTH_SOCK`, `~/.gitconfig`)
+  and requires working SSH keys; in `--http` mode gitty authenticates git
+  itself with the resolved token, and interactive credential prompts are
+  disabled so bad credentials fail fast instead of hanging.
+- The tool never deletes local repositories; it only clones new ones and
+  fast-forwards existing ones. Even `--reclone-broken` renames aside rather
+  than deleting.
+- Diverged or dirty checkouts make `git pull --ff-only` fail: the repo is
+  reported as an `error` event and left untouched for manual resolution.
+- Ctrl-C (SIGINT) is safe: in-flight git processes are signalled to clean up,
+  the run exits 130, and a re-run picks up where it stopped.

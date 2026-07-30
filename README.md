@@ -24,7 +24,7 @@ Ensure you have Go installed, then clone this repository and build the binary:
 go mod tidy
 
 # Build the executable
-go build -o gitty main.go
+go build -o gitty .
 
 # (Optional) Install globally
 sudo mv gitty /usr/local/bin/
@@ -43,8 +43,9 @@ gitty init [flags]
 ### Init Flags
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--url` | `https://gitlab.com` | The base URL of your GitLab instance (change this if using self-hosted GitLab). |
+| `--url` | `https://gitlab.com` | The base URL of your GitLab instance (change this if using self-hosted GitLab). Must be an `http(s)://` URL. |
 | `--http` | `false` | Use HTTP(S) for cloning (`https://...`) instead of the default SSH (`git@...`). |
+| `--force` | `false` | Overwrite an existing `.gitty/config`. Without it, `init` refuses to clobber an initialized workspace (which would reset its `root_path`). |
 
 **Example:**
 ```bash
@@ -72,7 +73,40 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
 | `--repos` | `false` | Only fetch and clone/pull repositories. *(Note: If neither `--groups` nor `--repos` is passed, it defaults to `--repos`)*. |
 | `--nested` | `false` | Include nested subgroups and projects recursively. |
-| `--dry-run`| `false` | Print what would happen without creating directories or executing git commands. |
+| `--dry-run`| `false` | Print planned actions (`plan clone <path>` etc.) without creating directories or executing git commands. Dry-run output is diffable against a real run's actions and produces the identical `summary` line. |
+| `--jobs` | `4` | Number of concurrent repo clone/pull operations (1-16). `--jobs=1` restores fully serial behavior. |
+| `--verbose` | `false` | Print each git invocation and its output to stderr, with URL credentials redacted. |
+| `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
+
+### Output and exit codes
+
+`gitty sync` writes one machine-readable event per line to **stdout** — stable
+prefixes, grep-friendly — while all human diagnostics (banners, progress, git
+output) go to **stderr**:
+
+```
+clone tenant/images/app        # repo cloned
+pull tenant/images/app         # repo fast-forwarded (git pull --ff-only)
+group tenant/images            # group dir + nested config ensured
+reclone tenant/images/app      # broken checkout moved aside and re-cloned
+error tenant/images/app git pull failed
+plan clone tenant/images/app   # --dry-run: "plan " + the exact action line
+summary cloned=3 pulled=12 skipped=0 errors=1   # always the last line
+```
+
+Exit codes: `0` success · `1` completed with per-item failures · `2` usage or
+configuration error · `130` interrupted (Ctrl-C; git is signalled cleanly and
+a re-run recovers the workspace).
+
+### Authentication for HTTP clones
+
+In `--http` mode, gitty authenticates `git clone`/`git pull` itself: it
+re-execs as git's askpass helper and hands the token over via the child
+process environment — never on the command line, never written to any git
+config or credential store (ambient credential helpers are disabled for the
+invocation). Personal/project access tokens authenticate as `oauth2`; a
+`CI_JOB_TOKEN` authenticates as `gitlab-ci-token` automatically. Credentials
+are only ever sent to the host of the configured instance URL.
 
 ### How `--groups` and `--repos` work together:
 * `gitty sync --path="tenant"`: Syncs **only** the immediate repositories inside `tenant`.
@@ -116,7 +150,11 @@ gitty sync --path="gitlab-examples/wayne-enterprises" --nested --anon
 ```
 
 ### 6. GitLab CI/CD Pipeline
-`gitty` will automatically pick up the ephemeral `CI_JOB_TOKEN`. Just ensure you configured your workspace to use HTTP during the `init` step, as CI runners typically can't use SSH.
+`gitty` automatically picks up the ephemeral `CI_JOB_TOKEN` for both the API
+and the git transport (authenticating as `gitlab-ci-token`), and `gitty init`
+defaults the instance URL to `CI_SERVER_URL` inside a CI job. Use HTTP during
+the `init` step, as CI runners typically can't use SSH. A failed sync exits
+non-zero, failing the job.
 ```yaml
 stages:
   - sync
@@ -125,7 +163,7 @@ clone_all_repos:
   stage: sync
   image: golang:latest
   script:
-    - go build -o gitty main.go
+    - go build -o gitty .
     - ./gitty init --http
     - ./gitty sync --path="tenant/images" --nested
 ```

@@ -1,21 +1,32 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
+	// Hidden re-exec mode: git invokes gitty as its askpass helper during
+	// authenticated HTTP clones/pulls. Must run before any flag parsing,
+	// config loading, or output.
+	if os.Getenv("GITTY_ASKPASS_MODE") == "1" {
+		runAskpass(os.Args)
+		return
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
-		os.Exit(1)
+		os.Exit(2)
 	}
 
 	initCmd := flag.NewFlagSet("init", flag.ExitOnError)
 	initURL := initCmd.String("url", "https://gitlab.com", "GitLab Base URL")
 	initHTTP := initCmd.Bool("http", false, "Use HTTP(S) for cloning instead of SSH")
+	initForce := initCmd.Bool("force", false, "Overwrite an existing .gitty/config")
 
 	syncCmd := flag.NewFlagSet("sync", flag.ExitOnError)
 	syncPath := syncCmd.String("path", "", "GitLab Group Path (e.g., tenant/images) (required)")
@@ -25,30 +36,73 @@ func main() {
 	syncRepos := syncCmd.Bool("repos", false, "Fetch and clone/pull repositories")
 	syncNested := syncCmd.Bool("nested", false, "Include nested subgroups/projects recursively")
 	syncAnon := syncCmd.Bool("anon", false, "Access public resources anonymously (no token required)")
+	syncVerbose := syncCmd.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
+	syncRecloneBroken := syncCmd.Bool("reclone-broken", false, "Move aside non-repo directories that block a clone (renamed, never deleted) and re-clone")
+	syncJobs := syncCmd.Int("jobs", 4, "Number of concurrent repo clone/pull operations (1-16)")
 
 	switch os.Args[1] {
 	case "init":
 		initCmd.Parse(os.Args[2:])
-		runInit(*initURL, *initHTTP)
+		// Inside a GitLab CI job, default the instance URL to the job's own
+		// server unless --url was passed explicitly. Only init applies this
+		// default: once written, the workspace config is the source of truth.
+		resolvedURL := *initURL
+		urlSet := false
+		initCmd.Visit(func(fl *flag.Flag) {
+			if fl.Name == "url" {
+				urlSet = true
+			}
+		})
+		if !urlSet && os.Getenv("GITLAB_CI") == "true" {
+			if ciURL := os.Getenv("CI_SERVER_URL"); ciURL != "" {
+				fmt.Fprintf(os.Stderr, "using CI_SERVER_URL=%s as instance URL\n", ciURL)
+				resolvedURL = ciURL
+			}
+		}
+		exitOnError(runInit(resolvedURL, *initHTTP, *initForce))
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
-		if err := runSync(*syncPath, *syncToken, *syncDryRun, *syncGroups, *syncRepos, *syncNested, *syncAnon); err != nil {
-			log.Fatalf("Error: %v", err)
-		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err := runSync(ctx, syncOptions{
+			Path:          *syncPath,
+			Token:         *syncToken,
+			DryRun:        *syncDryRun,
+			Groups:        *syncGroups,
+			Repos:         *syncRepos,
+			Nested:        *syncNested,
+			Anon:          *syncAnon,
+			Verbose:       *syncVerbose,
+			RecloneBroken: *syncRecloneBroken,
+			Jobs:          *syncJobs,
+		})
+		stop()
+		exitOnError(err)
 	case "agent":
 		runAgent(os.Args[2:])
 	default:
-		fmt.Printf("Unknown command: %s\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
-		os.Exit(1)
+		os.Exit(2)
 	}
 }
 
+// exitOnError reports a command error on stderr and exits with the taxonomy
+// code; a nil error returns normally (exit 0 at end of main).
+func exitOnError(err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	os.Exit(exitCode(err))
+}
+
+// printUsage writes usage to stderr: it is only ever printed on error paths
+// (no arguments or an unknown command).
 func printUsage() {
-	fmt.Println("Usage: gitty <command> [flags]")
-	fmt.Println("\nCommands:")
-	fmt.Println("  init    Initialize a gitty.toml config file in the current directory")
-	fmt.Println("  sync    Sync (clone/pull) a GitLab group based on the gitty.toml config")
-	fmt.Println("  agent   Print an MCP-style schema describing how an LLM/agent should use gitty")
-	fmt.Println("\nRun 'gitty <command> -h' for specific flags.")
+	fmt.Fprintln(os.Stderr, "Usage: gitty <command> [flags]")
+	fmt.Fprintln(os.Stderr, "\nCommands:")
+	fmt.Fprintln(os.Stderr, "  init    Initialize a .gitty/config file in the current directory")
+	fmt.Fprintln(os.Stderr, "  sync    Sync (clone/pull) a GitLab group based on the .gitty/config")
+	fmt.Fprintln(os.Stderr, "  agent   Print an MCP-style schema describing how an LLM/agent should use gitty")
+	fmt.Fprintln(os.Stderr, "\nRun 'gitty <command> -h' for specific flags.")
 }

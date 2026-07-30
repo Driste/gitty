@@ -14,10 +14,11 @@ import (
 
 // AgentSchema is the top-level document emitted by `gitty agent schema`.
 type AgentSchema struct {
-	Name        string      `json:"name"`
-	Version     string      `json:"version"`
-	Description string      `json:"description"`
-	Tools       []AgentTool `json:"tools"`
+	Name        string            `json:"name"`
+	Version     string            `json:"version"`
+	Description string            `json:"description"`
+	ExitCodes   map[string]string `json:"exitCodes,omitempty"`
+	Tools       []AgentTool       `json:"tools"`
 }
 
 // AgentTool describes a single invokable gitty command in MCP "tool" form.
@@ -53,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "1.0.0"
+const AgentSchemaVersion = "1.1.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -62,6 +63,12 @@ func buildAgentSchema() AgentSchema {
 		Name:        "gitty",
 		Version:     AgentSchemaVersion,
 		Description: "A configurable CLI to synchronize (clone/pull) GitLab groups, subgroups, and repositories to the local machine while preserving the GitLab namespace directory structure.",
+		ExitCodes: map[string]string{
+			"0":   "success",
+			"1":   "sync completed but one or more items failed (retryable)",
+			"2":   "usage or configuration error (do not retry without changing the invocation)",
+			"130": "interrupted (SIGINT/SIGTERM); a re-run recovers cleanly",
+		},
 		Tools: []AgentTool{
 			{
 				Name:        "init",
@@ -77,6 +84,11 @@ func buildAgentSchema() AgentSchema {
 						"http": {
 							Type:        "boolean",
 							Description: "Use HTTP(S) cloning (https://...) instead of the default SSH (git@...). Recommended for CI runners.",
+							Default:     false,
+						},
+						"force": {
+							Type:        "boolean",
+							Description: "Overwrite an existing .gitty/config. Without this, init refuses to clobber an initialized workspace.",
 							Default:     false,
 						},
 					},
@@ -105,6 +117,21 @@ func buildAgentSchema() AgentSchema {
 							Type:        "boolean",
 							Description: "Access public groups and repositories anonymously, without a token. Only public resources are visible in this mode.",
 							Default:     false,
+						},
+						"verbose": {
+							Type:        "boolean",
+							Description: "Print each git invocation and its output to stderr, with URLs redacted. Event lines on stdout are unaffected.",
+							Default:     false,
+						},
+						"reclone-broken": {
+							Type:        "boolean",
+							Description: "When a destination exists but is not a usable git repo, move it aside (renamed to <dir>.gitty-broken-<n>, never deleted) and clone fresh. Without this flag such destinations are reported as errors.",
+							Default:     false,
+						},
+						"jobs": {
+							Type:        "integer",
+							Description: "Number of concurrent repo clone/pull operations (1-16).",
+							Default:     4,
 						},
 						"groups": {
 							Type:        "boolean",

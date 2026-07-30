@@ -22,7 +22,7 @@ type Config struct {
 func LoadLocalConfig() (*Config, error) {
 	curr, _ := os.Getwd()
 	path := filepath.Join(curr, ConfigDir, ConfigName)
-	
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
