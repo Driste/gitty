@@ -66,7 +66,8 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | Flag | Default | Description |
 | :--- | :--- | :--- |
 | `--path` | `""` | **(Required)** The GitLab group or subgroup path (e.g., `tenant/images`). |
-| `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. |
+| `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
+| `--anon` | `false` | Sync public groups and repositories anonymously, without a token. Only public resources are visible in this mode. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
 | `--repos` | `false` | Only fetch and clone/pull repositories. *(Note: If neither `--groups` nor `--repos` is passed, it defaults to `--repos`)*. |
 | `--nested` | `false` | Include nested subgroups and projects recursively. |
@@ -107,7 +108,13 @@ Safely check what repositories would be downloaded recursively before actually d
 gitty sync --path="tenant/images" --nested --dry-run
 ```
 
-### 5. GitLab CI/CD Pipeline
+### 5. Anonymous Public Sync
+Sync a public group without any token (only public groups and repositories are visible).
+```bash
+gitty sync --path="gitlab-examples/wayne-enterprises" --nested --anon
+```
+
+### 6. GitLab CI/CD Pipeline
 `gitty` will automatically pick up the ephemeral `CI_JOB_TOKEN`. Just ensure you configured your workspace to use HTTP during the `init` step, as CI runners typically can't use SSH.
 ```yaml
 stages:
