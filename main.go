@@ -115,6 +115,8 @@ func main() {
 		})
 		stop()
 		exitOnError(err)
+	case "version":
+		runVersion()
 	case "agent":
 		runAgent(os.Args[2:])
 	default:
@@ -144,5 +146,6 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  status  Report the branch and freshness of every checkout in the workspace")
 	fmt.Fprintln(os.Stderr, "  ls      List the remote groups/projects for a target and what a sync would clone")
 	fmt.Fprintln(os.Stderr, "  agent   Print an MCP-style schema describing how an LLM/agent should use gitty")
+	fmt.Fprintln(os.Stderr, "  version Print the gitty version")
 	fmt.Fprintln(os.Stderr, "\nRun 'gitty <command> -h' for specific flags.")
 }
