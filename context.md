@@ -43,6 +43,10 @@ go build -o gitty .
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
+Check what you are running with `gitty version`: a release binary prints its
+tag (e.g. `v1.0.0`), a source build prints `dev` plus the commit it came from
+(e.g. `dev+5f76104a77d5`). It takes no flags and prints one bare line.
+
 ## Core concepts
 
 - **Workspace**: a directory containing a `.gitty/config` file. Created by

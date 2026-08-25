@@ -17,6 +17,25 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 
 ## Installation
 
+### From a release (recommended)
+
+Every tagged version publishes prebuilt binaries for Linux, macOS (Intel and
+Apple Silicon), and Windows, plus a `SHA256SUMS` file, on the
+[Releases page](https://github.com/Driste/gitty/releases). Download the binary
+for your platform, verify it, and put it on your `PATH`:
+
+```bash
+# Verify the download against the published checksums
+sha256sum -c SHA256SUMS --ignore-missing
+
+chmod +x gitty_v1.0.0_linux_amd64
+sudo mv gitty_v1.0.0_linux_amd64 /usr/local/bin/gitty
+
+gitty version   # prints the release tag, e.g. v1.0.0
+```
+
+### From source
+
 Ensure you have Go installed, then clone this repository and build the binary:
 
 ```bash
@@ -29,6 +48,32 @@ go build -o gitty .
 # (Optional) Install globally
 sudo mv gitty /usr/local/bin/
 ```
+
+A binary built this way reports `dev` plus the commit it was built from
+(e.g. `dev+5f76104a77d5`), so it is always clear whether you are running a
+release or a local build.
+
+---
+
+## Releasing
+
+Releases are built and published by
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which runs
+when a `v*` tag is pushed **or** a GitHub Release is published:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow runs `gofmt`, `go vet`, `go test ./...` and `go test -race` first —
+tags do not otherwise run CI, so nothing is published from a tree that fails
+these checks. It then cross-compiles the five platform binaries with the tag
+embedded via `-ldflags "-X main.version=<tag>"`, smoke-tests the linux build
+(asserting `gitty version` prints the tag, which catches a silently ineffective
+ldflag), generates `SHA256SUMS`, and creates the release — or uploads onto it
+if it already exists, so tagging and publishing a release for the same version
+converge on one release instead of colliding.
 
 ---
 

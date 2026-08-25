@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "1.2.0"
+const AgentSchemaVersion = "1.3.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -236,6 +236,19 @@ func buildAgentSchema() AgentSchema {
 					Command:   "gitty",
 					BaseArgs:  []string{"ls"},
 					FlagStyle: "--<name>=<value> for strings, --<name> for booleans",
+				},
+			},
+			{
+				Name:        "version",
+				Description: "Print the gitty binary's version as a single bare line. Release builds report their tag (e.g. 'v1.2.3'); builds from source report 'dev' plus the commit they were built from.",
+				InputSchema: InputSchema{
+					Type:       "object",
+					Properties: map[string]SchemaProp{},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"version"},
+					FlagStyle: "takes no flags",
 				},
 			},
 		},

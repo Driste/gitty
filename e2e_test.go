@@ -450,6 +450,48 @@ func TestE2EInitRejectsBadURL(t *testing.T) {
 	}
 }
 
+func TestE2EVersion(t *testing.T) {
+	skipIfShort(t)
+
+	stdout, stderr, code := runGitty(t, t.TempDir(), nil, "version")
+	if code != 0 {
+		t.Fatalf("version exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	line := strings.TrimRight(stdout, "\n")
+	if line == "" || strings.Contains(line, "\n") {
+		t.Errorf("version should print exactly one non-empty line, got %q", stdout)
+	}
+	if stderr != "" {
+		t.Errorf("version should write nothing to stderr, got:\n%s", stderr)
+	}
+}
+
+// TestE2EVersionLdflagsContract guards the exact contract the release workflow
+// depends on: building with -ldflags "-X main.version=<tag>" must make
+// `gitty version` print that tag verbatim. If the variable is ever renamed or
+// moved to another package, releases would silently ship binaries reporting
+// "dev" — this fails instead.
+func TestE2EVersionLdflagsContract(t *testing.T) {
+	skipIfShort(t)
+
+	const tag = "v0.0.0-ldflags-test"
+	stamped := filepath.Join(t.TempDir(), "gitty-stamped")
+	build := exec.Command("go", "build",
+		"-ldflags=-X main.version="+tag,
+		"-o", stamped, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building a version-stamped binary: %v\n%s", err, out)
+	}
+
+	out, err := exec.Command(stamped, "version").Output()
+	if err != nil {
+		t.Fatalf("running the stamped binary: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != tag {
+		t.Errorf("stamped binary reports version %q, want %q", got, tag)
+	}
+}
+
 func TestE2EAgentSchemaOutput(t *testing.T) {
 	skipIfShort(t)
 
