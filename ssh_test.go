@@ -10,6 +10,17 @@ import (
 	"gitlab.com/gitlab-org/api/client-go"
 )
 
+func TestInsteadOfOverride(t *testing.T) {
+	got := insteadOfOverride("https://gitlab.com/acme/repo.git")
+	want := []string{"-c", "url.https://gitlab.com/acme/repo.git.insteadOf=https://gitlab.com/acme/repo.git"}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("insteadOfOverride() = %v, want %v", got, want)
+	}
+	if insteadOfOverride("") != nil {
+		t.Error("insteadOfOverride(\"\") should produce no option")
+	}
+}
+
 func TestSSHEnv(t *testing.T) {
 	tests := []struct {
 		name      string

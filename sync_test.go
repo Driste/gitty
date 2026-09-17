@@ -242,6 +242,30 @@ func (r *recordingGit) lastEnv() []string {
 	return r.envs[len(r.envs)-1]
 }
 
+// gitSubArgs strips a recorded invocation down to the git subcommand and its
+// arguments: element 0 is the working directory, and gitty may prepend any
+// number of "-c key=value" option pairs (credential-helper reset, insteadOf
+// pin). Tests assert on the subcommand, not on option ordering.
+func gitSubArgs(call []string) []string {
+	args := call[1:]
+	for len(args) >= 2 && args[0] == "-c" {
+		args = args[2:]
+	}
+	return args
+}
+
+// findCall returns the first recorded invocation whose subcommand matches.
+func (r *recordingGit) findCall(subcommand string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.calls {
+		if sub := gitSubArgs(c); len(sub) > 0 && sub[0] == subcommand {
+			return c
+		}
+	}
+	return nil
+}
+
 // newTestSyncer builds a syncer over the given fakes with buffered streams.
 func newTestSyncer(cfg *Config, src gitlabSource, git gitRunner) (*syncer, *bytes.Buffer, *bytes.Buffer) {
 	stdout := &bytes.Buffer{}
@@ -300,10 +324,9 @@ func TestSyncReposClonesNewProjects(t *testing.T) {
 	if rec.callCount() != 1 {
 		t.Fatalf("expected 1 git call, got %d: %v", rec.callCount(), rec.calls)
 	}
-	got := rec.calls[0]
-	// dir, "clone", url, dest
-	if got[1] != "clone" || got[2] != "https://gitlab.com/acme/repo.git" || got[3] != "acme/repo" {
-		t.Errorf("unexpected clone invocation: %v", got)
+	got := gitSubArgs(rec.calls[0])
+	if len(got) != 3 || got[0] != "clone" || got[1] != "https://gitlab.com/acme/repo.git" || got[2] != "acme/repo" {
+		t.Errorf("unexpected clone invocation: %v", rec.calls[0])
 	}
 	assertEventLines(t, stdout)
 }
@@ -342,12 +365,14 @@ func TestSyncReposPullsExistingProjects(t *testing.T) {
 	if !strings.Contains(stdout.String(), "pull acme/repo\n") {
 		t.Errorf("missing pull event:\n%s", stdout.String())
 	}
-	if rec.callCount() != 1 {
-		t.Fatalf("expected 1 git call, got %d: %v", rec.callCount(), rec.calls)
+	// The pull is preceded by a local "config --get remote.origin.url" read,
+	// which supplies both the credential host check and the insteadOf pin.
+	pull := rec.findCall("pull")
+	if pull == nil {
+		t.Fatalf("no pull invocation recorded: %v", rec.calls)
 	}
-	got := rec.calls[0]
-	if got[1] != "pull" || got[2] != "--ff-only" {
-		t.Errorf("expected 'git pull --ff-only', got: %v", got)
+	if got := gitSubArgs(pull); len(got) != 2 || got[0] != "pull" || got[1] != "--ff-only" {
+		t.Errorf("expected 'git pull --ff-only', got: %v", pull)
 	}
 }
 
@@ -375,7 +400,7 @@ func TestSyncReposCountsGitFailures(t *testing.T) {
 		t.Errorf("missing error event:\n%s", stdout.String())
 	}
 	// The captured git output must land on stderr as an attributed block.
-	if !strings.Contains(stderr.String(), "--- git clone") || !strings.Contains(stderr.String(), "simulated git output") {
+	if !strings.Contains(stderr.String(), "clone https://gitlab.com/acme/repo.git") || !strings.Contains(stderr.String(), "simulated git output") {
 		t.Errorf("missing attributed git failure block on stderr:\n%s", stderr.String())
 	}
 }
@@ -612,7 +637,7 @@ func TestVerboseExecLinesGoToStderr(t *testing.T) {
 	s.verbose = true
 
 	s.syncRepos(context.Background(), "acme")
-	if !strings.Contains(stderr.String(), "exec git clone") {
+	if !strings.Contains(stderr.String(), "exec git ") || !strings.Contains(stderr.String(), " clone ") {
 		t.Errorf("verbose exec line missing from stderr:\n%s", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "exec git") {
@@ -759,7 +784,7 @@ func TestSyncOneRepoBrokenCheckout(t *testing.T) {
 		if !strings.Contains(stdout.String(), "reclone acme/repo\n") {
 			t.Errorf("missing reclone event:\n%s", stdout.String())
 		}
-		if rec.callCount() != 1 || rec.calls[0][1] != "clone" {
+		if rec.callCount() != 1 || gitSubArgs(rec.calls[0])[0] != "clone" {
 			t.Errorf("expected one clone call, got: %v", rec.calls)
 		}
 		// The junk must be preserved in the aside dir, not deleted.
@@ -803,7 +828,7 @@ func TestSyncOneRepoBrokenCheckout(t *testing.T) {
 		if !strings.Contains(stdout.String(), "clone acme/repo\n") {
 			t.Errorf("empty dir should be recovered via clone:\n%s", stdout.String())
 		}
-		if rec.callCount() != 1 || rec.calls[0][1] != "clone" {
+		if rec.callCount() != 1 || gitSubArgs(rec.calls[0])[0] != "clone" {
 			t.Errorf("expected one clone call, got: %v", rec.calls)
 		}
 	})
