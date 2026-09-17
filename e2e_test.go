@@ -414,6 +414,80 @@ func TestE2EInitWritesConfig(t *testing.T) {
 	}
 }
 
+func TestE2EInitTransportDefaults(t *testing.T) {
+	skipIfShort(t)
+
+	parse := func(t *testing.T, ws string) Config {
+		t.Helper()
+		var cfg Config
+		if err := toml.Unmarshal([]byte(readFileT(t, filepath.Join(ws, ConfigDir, ConfigName))), &cfg); err != nil {
+			t.Fatalf("parsing config: %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("defaults to http", func(t *testing.T) {
+		ws := t.TempDir()
+		stdout, stderr, code := runGitty(t, ws, nil, "init")
+		if code != 0 {
+			t.Fatalf("init exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		if !parse(t, ws).HTTP {
+			t.Error("plain 'gitty init' should select HTTP")
+		}
+		if !strings.Contains(stdout, "HTTP") {
+			t.Errorf("init should report the transport it chose:\n%s", stdout)
+		}
+	})
+
+	t.Run("--ssh opts out", func(t *testing.T) {
+		ws := t.TempDir()
+		stdout, stderr, code := runGitty(t, ws, nil, "init", "--ssh")
+		if code != 0 {
+			t.Fatalf("init --ssh exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		if parse(t, ws).HTTP {
+			t.Error("--ssh should select SSH")
+		}
+		if !strings.Contains(stdout, "SSH") {
+			t.Errorf("init should report the transport it chose:\n%s", stdout)
+		}
+	})
+
+	t.Run("--http still works for existing scripts", func(t *testing.T) {
+		ws := t.TempDir()
+		if _, stderr, code := runGitty(t, ws, nil, "init", "--http"); code != 0 {
+			t.Fatalf("init --http exit = %d:\n%s", code, stderr)
+		}
+		if !parse(t, ws).HTTP {
+			t.Error("--http should select HTTP")
+		}
+	})
+
+	t.Run("--http and --ssh conflict", func(t *testing.T) {
+		_, stderr, code := runGitty(t, t.TempDir(), nil, "init", "--http", "--ssh")
+		if code != 2 || !strings.Contains(stderr, "mutually exclusive") {
+			t.Errorf("exit = %d, want 2 with a conflict message:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("an existing SSH workspace keeps its transport", func(t *testing.T) {
+		// Flipping gitty's default must never re-point a workspace that was
+		// already initialized: the stored config wins.
+		ws := t.TempDir()
+		if _, stderr, code := runGitty(t, ws, nil, "init", "--ssh"); code != 0 {
+			t.Fatalf("init --ssh failed:\n%s", stderr)
+		}
+		if parse(t, ws).HTTP {
+			t.Fatal("setup: expected an SSH workspace")
+		}
+		// Re-reading it (any later command) must still see SSH.
+		if cfg := parse(t, ws); cfg.HTTP {
+			t.Error("an existing SSH workspace must stay SSH")
+		}
+	})
+}
+
 func TestE2EInitRefusesClobber(t *testing.T) {
 	skipIfShort(t)
 	ws := t.TempDir()

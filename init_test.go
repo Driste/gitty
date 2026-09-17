@@ -1,10 +1,142 @@
 package main
 
 import (
+	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"gitlab.com/gitlab-org/api/client-go"
 )
+
+// readFileString reads a file that the test requires to exist.
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func TestRunInitDefaultsToHTTP(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	// runInit's useHTTP argument is what main derives from --ssh; the default
+	// invocation (no --ssh) must produce an HTTP workspace.
+	if err := runInit("https://gitlab.com", true, false); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+	cfg, err := LoadLocalConfig()
+	if err != nil {
+		t.Fatalf("LoadLocalConfig: %v", err)
+	}
+	if !cfg.HTTP {
+		t.Error("a default workspace should clone over HTTP")
+	}
+}
+
+func TestRunInitSSHIsRecordedExplicitly(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	if err := runInit("https://gitlab.com", false, false); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+	cfg, err := LoadLocalConfig()
+	if err != nil {
+		t.Fatalf("LoadLocalConfig: %v", err)
+	}
+	if cfg.HTTP {
+		t.Error("--ssh should record an SSH workspace")
+	}
+	// The choice must be written explicitly, so that flipping gitty's default
+	// can never silently re-point an existing workspace.
+	raw := readFileString(t, filepath.Join(dir, ConfigDir, ConfigName))
+	if !strings.Contains(raw, "http = false") {
+		t.Errorf("transport should be stored explicitly, got:\n%s", raw)
+	}
+}
+
+// TestLegacyWorkspaceTransportIsHonored pins the compatibility contract for
+// workspaces initialized before HTTP became the default: the stored config is
+// the source of truth, so flipping gitty's default must not re-point an
+// existing workspace's clones.
+func TestLegacyWorkspaceTransportIsHonored(t *testing.T) {
+	cases := []struct {
+		name     string
+		config   string
+		wantHTTP bool
+		wantURL  string
+	}{
+		{
+			// Written by `gitty init` before the default flipped: SSH.
+			name:     "legacy ssh workspace stays ssh",
+			config:   "url = 'https://gitlab.com'\nhttp = false\nroot_path = ''\n",
+			wantHTTP: false,
+			wantURL:  "git@gitlab.com:acme/repo.git",
+		},
+		{
+			// Written by `gitty init --http`.
+			name:     "legacy http workspace stays http",
+			config:   "url = 'https://gitlab.com'\nhttp = true\nroot_path = ''\n",
+			wantHTTP: true,
+			wantURL:  "https://gitlab.com/acme/repo.git",
+		},
+		{
+			// Hand-written or truncated config with no http key at all: it
+			// must resolve the same way the old binary resolved it.
+			name:     "config without an http key resolves as before",
+			config:   "url = 'https://gitlab.com'\nroot_path = ''\n",
+			wantHTTP: false,
+			wantURL:  "git@gitlab.com:acme/repo.git",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Chdir(dir)
+			if err := os.MkdirAll(ConfigDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(ConfigDir, ConfigName), []byte(tc.config), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := LoadLocalConfig()
+			if err != nil {
+				t.Fatalf("LoadLocalConfig: %v", err)
+			}
+			if cfg.HTTP != tc.wantHTTP {
+				t.Errorf("cfg.HTTP = %v, want %v", cfg.HTTP, tc.wantHTTP)
+			}
+
+			// The behavioral half: prove which URL a sync actually clones.
+			rec := &recordingGit{}
+			s, _, _ := newTestSyncer(cfg, fakeSource{
+				projects: map[string][]*gitlab.Project{
+					"acme": {{
+						PathWithNamespace: "acme/repo",
+						HTTPURLToRepo:     "https://gitlab.com/acme/repo.git",
+						SSHURLToRepo:      "git@gitlab.com:acme/repo.git",
+					}},
+				},
+			}, rec.run)
+			s.jobs = 1
+			s.syncRepos(context.Background(), "acme")
+
+			if rec.callCount() != 1 {
+				t.Fatalf("expected one clone, got %v", rec.calls)
+			}
+			sub := gitSubArgs(rec.calls[0])
+			if len(sub) < 2 || sub[0] != "clone" || sub[1] != tc.wantURL {
+				t.Errorf("cloned %v, want clone of %q", rec.calls[0], tc.wantURL)
+			}
+		})
+	}
+}
 
 func TestValidateInstanceURL(t *testing.T) {
 	tests := []struct {

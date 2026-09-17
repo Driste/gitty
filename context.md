@@ -55,9 +55,12 @@ tag (e.g. `v1.0.0`), a source build prints `dev` plus the commit it came from
   `gitty sync --groups` creates subgroup directories, each gets its own config
   with `root_path` set to that subgroup, so you can `cd` into it and run
   `gitty sync` without repeating `--path`.
+- **Transport**: HTTP(S) by default (the API token authenticates clones too, so
+  no SSH keys are needed); `gitty init --ssh` selects SSH. The choice is stored
+  explicitly in `.gitty/config`, so an existing workspace keeps its transport.
 - **Token resolution order** for `sync`: `--token` flag → `GITLAB_TOKEN` env →
   `CI_JOB_TOKEN` env. A token is required unless `--anon` is passed (public
-  resources only). In `--http` mode the token also authenticates git itself,
+  resources only). In HTTP(S) mode the token also authenticates git itself,
   handed over via an internal askpass re-exec — never on the command line and
   never written to disk.
 - **Exit codes**: `0` success, `1` completed with per-item failures, `2` usage
@@ -72,12 +75,13 @@ Writes `.gitty/config` in the current directory. Run once in the root folder.
 | Flag      | Type    | Default                 | Description |
 | :-------- | :------ | :---------------------- | :---------- |
 | `--url`   | string  | `https://gitlab.com`    | Base URL of the GitLab instance (change for self-hosted). Must be http(s). Inside a GitLab CI job, defaults to `CI_SERVER_URL` when not passed. |
-| `--http`  | boolean | `false`                 | Clone over HTTPS instead of SSH. Recommended for CI runners. |
+| `--ssh`   | boolean | `false`                 | Clone over SSH (`git@...`) with local SSH keys. |
+| `--http`  | boolean | `true`                  | Clone over HTTP(S). The default; accepted for compatibility, conflicts with `--ssh`. |
 | `--force` | boolean | `false`                 | Overwrite an existing `.gitty/config`; without it, re-init refuses (exit 2). |
 
 ```bash
 cd ~/my-workspace
-gitty init --url="https://gitlab.mycompany.com" --http
+gitty init --url="https://gitlab.mycompany.com"
 ```
 
 ### `gitty sync` — clone/pull a group
@@ -219,7 +223,7 @@ gitty sync --path=tenant/images --nested
 
 1. Run `gitty agent schema` to discover the available commands and arguments.
 2. Ensure a workspace exists: if there is no `.gitty/config`, run `gitty init`
-   (choose `--http` for CI/token-based cloning).
+   (HTTP(S) is the default and needs no SSH keys; pass `--ssh` to use keys).
 3. Ensure a token is available via `--token` or the `GITLAB_TOKEN` /
    `CI_JOB_TOKEN` environment variable (or pass `--anon` for public groups).
 4. Optionally run `gitty ls --path=<group> --nested --format=json` to see how
@@ -231,15 +235,15 @@ gitty sync --path=tenant/images --nested
 
 ## CI/CD example (GitLab)
 
-`gitty` auto-detects `CI_JOB_TOKEN`. Use `--http` because CI runners usually
-cannot use SSH.
+`gitty` auto-detects `CI_JOB_TOKEN`. HTTP(S) is the default transport, so a CI
+runner needs no SSH keys.
 
 ```yaml
 clone_all_repos:
   image: golang:latest
   script:
     - go build -o gitty .
-    - ./gitty init --http
+    - ./gitty init
     - ./gitty sync --path="tenant/images" --nested
 ```
 
@@ -248,7 +252,7 @@ clone_all_repos:
 - `sync` must be run from a workspace directory; if there is no `.gitty/config`
   it exits 2 with an error telling you to run `gitty init` first.
 - SSH cloning uses the local git environment (`SSH_AUTH_SOCK`, `~/.gitconfig`)
-  and requires working SSH keys; in `--http` mode gitty authenticates git
+  and requires working SSH keys; in the default HTTP(S) mode gitty authenticates git
   itself with the resolved token, and interactive credential prompts are
   disabled so bad credentials fail fast instead of hanging.
 - SSH host keys: ssh prompts for confirmation of an unknown host key and reads
@@ -256,12 +260,12 @@ clone_all_repos:
   repository alone so that prompt happens once before the worker pool fans
   out. For unattended runs pass `--accept-new-host-keys`, which records
   unknown keys automatically (a changed key is still refused).
-- Transport is pinned: whichever URL gitty selects (HTTPS with `--http`, SSH
-  otherwise) is the URL git contacts. A `url.<base>.insteadOf` rule in the
+- Transport is pinned: whichever URL gitty selects (HTTPS by default, SSH with
+  `--ssh`) is the URL git contacts. A `url.<base>.insteadOf` rule in the
   local git config cannot silently switch the transport, which would otherwise
-  turn `--http` into an SSH clone and strand the injected credentials. gitty
-  notes on stderr when it overrides such a rule. To clone over SSH, run
-  `gitty init` without `--http` rather than relying on a rewrite.
+  turn an HTTP workspace into SSH clones and strand the injected credentials.
+  gitty notes on stderr when it overrides such a rule. To clone over SSH, run
+  `gitty init --ssh` rather than relying on a rewrite.
 - The tool never deletes local repositories; it only clones new ones and
   fast-forwards existing ones. Even `--reclone-broken` renames aside rather
   than deleting.

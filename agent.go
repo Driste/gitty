@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "1.4.0"
+const AgentSchemaVersion = "2.0.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -81,10 +81,15 @@ func buildAgentSchema() AgentSchema {
 							Description: "Base URL of the GitLab instance. Change this for self-hosted GitLab.",
 							Default:     "https://gitlab.com",
 						},
+						"ssh": {
+							Type:        "boolean",
+							Description: "Clone over SSH (git@...) using local SSH keys, instead of the default HTTP(S). Prefer the default for unattended runs: the token gitty already needs for the API authenticates the clones too, so no SSH key is required.",
+							Default:     false,
+						},
 						"http": {
 							Type:        "boolean",
-							Description: "Use HTTP(S) cloning (https://...) instead of the default SSH (git@...). Recommended for CI runners.",
-							Default:     false,
+							Description: "Clone over HTTP(S). This is the default; the flag is accepted for compatibility and is mutually exclusive with ssh.",
+							Default:     true,
 						},
 						"force": {
 							Type:        "boolean",
