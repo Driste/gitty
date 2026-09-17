@@ -61,6 +61,12 @@ type syncer struct {
 	cred          credential
 	exePath       string // this binary, for the askpass re-exec
 
+	// acceptNewHostKeys maps to ssh's StrictHostKeyChecking=accept-new:
+	// unknown hosts are recorded without prompting, a changed key is still
+	// refused. Opt-in, because it trades a confirmation prompt for
+	// trust-on-first-use.
+	acceptNewHostKeys bool
+
 	out    io.Writer
 	errOut io.Writer
 
@@ -174,16 +180,17 @@ func (s *syncer) reportGitFailure(path string, args []string, out []byte, err er
 
 // syncOptions bundles the sync command's flags.
 type syncOptions struct {
-	Path          string
-	Token         string
-	DryRun        bool
-	Groups        bool
-	Repos         bool
-	Nested        bool
-	Anon          bool
-	Verbose       bool
-	RecloneBroken bool
-	Jobs          int
+	Path              string
+	Token             string
+	DryRun            bool
+	Groups            bool
+	Repos             bool
+	Nested            bool
+	Anon              bool
+	Verbose           bool
+	RecloneBroken     bool
+	AcceptNewHostKeys bool
+	Jobs              int
 }
 
 // maxJobs bounds --jobs: beyond ~16 concurrent clones the bottleneck is the
@@ -209,6 +216,7 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.nested = opts.Nested
 	s.verbose = opts.Verbose
 	s.recloneBroken = opts.RecloneBroken
+	s.acceptNewHostKeys = opts.AcceptNewHostKeys
 	s.jobs = opts.Jobs
 
 	if s.verbose && s.credentialEnv() != nil {
@@ -316,6 +324,13 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	}
 
 	s.diagf("Found %d projects.", len(allProjects))
+
+	// Sync one repository on its own first so an SSH host-key prompt happens
+	// once rather than once per worker (see needsHostKeyWarmup).
+	if s.needsHostKeyWarmup() && len(allProjects) > 1 {
+		s.syncOneRepo(ctx, allProjects[0])
+		allProjects = allProjects[1:]
+	}
 
 	// Dispatch to a bounded worker pool. jobs=1 preserves serial FIFO
 	// behavior; workers rely on the syncer mutex for line-atomic output.
@@ -466,6 +481,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 	if env != nil {
 		args = append([]string{"-c", "credential.helper="}, args...)
 	}
+	env = append(env, s.sshEnv()...)
 	if err := s.runGit(ctx, p.PathWithNamespace, ".", env, args...); err == nil {
 		s.event(kind, p.PathWithNamespace)
 	}
@@ -524,15 +540,17 @@ func resolveToken(flagToken string) string {
 }
 
 // authForCheckout prepares a network git command to run inside an existing
-// checkout: it returns the credential environment and the final argv. When
-// credentials would be injected it first verifies the checkout's own origin
-// still points at the configured instance — a user may have re-pointed it
-// since the clone, and the token must never travel to another host. ok=false
-// means the caller must not run the command (an error event was emitted).
+// checkout: it returns the environment and the final argv. When credentials
+// would be injected it first verifies the checkout's own origin still points
+// at the configured instance — a user may have re-pointed it since the clone,
+// and the token must never travel to another host. ok=false means the caller
+// must not run the command (an error event was emitted).
 func (s *syncer) authForCheckout(ctx context.Context, path, dir string, args ...string) ([]string, []string, bool) {
 	env := s.credentialEnv()
 	if env == nil {
-		return nil, args, true
+		// Nothing to protect (SSH mode, or anonymous HTTP), so no origin
+		// check is needed — but ssh may still need steering.
+		return s.sshEnv(), args, true
 	}
 
 	originOut, err := s.git(ctx, dir, nil, "remote", "get-url", "origin")
@@ -548,6 +566,38 @@ func (s *syncer) authForCheckout(ctx context.Context, path, dir string, args ...
 		return nil, nil, false
 	}
 	return env, append([]string{"-c", "credential.helper="}, args...), true
+}
+
+// sshEnv returns the extra environment that steers ssh for SSH-mode clones,
+// pulls, and fetches. It is empty unless gitty has something to say: over HTTP
+// ssh is not involved at all, and without --accept-new-host-keys gitty leaves
+// ssh's host-key policy exactly as the user configured it.
+//
+// A GIT_SSH_COMMAND the user already set is preserved and extended, so a
+// custom ssh binary or existing options keep working.
+func (s *syncer) sshEnv() []string {
+	if s.cfg.HTTP || !s.acceptNewHostKeys {
+		return nil
+	}
+	base := strings.TrimSpace(os.Getenv("GIT_SSH_COMMAND"))
+	if base == "" {
+		base = "ssh"
+	}
+	return []string{"GIT_SSH_COMMAND=" + base + " -o StrictHostKeyChecking=accept-new"}
+}
+
+// needsHostKeyWarmup reports whether the first repository should be synced on
+// its own before the worker pool starts.
+//
+// Over SSH the first connection to a host whose key is not yet in known_hosts
+// prompts for confirmation, and ssh reads that answer straight from the
+// terminal. If every worker starts at once they all reach that prompt before
+// any of them has recorded the accepted key, so the user is asked once per
+// repository for the same fingerprint — and the concurrent appends to
+// known_hosts can lose each other's writes. Syncing one repository first lets
+// that happen exactly once.
+func (s *syncer) needsHostKeyWarmup() bool {
+	return !s.cfg.HTTP && !s.dryRun && s.jobs > 1
 }
 
 // credentialEnv builds the extra environment for a git invocation that may

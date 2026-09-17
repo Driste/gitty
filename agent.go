@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "1.3.0"
+const AgentSchemaVersion = "1.4.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -133,6 +133,11 @@ func buildAgentSchema() AgentSchema {
 							Description: "Number of concurrent repo clone/pull operations (1-16).",
 							Default:     4,
 						},
+						"accept-new-host-keys": {
+							Type:        "boolean",
+							Description: "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed host key is still refused. Set this for unattended runs, where an interactive host-key prompt would otherwise hang the job.",
+							Default:     false,
+						},
 						"groups": {
 							Type:        "boolean",
 							Description: "Fetch groups/subgroups and create their directory structure locally (with per-directory configs).",
@@ -186,6 +191,11 @@ func buildAgentSchema() AgentSchema {
 							Type:        "integer",
 							Description: "Number of concurrent repositories to inspect (1-16).",
 							Default:     4,
+						},
+						"accept-new-host-keys": {
+							Type:        "boolean",
+							Description: "With fetch over SSH, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new).",
+							Default:     false,
 						},
 						"verbose": {
 							Type:        "boolean",

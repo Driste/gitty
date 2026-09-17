@@ -1,4 +1,4 @@
-# This workflow will build a golang project
+# Build and test gitty on every push to main and every pull request.
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
 
 name: Go
@@ -22,10 +22,59 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v7
       with:
-        go-version: '1.24.4'
+        go-version-file: go.mod
+        cache: true
+
+    - name: Check formatting
+      run: |
+        unformatted="$(gofmt -l .)"
+        if [ -n "$unformatted" ]; then
+          echo "These files are not gofmt'd:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    - name: Vet
+      run: go vet ./...
 
     - name: Build
       run: go build -v ./...
 
     - name: Test
       run: go test -v ./...
+
+    - name: Test with race detector
+      run: go test -race -short ./...
+
+  # Drives the real binary against a small public group on gitlab.com. The
+  # suite above proves the logic against a fake GitLab; this proves gitty still
+  # agrees with the real API and a real git transport — API shape, pagination,
+  # clone/pull over HTTPS, and the event/exit-code contracts.
+  #
+  # Runs anonymously, so it needs no secrets and works on forked pull requests.
+  # It does need network access to gitlab.com; if that is ever unavailable this
+  # job fails and can simply be re-run.
+  integration:
+    name: Integration (live GitLab)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Build gitty
+      run: go build -o gitty .
+
+    - name: Sync a small public GitLab group
+      env:
+        # Make sure nothing in the runner environment silently supplies a
+        # token: this job must work purely anonymously.
+        GITLAB_TOKEN: ""
+        CI_JOB_TOKEN: ""
+      run: ./scripts/integration-test.sh

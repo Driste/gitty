@@ -39,6 +39,7 @@ func main() {
 	syncVerbose := syncCmd.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
 	syncRecloneBroken := syncCmd.Bool("reclone-broken", false, "Move aside non-repo directories that block a clone (renamed, never deleted) and re-clone")
 	syncJobs := syncCmd.Int("jobs", 4, "Number of concurrent repo clone/pull operations (1-16)")
+	syncAcceptHostKeys := syncCmd.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
 
 	statusCmd := flag.NewFlagSet("status", flag.ExitOnError)
 	statusToken := statusCmd.String("token", "", "GitLab Access Token (only needed with --fetch)")
@@ -46,6 +47,7 @@ func main() {
 	statusFetch := statusCmd.Bool("fetch", false, "Refresh remote-tracking refs first so ahead/behind reflect the remote now")
 	statusVerbose := statusCmd.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
 	statusJobs := statusCmd.Int("jobs", 4, "Number of concurrent repositories to inspect (1-16)")
+	statusAcceptHostKeys := statusCmd.Bool("accept-new-host-keys", false, "With --fetch over SSH, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new)")
 
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
 	lsPath := lsCmd.String("path", "", "GitLab Group Path (e.g., tenant/images)")
@@ -88,6 +90,8 @@ func main() {
 			Verbose:       *syncVerbose,
 			RecloneBroken: *syncRecloneBroken,
 			Jobs:          *syncJobs,
+
+			AcceptNewHostKeys: *syncAcceptHostKeys,
 		})
 		stop()
 		exitOnError(err)
@@ -100,6 +104,8 @@ func main() {
 			Fetch:   *statusFetch,
 			Verbose: *statusVerbose,
 			Jobs:    *statusJobs,
+
+			AcceptNewHostKeys: *statusAcceptHostKeys,
 		})
 		stop()
 		exitOnError(err)
