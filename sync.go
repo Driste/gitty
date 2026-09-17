@@ -229,6 +229,9 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	if opts.DryRun {
 		s.diagf("=== DRY RUN MODE ENABLED: No changes will be made ===")
 	}
+	if opts.Repos && !opts.DryRun {
+		s.warnIfURLRewritten(ctx)
+	}
 
 	if opts.Groups {
 		s.syncGroups(ctx, fullTarget)
@@ -482,6 +485,9 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		args = append([]string{"-c", "credential.helper="}, args...)
 	}
 	env = append(env, s.sshEnv()...)
+	// Pin the transport: the URL gitty selected and host-checked must be the
+	// URL git actually contacts, whatever insteadOf rules are configured.
+	args = append(insteadOfOverride(cloneURL), args...)
 	if err := s.runGit(ctx, p.PathWithNamespace, ".", env, args...); err == nil {
 		s.event(kind, p.PathWithNamespace)
 	}
@@ -539,6 +545,45 @@ func resolveToken(flagToken string) string {
 	return resolveCredential(flagToken).token
 }
 
+// insteadOfOverride returns the "-c url.<u>.insteadOf=<u>" option pair that
+// pins a clone or fetch to exactly the URL gitty selected.
+//
+// Before contacting a remote, git rewrites its URL through any matching
+// url.<base>.insteadOf setting. A very common global rule rewrites
+// "https://<host>/" to "git@<host>:", which silently turns gitty's --http mode
+// into an SSH clone: the injected HTTP credentials never apply, ssh asks for
+// host-key confirmation instead, and CI runners without SSH keys fail. It also
+// defeats the clone-URL host check, since gitty would be validating a URL that
+// git then replaces.
+//
+// git resolves insteadOf by longest matching prefix, so mapping the full URL
+// to itself outranks any shorter host-level rule and leaves the transport the
+// user asked for intact.
+func insteadOfOverride(rawURL string) []string {
+	if rawURL == "" {
+		return nil
+	}
+	return []string{"-c", "url." + rawURL + ".insteadOf=" + rawURL}
+}
+
+// warnIfURLRewritten notes once, on stderr, that the local git configuration
+// would redirect the configured instance to another transport, and that gitty
+// is overriding it for this run. "git ls-remote --get-url" resolves insteadOf
+// without contacting the network.
+func (s *syncer) warnIfURLRewritten(ctx context.Context) {
+	probe := strings.TrimSuffix(s.cfg.URL, "/") + "/"
+	out, err := s.git(ctx, ".", nil, "ls-remote", "--get-url", probe)
+	if err != nil {
+		return
+	}
+	got := strings.TrimSpace(string(out))
+	if got == "" || got == probe {
+		return
+	}
+	s.diagf("note: local git config rewrites %s to %s (url.insteadOf); gitty is overriding that so the URL it selected is the URL git uses",
+		probe, redactURL(got))
+}
+
 // authForCheckout prepares a network git command to run inside an existing
 // checkout: it returns the environment and the final argv. When credentials
 // would be injected it first verifies the checkout's own origin still points
@@ -547,25 +592,35 @@ func resolveToken(flagToken string) string {
 // must not run the command (an error event was emitted).
 func (s *syncer) authForCheckout(ctx context.Context, path, dir string, args ...string) ([]string, []string, bool) {
 	env := s.credentialEnv()
-	if env == nil {
-		// Nothing to protect (SSH mode, or anonymous HTTP), so no origin
-		// check is needed — but ssh may still need steering.
-		return s.sshEnv(), args, true
-	}
 
-	originOut, err := s.git(ctx, dir, nil, "remote", "get-url", "origin")
+	// Read the checkout's configured origin: it is both what the credential
+	// host check applies to and what git would rewrite via insteadOf.
+	//
+	// "git config --get remote.origin.url" is deliberate: "git remote get-url"
+	// resolves insteadOf and would hand back the already-rewritten URL, so
+	// pinning that would pin the very rewrite we mean to override.
+	originOut, err := s.git(ctx, dir, nil, "config", "--get", "remote.origin.url")
 	if err != nil {
 		s.event("error", path, "reading origin remote failed")
-		s.diagf("%s: git remote get-url origin: %v", path, err)
+		s.diagf("%s: git config --get remote.origin.url: %v", path, err)
 		return nil, nil, false
 	}
 	origin := strings.TrimSpace(string(originOut))
-	if ok, err := hostsMatch(s.cfg.URL, origin); err != nil || !ok {
-		s.event("error", path, "origin host does not match the configured instance")
-		s.diagf("%s: origin %q does not match instance %q; not sending credentials", path, redactURL(origin), s.cfg.URL)
-		return nil, nil, false
+
+	if env != nil {
+		if ok, err := hostsMatch(s.cfg.URL, origin); err != nil || !ok {
+			s.event("error", path, "origin host does not match the configured instance")
+			s.diagf("%s: origin %q does not match instance %q; not sending credentials", path, redactURL(origin), s.cfg.URL)
+			return nil, nil, false
+		}
+		args = append([]string{"-c", "credential.helper="}, args...)
+	} else {
+		// Nothing to protect (SSH mode, or anonymous HTTP), but ssh may still
+		// need steering.
+		env = s.sshEnv()
 	}
-	return env, append([]string{"-c", "credential.helper="}, args...), true
+
+	return env, append(insteadOfOverride(origin), args...), true
 }
 
 // sshEnv returns the extra environment that steers ssh for SSH-mode clones,

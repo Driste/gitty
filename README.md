@@ -124,6 +124,29 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
 | `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
 
+### Transport is exactly what you configured
+
+`--http` at `init` selects HTTPS clone URLs; without it gitty uses the SSH
+URLs. Whichever it picks, gitty pins that URL for the git invocation, so a
+`url.<base>.insteadOf` rule in your git config cannot silently switch the
+transport underneath it.
+
+This matters because rewriting `https://<host>/` to `git@<host>:` is a very
+common global setting, and it would otherwise turn `--http` into an SSH clone —
+the injected HTTPS credentials would stop applying, ssh would ask for host-key
+confirmation, and a CI runner with no SSH key would simply fail. It also means
+the clone-URL host check is meaningful: the URL gitty validates is the URL git
+contacts. When gitty overrides such a rule it says so on stderr:
+
+```
+note: local git config rewrites https://gitlab.com/ to git@gitlab.com:
+(url.insteadOf); gitty is overriding that so the URL it selected is the URL
+git uses
+```
+
+If you want SSH clones, ask for them directly — run `gitty init` without
+`--http` (or re-run it with `--force`) — rather than relying on a rewrite.
+
 ### SSH host keys
 
 The first time you clone from a host whose key isn't in your `known_hosts`,

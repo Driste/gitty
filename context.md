@@ -256,6 +256,12 @@ clone_all_repos:
   repository alone so that prompt happens once before the worker pool fans
   out. For unattended runs pass `--accept-new-host-keys`, which records
   unknown keys automatically (a changed key is still refused).
+- Transport is pinned: whichever URL gitty selects (HTTPS with `--http`, SSH
+  otherwise) is the URL git contacts. A `url.<base>.insteadOf` rule in the
+  local git config cannot silently switch the transport, which would otherwise
+  turn `--http` into an SSH clone and strand the injected credentials. gitty
+  notes on stderr when it overrides such a rule. To clone over SSH, run
+  `gitty init` without `--http` rather than relying on a rewrite.
 - The tool never deletes local repositories; it only clones new ones and
   fast-forwards existing ones. Even `--reclone-broken` renames aside rather
   than deleting.

@@ -975,6 +975,62 @@ func TestE2ELs(t *testing.T) {
 	}
 }
 
+// TestE2EInsteadOfDoesNotHijackHTTPClone is the regression guard for HTTP
+// clones being silently switched to SSH. A very common global git setting
+// rewrites an https:// remote to git@host:, which would defeat --http mode
+// (the injected credentials stop applying, ssh asks for host-key confirmation,
+// and a runner without SSH keys simply fails). gitty pins the transport with a
+// full-URL insteadOf override, so the URL it selected is the URL git contacts.
+func TestE2EInsteadOfDoesNotHijackHTTPClone(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/hijackme", map[string]string{"a.txt": "a"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(140, "acme/hijackme")}
+
+	// A HOME whose git config rewrites this server's http URLs to ssh.
+	home := t.TempDir()
+	gitconfig := "[url \"git@127.0.0.1:\"]\n\tinsteadOf = " + f.srv.URL + "/\n"
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(gitconfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "XDG_CONFIG_HOME="}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0 (the https URL must not be rewritten to ssh):\n%s\n%s",
+			code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/hijackme\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "hijackme", "a.txt")); got != "a" {
+		t.Errorf("cloned file = %q, want a", got)
+	}
+	// The clone must have gone over HTTP, not ssh.
+	if strings.Contains(stderr, "cannot run ssh") || strings.Contains(stderr, "ssh:") {
+		t.Errorf("clone was routed through ssh despite --http:\n%s", stderr)
+	}
+	// gitty must say that it overrode the user's configured rewrite.
+	if !strings.Contains(stderr, "url.insteadOf") {
+		t.Errorf("expected a note that the rewrite was overridden:\n%s", stderr)
+	}
+
+	// The same must hold for the pull path on a re-sync.
+	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("re-sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "pull acme/hijackme\n") {
+		t.Errorf("missing pull event:\n%s", stdout)
+	}
+	if strings.Contains(stderr, "cannot run ssh") {
+		t.Errorf("pull was routed through ssh despite --http:\n%s", stderr)
+	}
+}
+
 func TestE2EVerbose(t *testing.T) {
 	skipIfShort(t)
 
@@ -988,7 +1044,7 @@ func TestE2EVerbose(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("verbose sync exit = %d:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, "exec git clone") {
+	if !strings.Contains(stderr, "exec git ") || !strings.Contains(stderr, " clone ") {
 		t.Errorf("verbose exec line missing from stderr:\n%s", stderr)
 	}
 	if strings.Contains(stdout, "exec git") {
@@ -1464,7 +1520,7 @@ func TestE2EDivergedCheckoutFailsPull(t *testing.T) {
 	if !strings.Contains(stdout, "error acme/portal git pull failed") {
 		t.Errorf("expected pull failure event on stdout:\n%s", stdout)
 	}
-	if !strings.Contains(stderr, "--- git pull --ff-only for acme/portal failed") {
+	if !strings.Contains(stderr, "pull --ff-only for acme/portal failed") {
 		t.Errorf("expected attributed git output block on stderr:\n%s", stderr)
 	}
 	// The local commit must survive: --ff-only never merges or overwrites.
