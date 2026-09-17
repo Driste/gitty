@@ -2,7 +2,7 @@
 
 A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, subgroups, and repositories directly to your local machine.
 
-`gitty` uses a local `gitty.toml` configuration file to anchor your workspace, preserving the exact namespace directory structure of your GitLab environment to prevent naming collisions.
+`gitty` uses a local `.gitty/config` file to anchor your workspace, preserving the exact namespace directory structure of your GitLab environment to prevent naming collisions.
 
 ## Features
 * **Workspace Config**: Initialize a workspace with `gitty init` so you don't have to repeatedly pass your GitLab URL or SSH/HTTP preferences.
@@ -112,7 +112,7 @@ gitty init --force --ssh      # switch this workspace to SSH
 cd ~/my-workspace
 gitty init --url="https://gitlab.mycompany.com"
 ```
-This generates a `gitty.toml` file in the current directory. `gitty` will use this directory as the root destination for all future sync commands.
+This generates a `.gitty/config` file in the current directory. `gitty` will use this directory as the root destination for all future sync commands.
 
 ---
 
