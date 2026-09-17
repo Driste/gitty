@@ -122,6 +122,31 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | `--jobs` | `4` | Number of concurrent repo clone/pull operations (1-16). `--jobs=1` restores fully serial behavior. |
 | `--verbose` | `false` | Print each git invocation and its output to stderr, with URL credentials redacted. |
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
+| `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
+
+### SSH host keys
+
+The first time you clone from a host whose key isn't in your `known_hosts`,
+ssh asks you to confirm the fingerprint — and it reads your answer straight
+from the terminal, not from gitty. Because `gitty sync` clones several
+repositories at once, gitty syncs the **first** repository on its own so that
+prompt happens exactly once; only then does it fan out. Without that, every
+worker would reach the prompt simultaneously and compete for the terminal,
+which produces a storm of repeated prompts for the same fingerprint.
+
+For unattended runs, where there is no one to answer, use:
+
+```bash
+gitty sync --path="tenant/images" --accept-new-host-keys
+```
+
+That records unknown host keys automatically while still refusing a host key
+that has *changed*. Alternatively, pre-seed the key yourself
+(`ssh-keyscan gitlab.example.com >> ~/.ssh/known_hosts`) or use `--http`.
+
+If you are still prompted once per repository, the accepted key isn't being
+saved — check that `~/.ssh` exists and is writable. `--jobs=1` forces fully
+serial cloning as a fallback.
 
 ### Output and exit codes
 
@@ -344,6 +369,14 @@ fast unit-only run with:
 
 ```bash
 go test -short ./...
+```
+
+There is also an integration smoke test that drives the built binary against a
+small public group on gitlab.com, anonymously. CI runs it on every push and
+pull request; to run it yourself:
+
+```bash
+go build -o gitty . && ./scripts/integration-test.sh
 ```
 
 ---

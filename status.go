@@ -12,11 +12,12 @@ import (
 
 // statusOptions bundles the status command's flags.
 type statusOptions struct {
-	Token   string
-	Anon    bool
-	Fetch   bool
-	Verbose bool
-	Jobs    int
+	Token             string
+	Anon              bool
+	Fetch             bool
+	Verbose           bool
+	AcceptNewHostKeys bool
+	Jobs              int
 }
 
 // repoStatus is one checkout's branch and freshness, as reported by
@@ -103,14 +104,15 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 	}
 
 	s := &syncer{
-		cfg:     cfg,
-		git:     execGit,
-		verbose: opts.Verbose,
-		jobs:    opts.Jobs,
-		cred:    cred,
-		exePath: exePath,
-		out:     os.Stdout,
-		errOut:  os.Stderr,
+		cfg:               cfg,
+		git:               execGit,
+		verbose:           opts.Verbose,
+		jobs:              opts.Jobs,
+		cred:              cred,
+		exePath:           exePath,
+		acceptNewHostKeys: opts.AcceptNewHostKeys,
+		out:               os.Stdout,
+		errOut:            os.Stderr,
 	}
 
 	wd, err := os.Getwd()
@@ -128,7 +130,7 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		results []repoStatus
 		resMu   sync.Mutex
 	)
-	forEachConcurrent(ctx, s.jobs, repos, func(rel string) {
+	inspect := func(rel string) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -153,7 +155,17 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		resMu.Unlock()
 
 		s.event("status", rel, statusDetail(st))
-	})
+	}
+
+	// With --fetch over SSH the first connection may prompt for host-key
+	// confirmation; inspect one repo alone first so that happens once rather
+	// than once per worker (see needsHostKeyWarmup).
+	pending := repos
+	if opts.Fetch && s.needsHostKeyWarmup() && len(pending) > 1 {
+		inspect(pending[0])
+		pending = pending[1:]
+	}
+	forEachConcurrent(ctx, s.jobs, pending, inspect)
 
 	dirty, ahead, behind := 0, 0, 0
 	for _, st := range results {

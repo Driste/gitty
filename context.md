@@ -97,6 +97,7 @@ ones.
 | `--jobs`           | integer | `4`     | Concurrent repo clone/pull operations (1-16). |
 | `--verbose`        | boolean | `false` | Print each git invocation and its output to stderr (URLs redacted). |
 | `--reclone-broken` | boolean | `false` | Move aside non-repo destinations (renamed `<dir>.gitty-broken-<n>`, never deleted) and clone fresh; without it they are `error` events. |
+| `--accept-new-host-keys` | boolean | `false` | SSH only: record unknown host keys without prompting (`StrictHostKeyChecking=accept-new`); a changed key is still refused. Set this for unattended runs. |
 
 ```bash
 export GITLAB_TOKEN="glpat-XXXXXXXX"
@@ -250,6 +251,11 @@ clone_all_repos:
   and requires working SSH keys; in `--http` mode gitty authenticates git
   itself with the resolved token, and interactive credential prompts are
   disabled so bad credentials fail fast instead of hanging.
+- SSH host keys: ssh prompts for confirmation of an unknown host key and reads
+  the answer from the terminal, not from gitty. gitty syncs the first
+  repository alone so that prompt happens once before the worker pool fans
+  out. For unattended runs pass `--accept-new-host-keys`, which records
+  unknown keys automatically (a changed key is still refused).
 - The tool never deletes local repositories; it only clones new ones and
   fast-forwards existing ones. Even `--reclone-broken` renames aside rather
   than deleting.
