@@ -12,6 +12,10 @@ const (
 	ConfigName = "config"
 )
 
+// Config anchors a workspace. It is the source of truth for how that
+// workspace clones: HTTP records the transport chosen at init time, and is
+// always written explicitly, so changing gitty's default never re-points an
+// existing workspace.
 type Config struct {
 	URL      string `toml:"url"`
 	HTTP     bool   `toml:"http"`

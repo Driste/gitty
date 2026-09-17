@@ -25,7 +25,8 @@ func main() {
 
 	initCmd := flag.NewFlagSet("init", flag.ExitOnError)
 	initURL := initCmd.String("url", "https://gitlab.com", "GitLab Base URL")
-	initHTTP := initCmd.Bool("http", false, "Use HTTP(S) for cloning instead of SSH")
+	initSSH := initCmd.Bool("ssh", false, "Clone over SSH (git@...) instead of the default HTTP(S)")
+	initHTTP := initCmd.Bool("http", false, "Clone over HTTP(S) (this is the default; accepted for compatibility)")
 	initForce := initCmd.Bool("force", false, "Overwrite an existing .gitty/config")
 
 	syncCmd := flag.NewFlagSet("sync", flag.ExitOnError)
@@ -75,7 +76,14 @@ func main() {
 				resolvedURL = ciURL
 			}
 		}
-		exitOnError(runInit(resolvedURL, *initHTTP, *initForce))
+		// HTTP(S) is the default transport: the token gitty already needs for
+		// the API authenticates the clones too, which is what makes an
+		// unattended run work without SSH keys. --ssh opts out; --http is
+		// still accepted so existing scripts keep working.
+		if *initSSH && *initHTTP {
+			exitOnError(usageErrf("--ssh and --http are mutually exclusive"))
+		}
+		exitOnError(runInit(resolvedURL, !*initSSH, *initForce))
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

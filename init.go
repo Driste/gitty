@@ -53,7 +53,12 @@ func runInit(rawURL string, useHTTP, force bool) error {
 		return fmt.Errorf("failed to initialize: %w", err)
 	}
 
+	transport := "HTTP(S), authenticated with your token"
+	if !useHTTP {
+		transport = "SSH, using your local SSH keys"
+	}
 	fmt.Printf("Initialized gitty root at %s\n", wd)
+	fmt.Printf("Cloning over %s\n", transport)
 	fmt.Println("You can now run 'gitty sync --path=<path>' to pull down repositories.")
 	return nil
 }

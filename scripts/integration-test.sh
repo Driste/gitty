@@ -61,8 +61,9 @@ run 0 "gitty version" -- version
 [ -n "$OUT" ] || fail "version printed nothing"
 
 echo "== init"
-run 0 "gitty init --http" -- init --http
+run 0 "gitty init (default transport)" -- init
 [ -f .gitty/config ] || fail ".gitty/config was not created"
+grep -q '^http = true' .gitty/config || fail "init should default to the HTTP transport"
 
 echo "== ls (remote inventory, no git, no clone)"
 run 0 "gitty ls --nested" -- ls --path="$PARENT" --nested --anon
