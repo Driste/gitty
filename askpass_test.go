@@ -119,8 +119,8 @@ func TestInjectedCloneInvocation(t *testing.T) {
 		t.Fatalf("git calls: %v", rec.calls)
 	}
 	got := rec.calls[0] // dir + args
-	// The clone carries both option pairs gitty prepends — the credential
-	// helper reset and the insteadOf pin — followed by the clone itself.
+	// The clone carries the one option pair gitty prepends — the credential
+	// helper reset — followed by the clone itself.
 	if sub := gitSubArgs(got); len(sub) != 3 || sub[0] != "clone" ||
 		sub[1] != "https://gitlab.com/acme/repo.git" || sub[2] != "acme/repo" {
 		t.Errorf("injected clone subcommand = %v, want clone of the https URL", got)
@@ -129,8 +129,10 @@ func TestInjectedCloneInvocation(t *testing.T) {
 	if !strings.Contains(joinedArgs, "-c credential.helper=") {
 		t.Errorf("injected clone missing the credential-helper reset: %v", got)
 	}
-	if !strings.Contains(joinedArgs, "url.https://gitlab.com/acme/repo.git.insteadOf=https://gitlab.com/acme/repo.git") {
-		t.Errorf("injected clone missing the insteadOf pin: %v", got)
+	// gitty adds no insteadOf override of its own: the user's git config is
+	// what decides where a URL points.
+	if strings.Contains(joinedArgs, ".insteadOf=") {
+		t.Errorf("injected clone should not pin the URL: %v", got)
 	}
 	for _, a := range got {
 		if strings.Contains(a, "glpat-sekret") {

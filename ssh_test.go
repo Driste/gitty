@@ -10,17 +10,6 @@ import (
 	"gitlab.com/gitlab-org/api/client-go"
 )
 
-func TestInsteadOfOverride(t *testing.T) {
-	got := insteadOfOverride("https://gitlab.com/acme/repo.git")
-	want := []string{"-c", "url.https://gitlab.com/acme/repo.git.insteadOf=https://gitlab.com/acme/repo.git"}
-	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
-		t.Errorf("insteadOfOverride() = %v, want %v", got, want)
-	}
-	if insteadOfOverride("") != nil {
-		t.Error("insteadOfOverride(\"\") should produce no option")
-	}
-}
-
 func TestSSHEnv(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -71,22 +60,33 @@ func TestSSHEnv(t *testing.T) {
 
 func TestNeedsHostKeyWarmup(t *testing.T) {
 	tests := []struct {
-		name   string
-		http   bool
-		dryRun bool
-		jobs   int
-		want   bool
+		name    string
+		http    bool
+		dryRun  bool
+		jobs    int
+		sample  string
+		rewrite func(string) string
+		want    bool
 	}{
 		{name: "ssh with concurrency needs it", http: false, jobs: 4, want: true},
-		{name: "http does not (askpass, no tty)", http: true, jobs: 4, want: false},
+		{name: "http does not (askpass, no tty)", http: true, jobs: 4, sample: "https://gitlab.com/a/b.git", want: false},
 		{name: "serial sync cannot contend", http: false, jobs: 1, want: false},
 		{name: "dry run runs no git at all", http: false, dryRun: true, jobs: 4, want: false},
+		{
+			// The local git config can put ssh back in the path of an HTTP
+			// workspace, and gitty follows those rewrites.
+			name: "http rewritten to ssh needs it", http: true, jobs: 4,
+			sample:  "https://gitlab.com/a/b.git",
+			rewrite: func(string) string { return "git@gitlab.com:a/b.git" },
+			want:    true,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &syncer{cfg: &Config{HTTP: tc.http}, dryRun: tc.dryRun, jobs: tc.jobs}
-			if got := s.needsHostKeyWarmup(); got != tc.want {
+			git := &configAwareGit{rewrite: tc.rewrite}
+			s := &syncer{cfg: &Config{HTTP: tc.http}, dryRun: tc.dryRun, jobs: tc.jobs, git: git.run}
+			if got := s.needsHostKeyWarmup(context.Background(), ".", tc.sample); got != tc.want {
 				t.Errorf("needsHostKeyWarmup() = %v, want %v", got, tc.want)
 			}
 		})
@@ -108,6 +108,12 @@ type concurrencyProbe struct {
 }
 
 func (p *concurrencyProbe) run(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
+	// The insteadOf probe is a local config read, not a connection; answering
+	// it unchanged keeps the overlap counts about real git operations.
+	if len(args) == 3 && args[0] == "ls-remote" && args[1] == "--get-url" {
+		return []byte(args[2] + "\n"), nil
+	}
+
 	p.mu.Lock()
 	p.started++
 	isFirst := p.started == 1

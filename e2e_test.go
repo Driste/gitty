@@ -1446,62 +1446,6 @@ func TestE2ELs(t *testing.T) {
 	}
 }
 
-// TestE2EInsteadOfDoesNotHijackHTTPClone is the regression guard for HTTP
-// clones being silently switched to SSH. A very common global git setting
-// rewrites an https:// remote to git@host:, which would defeat --http mode
-// (the injected credentials stop applying, ssh asks for host-key confirmation,
-// and a runner without SSH keys simply fails). gitty pins the transport with a
-// full-URL insteadOf override, so the URL it selected is the URL git contacts.
-func TestE2EInsteadOfDoesNotHijackHTTPClone(t *testing.T) {
-	skipIfShort(t)
-
-	f := newFakeGitLab(t)
-	f.addRepo(t, "acme/hijackme", map[string]string{"a.txt": "a"})
-	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
-	f.projects["acme"] = []apiProject{f.project(140, "acme/hijackme")}
-
-	// A HOME whose git config rewrites this server's http URLs to ssh.
-	home := t.TempDir()
-	gitconfig := "[url \"git@127.0.0.1:\"]\n\tinsteadOf = " + f.srv.URL + "/\n"
-	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(gitconfig), 0644); err != nil {
-		t.Fatal(err)
-	}
-	env := []string{"HOME=" + home, "XDG_CONFIG_HOME="}
-
-	ws := initWorkspace(t, f)
-	stdout, stderr, code := runGitty(t, ws, env, "sync", "--path=acme", "--anon")
-	if code != 0 {
-		t.Fatalf("sync exit = %d, want 0 (the https URL must not be rewritten to ssh):\n%s\n%s",
-			code, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "clone acme/hijackme\n") {
-		t.Errorf("missing clone event:\n%s", stdout)
-	}
-	if got := readFileT(t, filepath.Join(ws, "acme", "hijackme", "a.txt")); got != "a" {
-		t.Errorf("cloned file = %q, want a", got)
-	}
-	// The clone must have gone over HTTP, not ssh.
-	if strings.Contains(stderr, "cannot run ssh") || strings.Contains(stderr, "ssh:") {
-		t.Errorf("clone was routed through ssh despite --http:\n%s", stderr)
-	}
-	// gitty must say that it overrode the user's configured rewrite.
-	if !strings.Contains(stderr, "url.insteadOf") {
-		t.Errorf("expected a note that the rewrite was overridden:\n%s", stderr)
-	}
-
-	// The same must hold for the pull path on a re-sync.
-	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon")
-	if code != 0 {
-		t.Fatalf("re-sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "pull acme/hijackme\n") {
-		t.Errorf("missing pull event:\n%s", stdout)
-	}
-	if strings.Contains(stderr, "cannot run ssh") {
-		t.Errorf("pull was routed through ssh despite --http:\n%s", stderr)
-	}
-}
-
 func TestE2EVerbose(t *testing.T) {
 	skipIfShort(t)
 
@@ -2000,20 +1944,22 @@ func TestE2EDivergedCheckoutFailsPull(t *testing.T) {
 	}
 }
 
-// TestE2ERespectGitConfigHonoursInsteadOf is the other half of
-// TestE2EInsteadOfDoesNotHijackHTTPClone: some instances advertise clone URLs
-// on a canonical host that the client cannot reach, and the user bridges that
-// with a url.<base>.insteadOf rule in their git config. Pinning the URL breaks
-// exactly that setup, so --respect-git-config turns the pin off and validates
-// the rewritten URL instead.
-func TestE2ERespectGitConfigHonoursInsteadOf(t *testing.T) {
+// TestE2EInsteadOfRewritesAreFollowed is the regression guard for gitty
+// honouring the local git configuration. Instances often advertise clone URLs
+// on a canonical host the client cannot reach, and the user bridges that with
+// a url.<base>.insteadOf rule. gitty adds no override of its own, so git
+// applies that rule for clones and pulls exactly as it would for a git clone
+// typed by hand — and the rewritten destination is accepted without any flag,
+// because it came from the user's own machine rather than from the API.
+func TestE2EInsteadOfRewritesAreFollowed(t *testing.T) {
 	skipIfShort(t)
 
 	f := newFakeGitLab(t)
 	work := f.addRepo(t, "acme/rewritten", map[string]string{"r.txt": "r"})
 	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
 	// The API advertises a canonical host that does not resolve; only the
-	// user's rewrite makes it reachable.
+	// user's rewrite makes it reachable, so a successful clone proves the
+	// rewrite was applied.
 	const canonical = "https://gitlab.canonical.invalid"
 	f.projects["acme"] = []apiProject{{
 		ID:                150,
@@ -2030,25 +1976,9 @@ func TestE2ERespectGitConfigHonoursInsteadOf(t *testing.T) {
 	env := []string{"HOME=" + home, "XDG_CONFIG_HOME="}
 
 	ws := initWorkspace(t, f)
-
-	// By default gitty pins the advertised URL, so the mismatch is reported
-	// rather than silently cloned from somewhere else — and the diagnostic
-	// has to point at the way out.
 	stdout, stderr, code := runGitty(t, ws, env, "sync", "--path=acme", "--anon")
-	if code != 1 {
-		t.Fatalf("default sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "error acme/rewritten clone URL host does not match the configured instance\n") {
-		t.Errorf("missing host mismatch event:\n%s", stdout)
-	}
-	if !strings.Contains(stderr, "--respect-git-config") {
-		t.Errorf("diagnostic should suggest --respect-git-config:\n%s", stderr)
-	}
-
-	// With the flag, the user's rewrite applies and the clone succeeds.
-	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon", "--respect-git-config")
 	if code != 0 {
-		t.Fatalf("sync --respect-git-config exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+		t.Fatalf("sync exit = %d, want 0 (the rewrite must be honoured):\n%s\n%s", code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, "clone acme/rewritten\n") {
 		t.Errorf("missing clone event:\n%s", stdout)
@@ -2060,32 +1990,36 @@ func TestE2ERespectGitConfigHonoursInsteadOf(t *testing.T) {
 	// The pull path honours the rewrite too: git stores the unrewritten URL
 	// as origin, so a re-sync has to resolve it the same way.
 	f.pushUpdate(t, work, "acme/rewritten", "r.txt", "r2")
-	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon", "--respect-git-config")
+	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon")
 	if code != 0 {
 		t.Fatalf("re-sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, "pull acme/rewritten\n") {
 		t.Errorf("missing pull event:\n%s", stdout)
 	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "rewritten", "r.txt")); got != "r2" {
+		t.Errorf("pulled file = %q, want r2", got)
+	}
 
-	// Persisting it in the workspace config must work the same as the flag.
+	// Without the rewrite the same workspace refuses the canonical host, so
+	// the acceptance above really is the git config talking.
 	ws2 := t.TempDir()
-	if _, _, code := runGitty(t, ws2, env, "init", "--url="+f.srv.URL, "--respect-git-config", "--verify=false"); code != 0 {
-		t.Fatalf("init --respect-git-config exit = %d", code)
+	if _, _, code := runGitty(t, ws2, nil, "init", "--url="+f.srv.URL, "--verify=false"); code != 0 {
+		t.Fatalf("init exit = %d", code)
 	}
-	stdout, stderr, code = runGitty(t, ws2, env, "sync", "--path=acme", "--anon")
-	if code != 0 {
-		t.Fatalf("sync from a respecting workspace exit = %d:\n%s\n%s", code, stdout, stderr)
+	stdout, stderr, code = runGitty(t, ws2, nil, "sync", "--path=acme", "--anon")
+	if code != 1 || !strings.Contains(stdout, "error acme/rewritten clone URL host does not match the configured instance\n") {
+		t.Errorf("an unrewritten foreign host should be refused (exit %d):\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "clone acme/rewritten\n") {
-		t.Errorf("missing clone event from the persisted config:\n%s", stdout)
+	if !strings.Contains(stderr, "insteadOf") {
+		t.Errorf("diagnostic should point at the git-config route:\n%s", stderr)
 	}
 }
 
 // TestE2EAllowCloneHost covers the split deployment: the API lives on one host
-// and advertises clone URLs on another. gitty refuses by default — that check
-// is what stops a hostile API response redirecting a clone — and the user
-// names the extra host to opt in.
+// and advertises clone URLs on another, with no git-config rewrite involved.
+// gitty refuses that by default — the check is what stops a hostile API
+// response redirecting a clone — and the user names the extra host to opt in.
 func TestE2EAllowCloneHost(t *testing.T) {
 	skipIfShort(t)
 

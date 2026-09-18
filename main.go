@@ -33,7 +33,6 @@ func main() {
 	initVerify := initCmd.Bool("verify", true, "Check the token against the instance and report its scopes")
 	var initCloneHosts stringList
 	initCmd.Var(&initCloneHosts, "allow-clone-host", "Additional host whose repositories this workspace may clone and send its token to (repeatable, or comma-separated)")
-	initRespectGit := initCmd.Bool("respect-git-config", false, "Honour url.<base>.insteadOf rewrites from your git config instead of pinning the URL gitty selected")
 
 	syncCmd := flag.NewFlagSet("sync", flag.ExitOnError)
 	syncPath := syncCmd.String("path", "", "GitLab Group Path (e.g., tenant/images) (required)")
@@ -49,7 +48,6 @@ func main() {
 	syncAcceptHostKeys := syncCmd.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
 	var syncCloneHosts stringList
 	syncCmd.Var(&syncCloneHosts, "allow-clone-host", "Additional host whose repositories may be cloned and sent this workspace's token (repeatable, or comma-separated)")
-	syncRespectGit := syncCmd.Bool("respect-git-config", false, "Honour url.<base>.insteadOf rewrites from your git config instead of pinning the URL gitty selected")
 
 	statusCmd := flag.NewFlagSet("status", flag.ExitOnError)
 	statusToken := statusCmd.String("token", "", "GitLab Access Token (only needed with --fetch)")
@@ -60,7 +58,6 @@ func main() {
 	statusAcceptHostKeys := statusCmd.Bool("accept-new-host-keys", false, "With --fetch over SSH, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new)")
 	var statusCloneHosts stringList
 	statusCmd.Var(&statusCloneHosts, "allow-clone-host", "With --fetch, an additional host that may be contacted with this workspace's token (repeatable, or comma-separated)")
-	statusRespectGit := statusCmd.Bool("respect-git-config", false, "Honour url.<base>.insteadOf rewrites from your git config instead of pinning the URL gitty selected")
 
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
 	lsPath := lsCmd.String("path", "", "GitLab group path (deprecated: pass it as a positional argument)")
@@ -97,13 +94,12 @@ func main() {
 			exitOnError(usageErrf("--ssh and --http are mutually exclusive"))
 		}
 		exitOnError(runInit(initOptions{
-			URL:              resolvedURL,
-			HTTP:             !*initSSH,
-			Force:            *initForce,
-			Verify:           *initVerify,
-			Token:            *initToken,
-			RespectGitConfig: *initRespectGit,
-			CloneHosts:       initCloneHosts,
+			URL:        resolvedURL,
+			HTTP:       !*initSSH,
+			Force:      *initForce,
+			Verify:     *initVerify,
+			Token:      *initToken,
+			CloneHosts: initCloneHosts,
 		}))
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
@@ -121,7 +117,6 @@ func main() {
 			Jobs:          *syncJobs,
 
 			AcceptNewHostKeys: *syncAcceptHostKeys,
-			RespectGitConfig:  *syncRespectGit,
 			AllowCloneHosts:   syncCloneHosts,
 		})
 		stop()
@@ -137,7 +132,6 @@ func main() {
 			Jobs:    *statusJobs,
 
 			AcceptNewHostKeys: *statusAcceptHostKeys,
-			RespectGitConfig:  *statusRespectGit,
 			AllowCloneHosts:   statusCloneHosts,
 		})
 		stop()

@@ -72,8 +72,8 @@ func (g *configAwareGit) sawNetworkCall() bool {
 	return false
 }
 
-// hasPin reports whether a recorded invocation carries gitty's identity
-// insteadOf override, which defeats the user's own rewrites.
+// hasPin reports whether a recorded invocation carries an identity insteadOf
+// override, which is what gitty used to add to defeat the user's own rewrites.
 func hasPin(call []string) bool {
 	for _, a := range call {
 		if strings.HasPrefix(a, "url.") && strings.Contains(a, ".insteadOf=") {
@@ -89,37 +89,9 @@ func oneProject(httpURL string) fakeSource {
 	}}
 }
 
-// By default gitty pins the URL it selected, so a stray global insteadOf rule
-// cannot turn an HTTP clone into an SSH one.
-func TestCloneIsPinnedByDefault(t *testing.T) {
-	t.Chdir(t.TempDir())
-
-	git := &configAwareGit{}
-	s, _, _ := newTestSyncer(
-		&Config{URL: "https://gitlab.com", HTTP: true},
-		oneProject("https://gitlab.com/acme/repo.git"),
-		git.run,
-	)
-	s.jobs = 1
-	s.syncRepos(context.Background(), "acme")
-
-	call, _ := git.network(t)
-	if !hasPin(call) {
-		t.Errorf("clone should carry the insteadOf pin by default, got %v", call)
-	}
-	// Nothing should probe git's rewrites when gitty is overriding them.
-	git.mu.Lock()
-	defer git.mu.Unlock()
-	for _, c := range git.calls {
-		if sub := gitSubArgs(c); len(sub) > 0 && sub[0] == "ls-remote" {
-			t.Errorf("unexpected rewrite probe while pinning: %v", c)
-		}
-	}
-}
-
-// --respect-git-config hands the URL to git unpinned, so the user's
-// url.<base>.insteadOf rules apply as they do for a hand-run git clone.
-func TestRespectGitConfigDropsThePin(t *testing.T) {
+// gitty hands git the advertised URL and adds nothing that would stop the
+// user's url.<base>.insteadOf rules from rewriting it.
+func TestCloneIsNeverPinned(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	git := &configAwareGit{
@@ -129,8 +101,8 @@ func TestRespectGitConfigDropsThePin(t *testing.T) {
 			return strings.Replace(u, "https://gitlab.example.com/", "https://git.internal/", 1)
 		},
 	}
-	s, _, stderr := newTestSyncer(
-		&Config{URL: "https://gitlab.example.com", HTTP: true, RespectGitConfig: true, CloneHosts: []string{"git.internal"}},
+	s, stdout, stderr := newTestSyncer(
+		&Config{URL: "https://gitlab.example.com", HTTP: true},
 		oneProject("https://gitlab.example.com/acme/repo.git"),
 		git.run,
 	)
@@ -139,20 +111,49 @@ func TestRespectGitConfigDropsThePin(t *testing.T) {
 
 	call, _ := git.network(t)
 	if hasPin(call) {
-		t.Errorf("--respect-git-config must not pin the URL, got %v", call)
+		t.Errorf("gitty must not pin the URL, got %v", call)
 	}
 	sub := gitSubArgs(call)
 	if len(sub) < 2 || sub[0] != "clone" || sub[1] != "https://gitlab.example.com/acme/repo.git" {
-		t.Errorf("clone should still be handed the advertised URL for git to rewrite, got %v", sub)
+		t.Errorf("clone should be handed the advertised URL for git to rewrite, got %v", sub)
+	}
+	if !strings.Contains(stdout.String(), "clone acme/repo\n") {
+		t.Errorf("expected a clone event, got %q", stdout.String())
 	}
 	if strings.Contains(stderr.String(), "does not match") {
-		t.Errorf("rewritten host should be accepted, stderr: %s", stderr.String())
+		t.Errorf("a rewritten host must not be rejected, stderr: %s", stderr.String())
 	}
 }
 
-// The clone URL's own host may legitimately differ from the instance's — a
-// split API/git deployment — but only for hosts the user named.
-func TestCloneHostAllowList(t *testing.T) {
+// The rewrite is the user's own configuration, so where it points is their
+// decision — including a host the workspace never heard of.
+func TestRewriteAuthorizesAnyHost(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	git := &configAwareGit{
+		rewrite: func(string) string { return "https://somewhere.else/acme/repo.git" },
+	}
+	s, stdout, _ := newTestSyncer(
+		&Config{URL: "https://gitlab.example.com", HTTP: true},
+		oneProject("https://gitlab.example.com/acme/repo.git"),
+		git.run,
+	)
+	s.jobs = 1
+	s.cred = credential{token: "t", username: "oauth2"}
+	s.exePath = "/bin/gitty"
+	s.syncRepos(context.Background(), "acme")
+
+	if !git.sawNetworkCall() {
+		t.Errorf("a git-config rewrite must be followed, got %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "clone acme/repo\n") {
+		t.Errorf("expected a clone event, got %q", stdout.String())
+	}
+}
+
+// What the API advertises is still checked, because that destination is
+// remote-controlled rather than something the user configured locally.
+func TestUnrewrittenCloneHostIsChecked(t *testing.T) {
 	tests := []struct {
 		name       string
 		cloneHosts []string
@@ -167,6 +168,7 @@ func TestCloneHostAllowList(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Chdir(t.TempDir())
 
+			// No rewrite: the API's own answer is the destination.
 			git := &configAwareGit{}
 			s, stdout, _ := newTestSyncer(
 				&Config{URL: "https://gitlab.example.com", HTTP: true, CloneHosts: tc.cloneHosts},
@@ -177,45 +179,13 @@ func TestCloneHostAllowList(t *testing.T) {
 			s.syncRepos(context.Background(), "acme")
 
 			assertEventLines(t, stdout)
-			cloned := git.sawNetworkCall()
-			if cloned != tc.wantClone {
+			if cloned := git.sawNetworkCall(); cloned != tc.wantClone {
 				t.Errorf("clone attempted = %v, want %v (stdout: %q)", cloned, tc.wantClone, stdout.String())
 			}
 			if !tc.wantClone && !strings.Contains(stdout.String(), "error acme/repo clone URL host") {
 				t.Errorf("expected a clone URL host error event, got %q", stdout.String())
 			}
 		})
-	}
-}
-
-// Honouring the user's git config must not become a way to smuggle the token
-// to an unnamed host: the rewritten URL is what gets checked.
-func TestRespectGitConfigStillChecksTheRewrittenHost(t *testing.T) {
-	t.Chdir(t.TempDir())
-
-	git := &configAwareGit{
-		rewrite: func(string) string { return "https://evil.example.com/acme/repo.git" },
-	}
-	s, stdout, stderr := newTestSyncer(
-		&Config{URL: "https://gitlab.example.com", HTTP: true, RespectGitConfig: true},
-		oneProject("https://gitlab.example.com/acme/repo.git"),
-		git.run,
-	)
-	s.jobs = 1
-	s.syncRepos(context.Background(), "acme")
-
-	assertEventLines(t, stdout)
-	if git.sawNetworkCall() {
-		t.Error("a rewrite to an unnamed host must not be cloned")
-	}
-	if !strings.Contains(stdout.String(), "error acme/repo clone URL host") {
-		t.Errorf("expected a host error event, got %q", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "evil.example.com") {
-		t.Errorf("diagnostic should name the rewritten host, got %q", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "local git config rewrote") {
-		t.Errorf("diagnostic should say the URL was rewritten, got %q", stderr.String())
 	}
 }
 
@@ -243,14 +213,14 @@ func TestHostMismatchHintIsPrintedOnce(t *testing.T) {
 	if n := strings.Count(stderr.String(), "--allow-clone-host"); n != 1 {
 		t.Errorf("hint printed %d times, want exactly 1:\n%s", n, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "--respect-git-config") {
-		t.Errorf("hint should mention --respect-git-config, got %q", stderr.String())
+	if !strings.Contains(stderr.String(), "insteadOf") {
+		t.Errorf("hint should mention the git-config route, got %q", stderr.String())
 	}
 }
 
-// A pull inside an existing checkout honours the same rules: the origin is
-// read unrewritten, and what git will really contact is what gets checked.
-func TestPullRespectsGitConfigRewrite(t *testing.T) {
+// A pull inside an existing checkout follows the same rules: the origin is
+// read unrewritten and handed to git, which rewrites it as the user configured.
+func TestPullFollowsGitConfigRewrite(t *testing.T) {
 	t.Chdir(t.TempDir())
 	mkRepo(t, "acme/repo")
 
@@ -261,7 +231,7 @@ func TestPullRespectsGitConfigRewrite(t *testing.T) {
 		},
 	}
 	s, stdout, _ := newTestSyncer(
-		&Config{URL: "https://gitlab.example.com", HTTP: true, RespectGitConfig: true, CloneHosts: []string{"git.internal"}},
+		&Config{URL: "https://gitlab.example.com", HTTP: true},
 		oneProject("https://gitlab.example.com/acme/repo.git"),
 		git.run,
 	)
@@ -275,7 +245,7 @@ func TestPullRespectsGitConfigRewrite(t *testing.T) {
 	}
 	call, _ := git.network(t)
 	if hasPin(call) {
-		t.Errorf("--respect-git-config must not pin the pull URL, got %v", call)
+		t.Errorf("gitty must not pin the pull URL, got %v", call)
 	}
 }
 
@@ -289,7 +259,7 @@ func TestRewriteToSSHStillSteersSSH(t *testing.T) {
 		rewrite: func(string) string { return "git@gitlab.example.com:acme/repo.git" },
 	}
 	s, _, _ := newTestSyncer(
-		&Config{URL: "https://gitlab.example.com", HTTP: true, RespectGitConfig: true},
+		&Config{URL: "https://gitlab.example.com", HTTP: true},
 		oneProject("https://gitlab.example.com/acme/repo.git"),
 		git.run,
 	)
@@ -303,45 +273,17 @@ func TestRewriteToSSHStillSteersSSH(t *testing.T) {
 	}
 }
 
-// A workspace honouring git rewrites may end up on SSH, so the host-key
-// warmup applies even though the configured transport is HTTP.
-func TestRespectGitConfigWarmsUpHostKeys(t *testing.T) {
-	cases := []struct {
-		name     string
-		cfg      *Config
-		jobs     int
-		dryRun   bool
-		wantWarm bool
-	}{
-		{name: "http alone needs no warmup", cfg: &Config{HTTP: true}, jobs: 4},
-		{name: "http honouring rewrites warms up", cfg: &Config{HTTP: true, RespectGitConfig: true}, jobs: 4, wantWarm: true},
-		{name: "ssh warms up", cfg: &Config{}, jobs: 4, wantWarm: true},
-		{name: "serial runs never need it", cfg: &Config{HTTP: true, RespectGitConfig: true}, jobs: 1},
-		{name: "dry runs never need it", cfg: &Config{HTTP: true, RespectGitConfig: true}, jobs: 4, dryRun: true},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &syncer{cfg: tc.cfg, jobs: tc.jobs, dryRun: tc.dryRun}
-			if got := s.needsHostKeyWarmup(); got != tc.wantWarm {
-				t.Errorf("needsHostKeyWarmup() = %v, want %v", got, tc.wantWarm)
-			}
-		})
-	}
-}
-
-// Managed subgroup directories must inherit these settings, or syncing from
+// Managed subgroup directories must inherit clone_hosts, or syncing from
 // inside one would fail where syncing from the root succeeds.
-func TestSubgroupConfigInheritsGitSettings(t *testing.T) {
+func TestSubgroupConfigInheritsCloneHosts(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	git := &configAwareGit{}
 	s, _, _ := newTestSyncer(
 		&Config{
-			URL:              "https://gitlab.example.com",
-			HTTP:             true,
-			RespectGitConfig: true,
-			CloneHosts:       []string{"git.internal"},
+			URL:        "https://gitlab.example.com",
+			HTTP:       true,
+			CloneHosts: []string{"git.internal"},
 		},
 		fakeSource{subgroups: map[string][]*gitlab.Group{
 			"acme": {{FullPath: "acme/team", Name: "team"}},
@@ -355,30 +297,19 @@ func TestSubgroupConfigInheritsGitSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loading subgroup config: %v", err)
 	}
-	if !sub.RespectGitConfig {
-		t.Error("subgroup config lost respect_git_config")
-	}
 	if len(sub.CloneHosts) != 1 || sub.CloneHosts[0] != "git.internal" {
 		t.Errorf("subgroup config lost clone_hosts: %v", sub.CloneHosts)
 	}
 }
 
-// Per-run flags widen the stored config rather than replacing it.
-func TestApplyGitOverridesIsAdditive(t *testing.T) {
+// The per-run flag widens the stored config rather than replacing it.
+func TestAllowCloneHostsIsAdditive(t *testing.T) {
 	cfg := &Config{URL: "https://gitlab.example.com", CloneHosts: []string{"a.internal"}}
-	cfg.ApplyGitOverrides(false, nil)
-	if cfg.RespectGitConfig {
-		t.Error("an unset flag must not turn respect_git_config on")
-	}
+	cfg.AllowCloneHosts(nil)
 	if len(cfg.CloneHosts) != 1 {
 		t.Errorf("clone_hosts changed without a flag: %v", cfg.CloneHosts)
 	}
-
-	cfg = &Config{URL: "https://gitlab.example.com", RespectGitConfig: true, CloneHosts: []string{"a.internal"}}
-	cfg.ApplyGitOverrides(false, []string{"b.internal"})
-	if !cfg.RespectGitConfig {
-		t.Error("an unset flag must not turn a stored respect_git_config off")
-	}
+	cfg.AllowCloneHosts([]string{"b.internal"})
 	if len(cfg.CloneHosts) != 2 {
 		t.Errorf("clone_hosts should be additive, got %v", cfg.CloneHosts)
 	}

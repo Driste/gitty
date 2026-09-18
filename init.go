@@ -24,13 +24,12 @@ func validateInstanceURL(raw string) error {
 
 // initOptions bundles the init command's flags.
 type initOptions struct {
-	URL              string
-	HTTP             bool
-	Force            bool
-	Verify           bool
-	Token            string
-	RespectGitConfig bool
-	CloneHosts       []string
+	URL        string
+	HTTP       bool
+	Force      bool
+	Verify     bool
+	Token      string
+	CloneHosts []string
 }
 
 func runInit(opts initOptions) error {
@@ -61,11 +60,10 @@ func runInit(opts initOptions) error {
 	}
 
 	cfg := &Config{
-		URL:              opts.URL,
-		HTTP:             opts.HTTP,
-		RootPath:         "", // The base of your workspace
-		RespectGitConfig: opts.RespectGitConfig,
-		CloneHosts:       opts.CloneHosts,
+		URL:        opts.URL,
+		HTTP:       opts.HTTP,
+		RootPath:   "", // The base of your workspace
+		CloneHosts: opts.CloneHosts,
 	}
 
 	if err := SaveConfigTo(wd, cfg); err != nil {
@@ -78,9 +76,6 @@ func runInit(opts initOptions) error {
 	}
 	fmt.Printf("Initialized gitty root at %s\n", wd)
 	fmt.Printf("Cloning over %s\n", transport)
-	if cfg.RespectGitConfig {
-		fmt.Println("Honouring url.<base>.insteadOf rewrites from your git config")
-	}
 	if len(cfg.CloneHosts) > 0 {
 		fmt.Printf("Also cloning from: %s\n", strings.Join(cfg.CloneHosts, ", "))
 	}

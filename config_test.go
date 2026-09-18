@@ -12,11 +12,10 @@ func TestSaveAndLoadConfigRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 
 	want := &Config{
-		URL:              "https://gitlab.example.com",
-		HTTP:             true,
-		RootPath:         "acme/team",
-		RespectGitConfig: true,
-		CloneHosts:       []string{"git.example.com", "mirror.example.com"},
+		URL:        "https://gitlab.example.com",
+		HTTP:       true,
+		RootPath:   "acme/team",
+		CloneHosts: []string{"git.example.com", "mirror.example.com"},
 	}
 	if err := SaveConfigTo(dir, want); err != nil {
 		t.Fatalf("SaveConfigTo returned error: %v", err)
