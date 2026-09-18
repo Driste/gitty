@@ -28,6 +28,8 @@ func main() {
 	initSSH := initCmd.Bool("ssh", false, "Clone over SSH (git@...) instead of the default HTTP(S)")
 	initHTTP := initCmd.Bool("http", false, "Clone over HTTP(S) (this is the default; accepted for compatibility)")
 	initForce := initCmd.Bool("force", false, "Overwrite an existing .gitty/config")
+	initToken := initCmd.String("token", "", "GitLab Access Token to verify (falls back to env vars)")
+	initVerify := initCmd.Bool("verify", true, "Check the token against the instance and report its scopes")
 
 	syncCmd := flag.NewFlagSet("sync", flag.ExitOnError)
 	syncPath := syncCmd.String("path", "", "GitLab Group Path (e.g., tenant/images) (required)")
@@ -83,7 +85,7 @@ func main() {
 		if *initSSH && *initHTTP {
 			exitOnError(usageErrf("--ssh and --http are mutually exclusive"))
 		}
-		exitOnError(runInit(resolvedURL, !*initSSH, *initForce))
+		exitOnError(runInit(resolvedURL, !*initSSH, *initForce, *initVerify, *initToken))
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

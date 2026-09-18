@@ -92,6 +92,8 @@ gitty init [flags]
 | `--ssh` | `false` | Clone over SSH (`git@...`) using your local SSH keys, instead of the default HTTP(S). |
 | `--http` | `true` | Clone over HTTP(S). This is the default; the flag is accepted for compatibility and conflicts with `--ssh`. |
 | `--force` | `false` | Overwrite an existing `.gitty/config`. Without it, `init` refuses to clobber an initialized workspace (which would reset its `root_path`). |
+| `--token` | `""` | Token to verify (falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`). Only used for the check below; it is never stored. |
+| `--verify` | `true` | Check the token against the instance and report its scopes. `--verify=false` skips it (offline installs, CI ordering). |
 
 **gitty clones over HTTP(S) by default.** The token gitty already needs for the
 GitLab API authenticates the clones too, so a fresh workspace works on a CI
@@ -207,6 +209,30 @@ summary cloned=3 pulled=12 skipped=0 errors=1   # always the last line
 Exit codes: `0` success · `1` completed with per-item failures · `2` usage or
 configuration error · `130` interrupted (Ctrl-C; git is signalled cleanly and
 a re-run recovers the workspace).
+
+### `init` checks your token
+
+`init` asks the instance who your token belongs to and what it is allowed to
+do, so a missing, expired or under-scoped token is caught immediately rather
+than as a confusing 401 half-way through your first sync:
+
+```
+Token from GITLAB_TOKEN authenticated as @alice.
+  Scopes: read_api
+  WARNING: no read_repository scope — this workspace clones over HTTP(S), so every
+  clone will fail even though listing works. Add read_repository to the token, or
+  re-run 'gitty init --force --ssh' to clone with SSH keys instead.
+```
+
+With no token it tells you how to create one with the right scopes for this
+workspace's transport, and mentions `--anon` for public groups. A rejected
+token is reported as rejected; an *unreachable* instance is reported as
+unreachable, not as a bad token. The check is advisory — the workspace is
+created either way — takes well under a second, and never blocks: pass
+`--verify=false` to skip it entirely. Scope reporting needs a GitLab new
+enough to support token introspection; where it is unavailable gitty says so
+rather than guessing. CI job tokens cannot be introspected and are reported
+as such.
 
 ### Token scopes
 
