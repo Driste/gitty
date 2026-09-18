@@ -94,7 +94,7 @@ gitty init [flags]
 | `--force` | `false` | Overwrite an existing `.gitty/config`. Without it, `init` refuses to clobber an initialized workspace (which would reset its `root_path`). |
 | `--token` | `""` | Token to verify (falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`). Only used for the check below; it is never stored. |
 | `--verify` | `true` | Check the token against the instance and report its scopes. `--verify=false` skips it (offline installs, CI ordering). |
-| `--allow-clone-host` | `""` | An extra host whose repositories this workspace may clone and send its token to, beyond the instance's own. Repeatable, or comma-separated. Not needed for a host your git config rewrites to — see below. |
+| `--allow-clone-host` | `""` | Record an extra host this workspace expects to clone from, beyond the instance's own, to silence the note gitty prints about it. Repeatable, or comma-separated. |
 
 **gitty clones over HTTP(S) by default.** The token gitty already needs for the
 GitLab API authenticates the clones too, so a fresh workspace works on a CI
@@ -141,35 +141,45 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | `--verbose` | `false` | Print each git invocation and its output to stderr, with URL credentials redacted. |
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
 | `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
-| `--allow-clone-host` | `""` | An extra host whose repositories may be cloned and sent this workspace's token. Repeatable, or comma-separated. Adds to whatever `init` stored. |
+| `--allow-clone-host` | `""` | Record an extra host this run expects to clone from, silencing the note about it. Repeatable, or comma-separated. Adds to whatever `init` stored. |
 
 ### Your git config is respected
 
-gitty hands git the clone URL and nothing else — no `-c url.<...>.insteadOf`
-override of its own. Whatever `url.<base>.insteadOf` rules you have configured
-apply to gitty's clones, pulls and fetches exactly as they would to a
-`git clone` you typed yourself.
+gitty hands git the clone URL and gets out of the way. It adds no
+`url.<...>.insteadOf` override of its own, and it never refuses a URL because
+it disagrees about where it points. Whatever rules you have configured apply to
+gitty's clones, pulls and fetches exactly as they would to a `git clone` you
+typed yourself.
 
-That matters when your instance advertises clone URLs on a canonical host you
-cannot reach — a VPN name, an internal mirror, an SSH-only egress path — and
-you bridge it with a URL block:
+That matters when your instance advertises an external endpoint you cannot
+reach from where gitty runs, and you map it back to the internal one:
 
 ```ini
 [url "https://git.internal/"]
-	insteadOf = https://gitlab.example.com/
+	insteadOf = https://gitlab.external.example.com/
 ```
 
 gitty follows it. No flag, no workspace setting.
 
-The rewritten destination is also accepted without being listed as a clone
-host, because it came from your machine rather than from the API. gitty
-resolves it with `git ls-remote --get-url` (which applies your rules without
-touching the network) so it knows where the credential is actually going and
-whether ssh ended up in the path — a rewrite to an SSH URL still gets
-`--accept-new-host-keys` and the host-key warmup.
+**Conditional includes work too.** If that rule lives in a file pulled in by an
+`includeIf`:
 
-When a rewrite redirects the instance itself, gitty says so on stderr, so a
-surprising transport is visible rather than silent:
+```ini
+[includeIf "gitdir:~/work/"]
+	path = ~/work/.gitconfig
+```
+
+git evaluates a `gitdir:` condition against the repository it is operating on,
+so the rule is invisible from anywhere that is *not* that repository — the
+workspace root included. A clone still picks it up, because git creates the
+repository first and only then fetches. This is precisely why gitty does not
+try to work out the final URL in advance and act on it: any such prediction is
+blind to your conditional includes, while git itself is not.
+
+gitty does still ask git where a URL resolves to (`git ls-remote --get-url`,
+which touches no network), but only to steer ssh and to print something useful
+— a rewrite that lands on an SSH URL still gets `--accept-new-host-keys` and
+the host-key warmup. When a rewrite redirects the instance itself, it says so:
 
 ```
 note: local git config rewrites https://gitlab.com/ to git@gitlab.com:
@@ -184,15 +194,20 @@ more narrowly, or run gitty where it does not apply.
 
 ### Clone URLs on another host (`--allow-clone-host`)
 
-What the *API* advertises is still checked: by default the only host gitty
-clones from — and sends your token to — is the instance's own. That check is
-what stops a compromised or misconfigured API response redirecting a clone
-elsewhere, and unlike your git config, the API's answer is not under your
-control.
+When the API advertises repositories on a host that is not the instance's,
+gitty clones them anyway — where a URL ends up is git's call — but says so once
+per run, because your token travels with it:
 
-Split deployments legitimately trip it, when the API answers on one host and
-advertises repositories on another with no rewrite in between. Name the extra
-host to opt in:
+```
+note: clone URL https://git.internal/acme/app.git is not on the configured
+instance https://gitlab.example.com; git decides the final URL (url.insteadOf
+rules apply) and any token travels with it
+hint: if that is expected, list the host with --allow-clone-host=<host> to
+silence this note
+```
+
+Split deployments do this legitimately. Record that it is intended and the note
+goes away:
 
 ```bash
 gitty sync --path="tenant/images" --allow-clone-host=git.internal
@@ -391,7 +406,7 @@ unknowable rather than zero.
 | `--jobs` | `4` | Repositories inspected concurrently (1-16). |
 | `--verbose` | `false` | Print each git invocation to stderr (URLs redacted). |
 | `--accept-new-host-keys` | `false` | With `--fetch` over SSH, record unknown host keys without prompting. |
-| `--allow-clone-host` | `""` | With `--fetch`, an extra host that may be contacted with this workspace's token. Repeatable. |
+| `--allow-clone-host` | `""` | With `--fetch`, record an extra host this workspace expects to contact. Repeatable. |
 
 ---
 

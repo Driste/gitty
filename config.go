@@ -22,17 +22,10 @@ type Config struct {
 	HTTP     bool   `toml:"http"`
 	RootPath string `toml:"root_path"`
 
-	// RespectGitConfig honours the local git configuration's
-	// url.<base>.insteadOf rewrites instead of pinning every clone and fetch
-	// to the URL gitty selected. Off by default, because the most common such
-	// rule silently turns an HTTP clone into an SSH one; on for setups that
-	// deliberately rewrite the instance's advertised URL to a reachable one.
-	RespectGitConfig bool `toml:"respect_git_config,omitempty"`
-
-	// CloneHosts names extra hosts whose repositories this workspace may
-	// clone, fetch, and send its token to, beyond the instance's own host.
-	// Needed when the API advertises clone URLs on a different host than the
-	// one gitty talks to (a split API/git deployment, or a mirror).
+	// CloneHosts names extra hosts this workspace expects to clone and fetch
+	// from, beyond the instance's own. Listing one records that an API
+	// advertising repositories on another host (a split API/git deployment, or
+	// a mirror) is intended, which silences the note gitty otherwise prints.
 	CloneHosts []string `toml:"clone_hosts,omitempty"`
 }
 
@@ -43,14 +36,14 @@ func (c *Config) AllowCloneHosts(hosts []string) {
 	c.CloneHosts = append(c.CloneHosts, hosts...)
 }
 
-// AllowsHost reports whether a URL the GitLab API advertised may be contacted
-// with this workspace's credentials: its host must be the configured
-// instance's, or one the user listed in clone_hosts. An empty host on either
-// side is an error, which callers treat as "not allowed".
+// AllowsHost reports whether a remote URL's host is one this workspace expects
+// to talk to: the configured instance's, or one the user listed in
+// clone_hosts. An empty host on either side is an error, which callers treat
+// as "not expected".
 //
-// This applies only to URLs that reached gitty from the API. A destination the
-// local git config rewrote to is the user's own choice and is not checked here
-// — see syncer.checkRemoteHost.
+// It answers "should gitty say something about this host", not "may git go
+// there" — git's own configuration decides that, and gitty does not override
+// it. See syncer.noteForeignHost.
 func (c *Config) AllowsHost(rawURL string) (bool, error) {
 	host := extractHost(rawURL)
 	instance := extractHost(c.URL)

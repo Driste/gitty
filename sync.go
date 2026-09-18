@@ -490,13 +490,11 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		return
 	}
 
-	// Clone (or reclone): verify the URL git will contact points at a host
-	// this workspace trusts, so a compromised or misconfigured API response
-	// cannot redirect the clone to an attacker-controlled host.
+	// Clone (or reclone). gitty hands git the URL the API advertised and lets
+	// git's own configuration decide where that points; the probe below only
+	// steers ssh and reports an unexpected host, it never blocks the clone.
 	effective := s.effectiveURL(ctx, ".", cloneURL)
-	if !s.checkRemoteHost(p.PathWithNamespace, "clone URL", cloneURL, effective) {
-		return
-	}
+	s.noteForeignHost("clone URL", cloneURL, effective)
 
 	kind := "clone"
 	if state == destBroken {
@@ -603,18 +601,22 @@ func resolveToken(flagToken string) string {
 	return resolveCredential(flagToken).token
 }
 
-// effectiveURL returns the URL git will actually contact for rawURL once the
-// local git configuration's url.<base>.insteadOf rules have been applied.
-// "git ls-remote --get-url" performs exactly that resolution, and does so
-// without touching the network.
+// effectiveURL is a best-effort answer to "where will git actually send this
+// URL", after the local git configuration's url.<base>.insteadOf rules.
+// "git ls-remote --get-url" performs that resolution without touching the
+// network.
 //
-// gitty never overrides those rules: whatever the user configured is what git
-// does, for clones, pulls and fetches alike. Resolving the result up front is
-// what lets gitty check where a credential is about to go, and steer ssh when
-// a rewrite puts it in the path.
+// It is advisory only, and deliberately never gates a git invocation. git
+// resolves a `[includeIf "gitdir:..."]` section against the repository it is
+// operating on, so a rule living in such an include is invisible from anywhere
+// that is not that repository — including the workspace root, where a clone
+// starts. A clone still picks the rule up (git creates the gitdir, then
+// fetches), which is exactly the case where predicting the URL up front gets
+// it wrong. So gitty uses this to steer ssh and to say something useful on
+// stderr, and lets git decide where to go.
 //
-// If the probe fails, rawURL is the best available answer and is returned
-// unchanged.
+// dir should be the repository the command will run in, when there is one.
+// If the probe fails, rawURL is the best available answer.
 func (s *syncer) effectiveURL(ctx context.Context, dir, rawURL string) string {
 	if rawURL == "" {
 		return rawURL
@@ -629,43 +631,30 @@ func (s *syncer) effectiveURL(ctx context.Context, dir, rawURL string) string {
 	return rawURL
 }
 
-// checkRemoteHost validates the host git will really contact, where rawURL is
-// the URL the GitLab API advertised and effective is what the local git config
-// resolves it to. It guards the credential: a compromised or misconfigured API
-// response must not be able to redirect a clone — and the token with it — to a
-// host the user never named.
+// noteForeignHost reports, once per run, that repositories are being cloned or
+// fetched from a host other than the configured instance — and that the token
+// goes there with them.
 //
-// A URL the local git config rewrote is exempt, because that destination came
-// from the user's own machine rather than from the API. Everything else must
-// be the instance's host or one listed in clone_hosts.
-//
-// false means the caller must not run the command; an error event and a
-// diagnostic have already been emitted.
-func (s *syncer) checkRemoteHost(path, what, rawURL, effective string) bool {
-	if effective != rawURL {
-		return true // the user's git config chose this destination
-	}
+// It is a note rather than a refusal. gitty cannot know where git will end up
+// before git runs (see effectiveURL), and the local git config is the
+// authority on that; blocking on a guess breaks the legitimate setups where an
+// instance advertises URLs on an external host that the user's own config
+// rewrites to an internal one. Listing the host with --allow-clone-host says
+// "yes, I know" and silences this.
+func (s *syncer) noteForeignHost(what, rawURL, effective string) {
 	if ok, err := s.cfg.AllowsHost(effective); ok && err == nil {
-		return true
+		return
 	}
-	s.event("error", path, what+" host does not match the configured instance")
-	s.diagf("%s: %s %q does not match instance %q", path, what, redactURL(effective), s.cfg.URL)
-	s.hostHint()
-	return false
-}
-
-// hostHint prints the way out of a host mismatch, once per run rather than
-// once per repository.
-func (s *syncer) hostHint() {
 	s.hintOnce.Do(func() {
-		s.diagf("hint: allow that host with --allow-clone-host=<host>, or rewrite it in your git config with url.<base>.insteadOf — gitty follows those rewrites")
+		s.diagf("note: %s %s is not on the configured instance %s; git decides the final URL (url.insteadOf rules apply) and any token travels with it",
+			what, redactURL(effective), s.cfg.URL)
+		s.diagf("hint: if that is expected, list the host with --allow-clone-host=<host> to silence this note")
 	})
 }
 
 // warnIfURLRewritten notes once, on stderr, that the local git configuration
 // redirects the configured instance somewhere else, so a surprising transport
-// is visible rather than silent. "git ls-remote --get-url" resolves insteadOf
-// without contacting the network.
+// is visible rather than silent.
 func (s *syncer) warnIfURLRewritten(ctx context.Context) {
 	probe := strings.TrimSuffix(s.cfg.URL, "/") + "/"
 	got := s.effectiveURL(ctx, ".", probe)
@@ -677,17 +666,15 @@ func (s *syncer) warnIfURLRewritten(ctx context.Context) {
 }
 
 // authForCheckout prepares a network git command to run inside an existing
-// checkout: it returns the environment and the final argv. When credentials
-// would be injected it first verifies the checkout's own origin still points
-// at the configured instance — a user may have re-pointed it since the clone,
-// and the token must never travel to another host. ok=false means the caller
-// must not run the command (an error event was emitted).
+// checkout: it returns the environment and the final argv. Running inside the
+// repository is what lets git apply that repository's own configuration,
+// including `[includeIf "gitdir:..."]` sections. ok=false means the caller must
+// not run the command (an error event was emitted).
 func (s *syncer) authForCheckout(ctx context.Context, path, dir string, args ...string) ([]string, []string, bool) {
 	env := s.credentialEnv()
 
-	// Read the checkout's configured origin, unrewritten: it is what the
-	// credential host check applies to, and what git will rewrite via
-	// insteadOf when it contacts the remote.
+	// Read the checkout's configured origin, unrewritten: it is what git will
+	// rewrite via insteadOf when it contacts the remote.
 	origin, err := s.originOf(ctx, dir)
 	if err != nil {
 		s.event("error", path, "reading origin remote failed")
@@ -695,14 +682,12 @@ func (s *syncer) authForCheckout(ctx context.Context, path, dir string, args ...
 		return nil, nil, false
 	}
 
-	// Resolve what git will really contact, applying this checkout's own
-	// insteadOf rules.
+	// Resolve what git will really contact. Inside the checkout this sees the
+	// repository's full configuration, gitdir-conditional includes and all.
 	effective := s.effectiveURL(ctx, dir, origin)
 
 	if env != nil {
-		if !s.checkRemoteHost(path, "origin", origin, effective) {
-			return nil, nil, false
-		}
+		s.noteForeignHost("origin", origin, effective)
 		args = append([]string{"-c", "credential.helper="}, args...)
 	}
 	// ssh may still need steering: always in SSH mode, and over HTTP when the

@@ -1528,28 +1528,39 @@ func TestE2EUnknownGroupFailsNonZero(t *testing.T) {
 	}
 }
 
-func TestE2EForeignCloneHostRejected(t *testing.T) {
+func TestE2EForeignCloneHostIsNoted(t *testing.T) {
 	skipIfShort(t)
 
 	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/elsewhere", map[string]string{"e.txt": "e"})
 	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	// The same server under another name: the clone can really succeed, so the
+	// test proves gitty does not stand in the way of it.
+	gitHost := strings.Replace(f.srv.URL, "127.0.0.1", "localhost", 1)
 	f.projects["acme"] = []apiProject{{
 		ID:                60,
-		PathWithNamespace: "acme/hijack",
-		HTTPURLToRepo:     "http://evil.invalid/hijack.git",
-		SSHURLToRepo:      "git@evil.invalid:hijack.git",
+		PathWithNamespace: "acme/elsewhere",
+		HTTPURLToRepo:     gitHost + "/git/acme/elsewhere.git",
+		SSHURLToRepo:      "git@example.invalid:acme/elsewhere.git",
 	}}
 
 	ws := initWorkspace(t, f)
 	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
-	if code != 1 {
-		t.Errorf("foreign-host sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0 (an unexpected host is a note):\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "error acme/hijack clone URL host does not match") {
-		t.Errorf("expected host-mismatch error event on stdout:\n%s", stdout)
+	if !strings.Contains(stdout, "clone acme/elsewhere\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
 	}
-	if _, err := os.Stat(filepath.Join(ws, "acme", "hijack")); !os.IsNotExist(err) {
-		t.Error("foreign-host project must not be cloned")
+	if got := readFileT(t, filepath.Join(ws, "acme", "elsewhere", "e.txt")); got != "e" {
+		t.Errorf("cloned file = %q, want e", got)
+	}
+	// The note belongs on stderr, never in the event stream.
+	if !strings.Contains(stderr, "localhost") || !strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("expected a note naming the host and how to silence it:\n%s", stderr)
+	}
+	if strings.Contains(stdout, "note:") || strings.Contains(stdout, "hint:") {
+		t.Errorf("diagnostics leaked into the event stream:\n%s", stdout)
 	}
 }
 
@@ -2001,18 +2012,20 @@ func TestE2EInsteadOfRewritesAreFollowed(t *testing.T) {
 		t.Errorf("pulled file = %q, want r2", got)
 	}
 
-	// Without the rewrite the same workspace refuses the canonical host, so
-	// the acceptance above really is the git config talking.
+	// Without the rewrite the canonical host is simply unreachable, so the
+	// same workspace fails inside git. That is what makes the clones above
+	// meaningful: they were the user's git config talking, not gitty quietly
+	// substituting a URL of its own.
 	ws2 := t.TempDir()
 	if _, _, code := runGitty(t, ws2, nil, "init", "--url="+f.srv.URL, "--verify=false"); code != 0 {
 		t.Fatalf("init exit = %d", code)
 	}
 	stdout, stderr, code = runGitty(t, ws2, nil, "sync", "--path=acme", "--anon")
-	if code != 1 || !strings.Contains(stdout, "error acme/rewritten clone URL host does not match the configured instance\n") {
-		t.Errorf("an unrewritten foreign host should be refused (exit %d):\n%s\n%s", code, stdout, stderr)
+	if code != 1 || !strings.Contains(stdout, "error acme/rewritten git clone failed\n") {
+		t.Errorf("the unrewritten canonical host should fail in git (exit %d):\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, "insteadOf") {
-		t.Errorf("diagnostic should point at the git-config route:\n%s", stderr)
+	if !strings.Contains(stderr, "gitlab.canonical.invalid") {
+		t.Errorf("expected a note naming the unexpected host:\n%s", stderr)
 	}
 }
 
@@ -2027,8 +2040,8 @@ func TestE2EAllowCloneHost(t *testing.T) {
 	f.addRepo(t, "acme/split", map[string]string{"s.txt": "s"})
 	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
 
-	// The same test server reached under a different name, so the clone can
-	// really succeed once the host is allowed.
+	// The same test server reached under a different name, so the clone really
+	// succeeds either way — the flag changes the reporting, not the outcome.
 	gitHost := strings.Replace(f.srv.URL, "127.0.0.1", "localhost", 1)
 	f.projects["acme"] = []apiProject{{
 		ID:                160,
@@ -2039,20 +2052,10 @@ func TestE2EAllowCloneHost(t *testing.T) {
 
 	ws := initWorkspace(t, f)
 
+	// Unlisted: cloned, and noted on stderr.
 	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
-	if code != 1 {
-		t.Fatalf("default sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "error acme/split clone URL host does not match the configured instance\n") {
-		t.Errorf("missing host mismatch event:\n%s", stdout)
-	}
-	if !strings.Contains(stderr, "--allow-clone-host") {
-		t.Errorf("diagnostic should suggest --allow-clone-host:\n%s", stderr)
-	}
-
-	stdout, stderr, code = runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--allow-clone-host=localhost")
 	if code != 0 {
-		t.Fatalf("sync --allow-clone-host exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+		t.Fatalf("sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, "clone acme/split\n") {
 		t.Errorf("missing clone event:\n%s", stdout)
@@ -2060,15 +2063,33 @@ func TestE2EAllowCloneHost(t *testing.T) {
 	if got := readFileT(t, filepath.Join(ws, "acme", "split", "s.txt")); got != "s" {
 		t.Errorf("cloned file = %q, want s", got)
 	}
+	if !strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("expected a note about the unexpected host:\n%s", stderr)
+	}
 
-	// An allow list that does not cover the host is no help.
+	// An allow list that does not cover the host still notes it.
 	ws2 := t.TempDir()
 	if _, _, code := runGitty(t, ws2, nil, "init", "--url="+f.srv.URL, "--allow-clone-host=elsewhere.invalid", "--verify=false"); code != 0 {
 		t.Fatalf("init --allow-clone-host exit = %d", code)
 	}
-	stdout, _, code = runGitty(t, ws2, nil, "sync", "--path=acme", "--anon")
-	if code != 1 || !strings.Contains(stdout, "error acme/split clone URL host") {
-		t.Errorf("unrelated allowed host should not permit the clone (exit %d):\n%s", code, stdout)
+	if _, stderr, _ := runGitty(t, ws2, nil, "sync", "--path=acme", "--anon"); !strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("an unrelated allowed host should not silence the note:\n%s", stderr)
+	}
+
+	// Listing the right host does silence it.
+	ws3 := t.TempDir()
+	if _, _, code := runGitty(t, ws3, nil, "init", "--url="+f.srv.URL, "--allow-clone-host=localhost", "--verify=false"); code != 0 {
+		t.Fatalf("init --allow-clone-host exit = %d", code)
+	}
+	stdout, stderr, code = runGitty(t, ws3, nil, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync from an allowing workspace exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/split\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("listing the host should silence the note:\n%s", stderr)
 	}
 
 	// Subgroup workspaces inherit the setting, so syncing from inside one
@@ -2082,14 +2103,98 @@ func TestE2EAllowCloneHost(t *testing.T) {
 	}}
 	f.addRepo(t, "acme/team/nested", map[string]string{"n.txt": "n"})
 
-	if _, _, code := runGitty(t, ws, nil, "sync", "--path=acme", "--groups", "--anon", "--allow-clone-host=localhost"); code != 0 {
+	if _, _, code := runGitty(t, ws3, nil, "sync", "--path=acme", "--groups", "--anon"); code != 0 {
 		t.Fatalf("group sync exit = %d", code)
 	}
-	stdout, stderr, code = runGitty(t, filepath.Join(ws, "acme", "team"), nil, "sync", "--anon")
+	stdout, stderr, code = runGitty(t, filepath.Join(ws3, "acme", "team"), nil, "sync", "--anon")
 	if code != 0 {
 		t.Fatalf("sync from the subgroup exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, "clone acme/team/nested\n") {
-		t.Errorf("subgroup workspace did not inherit clone_hosts:\n%s\n%s", stdout, stderr)
+		t.Errorf("subgroup sync did not clone:\n%s\n%s", stdout, stderr)
+	}
+	if strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("subgroup workspace did not inherit clone_hosts:\n%s", stderr)
+	}
+}
+
+// TestE2EIncludeIfRewriteIsHonoured is the regression guard for gitty getting
+// between git and a conditionally-included config.
+//
+// git evaluates an `[includeIf "gitdir:..."]` section against the repository it
+// is working on, so a url.<base>.insteadOf rule inside one is invisible from
+// anywhere that is not that repository — including the workspace root, where a
+// clone is launched from. A clone still picks the rule up, because git creates
+// the gitdir and only then fetches. Any attempt by gitty to predict the final
+// URL from the workspace root therefore gets it wrong, which is why the
+// clone-URL host check reports rather than refuses.
+func TestE2EIncludeIfRewriteIsHonoured(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	work := f.addRepo(t, "acme/internal", map[string]string{"i.txt": "i"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	// The API advertises the external endpoint, which does not resolve.
+	const external = "https://gitlab.external.invalid"
+	f.projects["acme"] = []apiProject{{
+		ID:                170,
+		PathWithNamespace: "acme/internal",
+		HTTPURLToRepo:     external + "/git/acme/internal.git",
+		SSHURLToRepo:      "git@gitlab.external.invalid:acme/internal.git",
+	}}
+
+	ws := t.TempDir()
+
+	// The rewrite lives in a second file, pulled in by a gitdir condition
+	// scoped to the workspace — the shape gitty could not see.
+	home := t.TempDir()
+	inner := filepath.Join(home, "internal.gitconfig")
+	if err := os.WriteFile(inner,
+		[]byte("[url \""+f.srv.URL+"/\"]\n\tinsteadOf = "+external+"/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"),
+		[]byte("[includeIf \"gitdir:"+ws+"/\"]\n\tpath = "+inner+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "XDG_CONFIG_HOME="}
+
+	if _, _, code := runGitty(t, ws, env, "init", "--url="+f.srv.URL, "--verify=false"); code != 0 {
+		t.Fatalf("init exit = %d", code)
+	}
+
+	stdout, stderr, code := runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0 (the included rewrite must be honoured):\n%s\n%s",
+			code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/internal\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "internal", "i.txt")); got != "i" {
+		t.Errorf("cloned file = %q, want i", got)
+	}
+
+	// And the pull path, which runs inside the checkout where the condition
+	// matches directly.
+	f.pushUpdate(t, work, "acme/internal", "i.txt", "i2")
+	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("re-sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "pull acme/internal\n") {
+		t.Errorf("missing pull event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "internal", "i.txt")); got != "i2" {
+		t.Errorf("pulled file = %q, want i2", got)
+	}
+
+	// status --fetch runs inside the checkouts too, so it must work as well.
+	stdout, stderr, code = runGitty(t, ws, env, "status", "--fetch", "--anon")
+	if code != 0 {
+		t.Fatalf("status --fetch exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "status acme/internal branch=") {
+		t.Errorf("missing status event:\n%s", stdout)
 	}
 }
