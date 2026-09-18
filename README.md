@@ -2,7 +2,7 @@
 
 A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, subgroups, and repositories directly to your local machine.
 
-`gitty` uses a local `gitty.toml` configuration file to anchor your workspace, preserving the exact namespace directory structure of your GitLab environment to prevent naming collisions.
+`gitty` uses a local `.gitty/config` file to anchor your workspace, preserving the exact namespace directory structure of your GitLab environment to prevent naming collisions.
 
 ## Features
 * **Workspace Config**: Initialize a workspace with `gitty init` so you don't have to repeatedly pass your GitLab URL or SSH/HTTP preferences.
@@ -10,7 +10,7 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Recursive or Flat**: Sync only the immediate group, or use the `--nested` flag to recursively pull everything underneath it.
 * **Smart Updates**: Automatically runs `git pull --ff-only` if the local directory exists, or `git clone` if it doesn't. Fast-forward-only pulls avoid surprise merge commits — a diverged or dirty checkout fails loudly and is reported instead of silently merged.
 * **Dry Runs**: Test your sync commands safely with `--dry-run` to see exactly what folders will be created and which repos will be cloned.
-* **CI/CD Ready**: Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN` environment variables, and exits non-zero when any group or repository fails to sync so a broken pipeline stage is never reported green.
+* **CI/CD Ready**: Clones over HTTP(S) by default, authenticated with the same token gitty already uses for the API — no SSH keys to provision. Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN`, and exits non-zero when any group or repository fails to sync so a broken pipeline stage is never reported green.
 * **Safe Destinations**: Refuses to write outside the workspace (namespace paths containing `..` or absolute paths are skipped) and verifies each clone URL points at the configured GitLab host before running `git clone`.
 
 ---
@@ -89,15 +89,33 @@ gitty init [flags]
 | Flag | Default | Description |
 | :--- | :--- | :--- |
 | `--url` | `https://gitlab.com` | The base URL of your GitLab instance (change this if using self-hosted GitLab). Must be an `http(s)://` URL. |
-| `--http` | `false` | Use HTTP(S) for cloning (`https://...`) instead of the default SSH (`git@...`). |
+| `--ssh` | `false` | Clone over SSH (`git@...`) using your local SSH keys, instead of the default HTTP(S). |
+| `--http` | `true` | Clone over HTTP(S). This is the default; the flag is accepted for compatibility and conflicts with `--ssh`. |
 | `--force` | `false` | Overwrite an existing `.gitty/config`. Without it, `init` refuses to clobber an initialized workspace (which would reset its `root_path`). |
+| `--token` | `""` | Token to verify (falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`). Only used for the check below; it is never stored. |
+| `--verify` | `true` | Check the token against the instance and report its scopes. `--verify=false` skips it (offline installs, CI ordering). |
+| `--allow-clone-host` | `""` | Record an extra host this workspace expects to clone from, beyond the instance's own, to silence the note gitty prints about it. Repeatable, or comma-separated. |
+
+**gitty clones over HTTP(S) by default.** The token gitty already needs for the
+GitLab API authenticates the clones too, so a fresh workspace works on a CI
+runner or a new machine without setting up SSH keys. Pass `--ssh` if you would
+rather clone with your keys.
+
+The transport is recorded in `.gitty/config` at `init` time and is always
+written explicitly, so an existing workspace keeps the transport it was created
+with — changing gitty's default never re-points a workspace you already have.
+To switch an existing one, re-run `init`:
+
+```bash
+gitty init --force --ssh      # switch this workspace to SSH
+```
 
 **Example:**
 ```bash
 cd ~/my-workspace
-gitty init --url="https://gitlab.mycompany.com" --http
+gitty init --url="https://gitlab.mycompany.com"
 ```
-This generates a `gitty.toml` file in the current directory. `gitty` will use this directory as the root destination for all future sync commands.
+This generates a `.gitty/config` file in the current directory. `gitty` will use this directory as the root destination for all future sync commands.
 
 ---
 
@@ -114,14 +132,131 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | :--- | :--- | :--- |
 | `--path` | `""` | **(Required)** The GitLab group or subgroup path (e.g., `tenant/images`). |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
-| `--anon` | `false` | Sync public groups and repositories anonymously, without a token. Only public resources are visible in this mode. |
+| `--anon` | `false` | Sync public groups and repositories anonymously. Any `GITLAB_TOKEN` / `CI_JOB_TOKEN` in the environment is ignored, so a stale token cannot turn an anonymous run into a 401. Conflicts with `--token`. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
 | `--repos` | `false` | Only fetch and clone/pull repositories. *(Note: If neither `--groups` nor `--repos` is passed, it defaults to `--repos`)*. |
 | `--nested` | `false` | Include nested subgroups and projects recursively. |
 | `--dry-run`| `false` | Print planned actions (`plan clone <path>` etc.) without creating directories or executing git commands. Dry-run output is diffable against a real run's actions and produces the identical `summary` line. |
 | `--jobs` | `4` | Number of concurrent repo clone/pull operations (1-16). `--jobs=1` restores fully serial behavior. |
-| `--verbose` | `false` | Print each git invocation and its output to stderr, with URL credentials redacted. |
+| `--verbose` | `false` | Print gitty's version, each git invocation and its output, and — after every clone or pull — the origin URL git itself resolved from inside the checkout, so you can see whether a `url.<base>.insteadOf` rule took effect. URL credentials are redacted. |
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
+| `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
+| `--allow-clone-host` | `""` | Record an extra host this run expects to clone from, silencing the note about it. Repeatable, or comma-separated. Adds to whatever `init` stored. |
+
+### Your git config is respected
+
+gitty hands git the clone URL and gets out of the way. It adds no
+`url.<...>.insteadOf` override of its own, and it never refuses a URL because
+it disagrees about where it points. Whatever rules you have configured apply to
+gitty's clones, pulls and fetches exactly as they would to a `git clone` you
+typed yourself.
+
+That matters when your instance advertises an external endpoint you cannot
+reach from where gitty runs, and you map it back to the internal one:
+
+```ini
+[url "https://git.internal/"]
+	insteadOf = https://gitlab.external.example.com/
+```
+
+gitty follows it. No flag, no workspace setting.
+
+To watch it happen, run with `--verbose`: after each clone or pull gitty asks
+git — from inside that checkout, where all of your configuration is in effect
+— what the origin resolves to, and prints it:
+
+```
+acme/app: origin https://git.internal/acme/app.git (rewritten by git config from https://gitlab.external.example.com/acme/app.git)
+```
+
+If that line shows the URL you expected, your config is being used. If it shows
+the unrewritten URL, git itself did not apply the rule from that directory —
+which is a question about the rule (its `includeIf` condition, its prefix, the
+`HOME` gitty was started with), not about gitty.
+
+**Conditional includes work too.** If that rule lives in a file pulled in by an
+`includeIf`:
+
+```ini
+[includeIf "gitdir:~/work/"]
+	path = ~/work/.gitconfig
+```
+
+git evaluates a `gitdir:` condition against the repository it is operating on,
+so the rule is invisible from anywhere that is *not* that repository — the
+workspace root included. A clone still picks it up, because git creates the
+repository first and only then fetches. This is precisely why gitty does not
+try to work out the final URL in advance and act on it: any such prediction is
+blind to your conditional includes, while git itself is not.
+
+gitty does still ask git where a URL resolves to (`git ls-remote --get-url`,
+which touches no network), but only to steer ssh and to print something useful
+— a rewrite that lands on an SSH URL still gets `--accept-new-host-keys` and
+the host-key warmup. When a rewrite redirects the instance itself, it says so:
+
+```
+note: local git config rewrites https://gitlab.com/ to git@gitlab.com:
+(url.insteadOf); gitty is following that
+```
+
+**The flip side:** a global rule rewriting `https://<host>/` to `git@<host>:`
+will turn an HTTP workspace into SSH clones. The injected HTTPS credentials
+stop applying, ssh asks for host-key confirmation, and a CI runner with no SSH
+key fails. That is your git config doing what you told it to; scope the rule
+more narrowly, or run gitty where it does not apply.
+
+### Clone URLs on another host (`--allow-clone-host`)
+
+When the API advertises repositories on a host that is not the instance's,
+gitty clones them anyway — where a URL ends up is git's call — but says so once
+per run, because your token travels with it:
+
+```
+note: clone URL https://git.internal/acme/app.git is not on the configured
+instance https://gitlab.example.com; git decides the final URL (url.insteadOf
+rules apply) and any token travels with it
+hint: if that is expected, list the host with --allow-clone-host=<host> to
+silence this note
+```
+
+Split deployments do this legitimately. Record that it is intended and the note
+goes away:
+
+```bash
+gitty sync --path="tenant/images" --allow-clone-host=git.internal
+
+# or store it in the workspace, once:
+gitty init --url="https://gitlab.example.com" --allow-clone-host=git.internal
+```
+
+The flag is repeatable and also accepts a comma-separated list. Stored hosts
+are inherited by the managed subgroup directories `--groups` creates, so
+syncing from inside one behaves the same as syncing from the workspace root.
+
+### SSH host keys
+
+The first time you clone from a host whose key isn't in your `known_hosts`,
+ssh asks you to confirm the fingerprint — and it reads your answer straight
+from the terminal, not from gitty. Because `gitty sync` clones several
+repositories at once, gitty syncs the **first** repository on its own so that
+prompt happens exactly once; only then does it fan out. Without that, every
+worker would reach the prompt simultaneously and compete for the terminal,
+which produces a storm of repeated prompts for the same fingerprint.
+
+For unattended runs, where there is no one to answer, use:
+
+```bash
+gitty sync --path="tenant/images" --accept-new-host-keys
+```
+
+That records unknown host keys automatically while still refusing a host key
+that has *changed*. Alternatively, pre-seed the key yourself
+(`ssh-keyscan gitlab.example.com >> ~/.ssh/known_hosts`), or use the default
+HTTP(S) transport instead.
+
+If you are still prompted once per repository, the accepted key isn't being
+saved — check that `~/.ssh` exists and is writable. `--jobs=1` forces fully
+serial cloning as a fallback.
 
 ### Output and exit codes
 
@@ -143,9 +278,48 @@ Exit codes: `0` success · `1` completed with per-item failures · `2` usage or
 configuration error · `130` interrupted (Ctrl-C; git is signalled cleanly and
 a re-run recovers the workspace).
 
+### `init` checks your token
+
+`init` asks the instance who your token belongs to and what it is allowed to
+do, so a missing, expired or under-scoped token is caught immediately rather
+than as a confusing 401 half-way through your first sync:
+
+```
+Token from GITLAB_TOKEN authenticated as @alice.
+  Scopes: read_api
+  WARNING: no read_repository scope — this workspace clones over HTTP(S), so every
+  clone will fail even though listing works. Add read_repository to the token, or
+  re-run 'gitty init --force --ssh' to clone with SSH keys instead.
+```
+
+With no token it tells you how to create one with the right scopes for this
+workspace's transport, and mentions `--anon` for public groups. A rejected
+token is reported as rejected; an *unreachable* instance is reported as
+unreachable, not as a bad token. The check is advisory — the workspace is
+created either way — takes well under a second, and never blocks: pass
+`--verify=false` to skip it entirely. Scope reporting needs a GitLab new
+enough to support token introspection; where it is unavailable gitty says so
+rather than guessing. CI job tokens cannot be introspected and are reported
+as such.
+
+### Token scopes
+
+Because gitty clones over HTTP(S), the token does two jobs: it reads the API
+*and* authenticates git. A token with only `api` or `read_api` can list groups
+but **cannot clone** — it needs **`read_repository`** as well. That combination
+fails in a confusing way (the listing works, every clone 401s), so gitty
+detects it and says so:
+
+```
+hint: gitty clones over HTTP(S) and authenticated git with the GITLAB_TOKEN
+token. That token needs the read_repository scope — 'api' or 'read_api' alone
+lets it list groups but not clone. Re-run 'gitty init --force --ssh' to clone
+with SSH keys instead.
+```
+
 ### Authentication for HTTP clones
 
-In `--http` mode, gitty authenticates `git clone`/`git pull` itself: it
+In HTTP(S) mode (the default), gitty authenticates `git clone`/`git pull` itself: it
 re-execs as git's askpass helper and hands the token over via the child
 process environment — never on the command line, never written to any git
 config or credential store (ambient credential helpers are disabled for the
@@ -209,7 +383,7 @@ clone_all_repos:
   image: golang:latest
   script:
     - go build -o gitty .
-    - ./gitty init --http
+    - ./gitty init
     - ./gitty sync --path="tenant/images" --nested
 ```
 
@@ -244,40 +418,65 @@ unknowable rather than zero.
 | `--anon` | `false` | With `--fetch`, contact public repositories without a token. |
 | `--jobs` | `4` | Repositories inspected concurrently (1-16). |
 | `--verbose` | `false` | Print each git invocation to stderr (URLs redacted). |
+| `--accept-new-host-keys` | `false` | With `--fetch` over SSH, record unknown host keys without prompting. |
+| `--allow-clone-host` | `""` | With `--fetch`, record an extra host this workspace expects to contact. Repeatable. |
 
 ---
 
-## Previewing a group (`gitty ls`)
+## Browsing (`gitty ls`)
 
-Lists the remote groups and projects under a target, with a project count per
-group, marking each project `new` (a sync would clone it) or `present`
-(already checked out). It never invokes git and never writes to the workspace —
-use it to see what a sync *would* bring down, and how much.
+Lists the remote groups and projects under a target, nesting subgroups and
+marking each project `present` (already checked out) or `new` (a sync would
+clone it). It never invokes git and never writes to the workspace.
+
+`ls` takes its target as a positional argument and resolves it the way a shell
+resolves a directory, against the workspace directory you are standing in:
 
 ```bash
-gitty ls --path="tenant/images" --nested
-gitty ls --path="tenant/images" --nested --format=tree
-gitty ls --path="tenant/images" --nested --format=json
+gitty ls                      # the current context; at the workspace root, the top-level groups
+gitty ls .                    # the same
+gitty ls /                    # always the instance's top-level groups
+gitty ls tenant/images        # relative to the current context
+gitty ls /tenant/images       # absolute, from the instance root
+gitty ls ..                   # the parent group
 ```
 
+Inside a managed subgroup directory (one `sync --groups` created) a bare
+`gitty ls` lists that subgroup — no flags required. Flags may go on either side
+of the argument: `gitty ls acme --nested` works as well as
+`gitty ls --nested acme`.
+
+On a terminal it prints a tree:
+
 ```
-group tenant/images projects=2
-project tenant/images/app present
-project tenant/images/lib new
-summary groups=1 projects=2 new=1 present=1
+wayne-enterprises/
+├── wayne-aerospace/ (1 project)
+│   └── mission-control  new
+├── wayne-industries/ (2 projects)
+│   ├── backend-controller  present
+│   └── microservice  present
+└── wayne-tech/
+
+4 groups, 3 projects: 2 present, 1 to clone
 ```
 
-`--format=tree` renders the same data as an indented namespace tree with `+`
-(would clone) and `=` (present) markers; `--format=json` emits a structured
-document for programmatic use.
+Group names are blue, present projects green, and ones a sync would clone
+yellow. Like `ls(1)`, the output adapts to where it is going: **piped or
+redirected output falls back to the greppable one-event-per-line format with no
+colour**, so scripts keep parsing stable output. Override either with
+`--format` and `--color`; `NO_COLOR` is honoured.
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--path` | `""` | **(Required)** GitLab group or subgroup path, unless run from a managed subgroup directory. |
+| *(positional)* | current context | Group to list. `.`, `/`, `..`, relative and absolute paths all work. |
 | `--token` | `""` | GitLab access token. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. Required unless `--anon`. |
 | `--anon` | `false` | List public groups and projects anonymously. |
 | `--nested` | `false` | Recurse into nested subgroups. Per-group project counts are only complete in this mode. |
-| `--format` | `text` | `text` (greppable event lines), `tree` (indented tree), or `json`. |
+| `--format` | `auto` | `auto` (tree on a terminal, `text` when piped), `tree`, `text`, or `json`. |
+| `--color` | `auto` | `auto` (only on a terminal), `always`, or `never`. |
+
+`--path` still works in place of the positional argument, but the two cannot be
+combined.
 
 ---
 
@@ -344,6 +543,14 @@ fast unit-only run with:
 
 ```bash
 go test -short ./...
+```
+
+There is also an integration smoke test that drives the built binary against a
+small public group on gitlab.com, anonymously. CI runs it on every push and
+pull request; to run it yourself:
+
+```bash
+go build -o gitty . && ./scripts/integration-test.sh
 ```
 
 ---

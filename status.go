@@ -12,11 +12,16 @@ import (
 
 // statusOptions bundles the status command's flags.
 type statusOptions struct {
-	Token   string
-	Anon    bool
-	Fetch   bool
-	Verbose bool
-	Jobs    int
+	Token             string
+	Anon              bool
+	Fetch             bool
+	Verbose           bool
+	AcceptNewHostKeys bool
+	Jobs              int
+
+	// AllowCloneHosts adds trusted clone hosts for this run only; see
+	// Config.AllowCloneHosts.
+	AllowCloneHosts []string
 }
 
 // repoStatus is one checkout's branch and freshness, as reported by
@@ -80,6 +85,17 @@ func statusDetail(st repoStatus) string {
 	return detail
 }
 
+// firstOrigin reads a checkout's origin for the host-key warmup decision. A
+// repo whose origin cannot be read is simply not informative here, so the
+// caller falls back to the configured transport.
+func firstOrigin(ctx context.Context, s *syncer, dir string) string {
+	origin, err := s.originOf(ctx, dir)
+	if err != nil {
+		return ""
+	}
+	return origin
+}
+
 // runStatus reports the branch and freshness of every checkout in the
 // workspace. It needs no GitLab API access; --fetch refreshes remote-tracking
 // refs first, which does require credentials for HTTP remotes.
@@ -93,7 +109,12 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		return usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
 	}
 
-	cred := resolveCredential(opts.Token)
+	cfg.AllowCloneHosts(opts.AllowCloneHosts)
+
+	cred, err := resolveCredentialFor(opts.Token, opts.Anon)
+	if err != nil {
+		return err
+	}
 	if opts.Fetch && cred.token == "" && !opts.Anon {
 		return usageErrf("--fetch needs a token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var); use --anon to fetch public repositories without one")
 	}
@@ -103,14 +124,18 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 	}
 
 	s := &syncer{
-		cfg:     cfg,
-		git:     execGit,
-		verbose: opts.Verbose,
-		jobs:    opts.Jobs,
-		cred:    cred,
-		exePath: exePath,
-		out:     os.Stdout,
-		errOut:  os.Stderr,
+		cfg:               cfg,
+		git:               execGit,
+		verbose:           opts.Verbose,
+		jobs:              opts.Jobs,
+		cred:              cred,
+		exePath:           exePath,
+		acceptNewHostKeys: opts.AcceptNewHostKeys,
+		out:               os.Stdout,
+		errOut:            os.Stderr,
+	}
+	if opts.Verbose {
+		s.diagf("gitty %s", versionString())
 	}
 
 	wd, err := os.Getwd()
@@ -128,7 +153,7 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		results []repoStatus
 		resMu   sync.Mutex
 	)
-	forEachConcurrent(ctx, s.jobs, repos, func(rel string) {
+	inspect := func(rel string) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -153,7 +178,19 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		resMu.Unlock()
 
 		s.event("status", rel, statusDetail(st))
-	})
+	}
+
+	// With --fetch over SSH the first connection may prompt for host-key
+	// confirmation; inspect one repo alone first so that happens once rather
+	// than once per worker (see needsHostKeyWarmup). Whether ssh is involved
+	// follows the first checkout's own remote, after the local git config's
+	// rewrites.
+	pending := repos
+	if opts.Fetch && len(pending) > 1 && s.needsHostKeyWarmup(ctx, pending[0], firstOrigin(ctx, s, pending[0])) {
+		inspect(pending[0])
+		pending = pending[1:]
+	}
+	forEachConcurrent(ctx, s.jobs, pending, inspect)
 
 	dirty, ahead, behind := 0, 0, 0
 	for _, st := range results {

@@ -55,11 +55,18 @@ tag (e.g. `v1.0.0`), a source build prints `dev` plus the commit it came from
   `gitty sync --groups` creates subgroup directories, each gets its own config
   with `root_path` set to that subgroup, so you can `cd` into it and run
   `gitty sync` without repeating `--path`.
+- **Transport**: HTTP(S) by default (the API token authenticates clones too, so
+  no SSH keys are needed); `gitty init --ssh` selects SSH. The choice is stored
+  explicitly in `.gitty/config`, so an existing workspace keeps its transport.
 - **Token resolution order** for `sync`: `--token` flag → `GITLAB_TOKEN` env →
   `CI_JOB_TOKEN` env. A token is required unless `--anon` is passed (public
-  resources only). In `--http` mode the token also authenticates git itself,
-  handed over via an internal askpass re-exec — never on the command line and
-  never written to disk.
+  resources only). `--anon` ignores ambient env tokens rather than silently
+  using them, and conflicts with an explicit `--token`.
+- **Token scopes**: in HTTP(S) mode the token also authenticates git itself,
+  handed to git via an internal askpass re-exec — never on the command line,
+  never written to disk. It therefore needs `read_repository` in addition to
+  `api`/`read_api`: an API-only token lists groups fine but cannot clone.
+  gitty detects that failure and prints a hint naming the scope.
 - **Exit codes**: `0` success, `1` completed with per-item failures, `2` usage
   or configuration error (do not retry unchanged), `130` interrupted.
 
@@ -72,13 +79,22 @@ Writes `.gitty/config` in the current directory. Run once in the root folder.
 | Flag      | Type    | Default                 | Description |
 | :-------- | :------ | :---------------------- | :---------- |
 | `--url`   | string  | `https://gitlab.com`    | Base URL of the GitLab instance (change for self-hosted). Must be http(s). Inside a GitLab CI job, defaults to `CI_SERVER_URL` when not passed. |
-| `--http`  | boolean | `false`                 | Clone over HTTPS instead of SSH. Recommended for CI runners. |
+| `--ssh`   | boolean | `false`                 | Clone over SSH (`git@...`) with local SSH keys. |
+| `--http`  | boolean | `true`                  | Clone over HTTP(S). The default; accepted for compatibility, conflicts with `--ssh`. |
 | `--force` | boolean | `false`                 | Overwrite an existing `.gitty/config`; without it, re-init refuses (exit 2). |
+| `--token` | string  | `""`                    | Token to verify; falls back to env vars. Never stored. |
+| `--verify`| boolean | `true`                  | Check the token against the instance and report its scopes. Advisory: never fails init. |
 
 ```bash
 cd ~/my-workspace
-gitty init --url="https://gitlab.mycompany.com" --http
+gitty init --url="https://gitlab.mycompany.com"
 ```
+
+`init` verifies the resolved token: it reports the authenticated user, the
+token's scopes where the instance supports introspection, and warns when a
+scope needed by this workspace is missing (notably `read_repository` for an
+HTTP workspace). Missing, rejected and unreachable are reported distinctly.
+The check never fails init; `--verify=false` skips it.
 
 ### `gitty sync` — clone/pull a group
 
@@ -89,7 +105,7 @@ ones.
 | :----------------- | :------ | :------ | :---------- |
 | `--path`           | string  | `""`    | GitLab group/subgroup path, e.g. `tenant/images`. Required unless run from a managed subgroup directory that already has its own config. |
 | `--token`          | string  | `""`    | GitLab access token. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. Required unless `--anon`. |
-| `--anon`           | boolean | `false` | Sync public groups/repositories anonymously, without a token. |
+| `--anon`           | boolean | `false` | Sync public groups/repositories anonymously. Ambient `GITLAB_TOKEN` / `CI_JOB_TOKEN` are ignored; conflicts with `--token`. |
 | `--groups`         | boolean | `false` | Create the subgroup directory structure locally (each with its own config). |
 | `--repos`          | boolean | `false` | Clone/pull repositories. Defaults to `true` when neither `--groups` nor `--repos` is passed. |
 | `--nested`         | boolean | `false` | Recurse into nested subgroups/projects instead of only the immediate group. |
@@ -97,6 +113,7 @@ ones.
 | `--jobs`           | integer | `4`     | Concurrent repo clone/pull operations (1-16). |
 | `--verbose`        | boolean | `false` | Print each git invocation and its output to stderr (URLs redacted). |
 | `--reclone-broken` | boolean | `false` | Move aside non-repo destinations (renamed `<dir>.gitty-broken-<n>`, never deleted) and clone fresh; without it they are `error` events. |
+| `--accept-new-host-keys` | boolean | `false` | SSH only: record unknown host keys without prompting (`StrictHostKeyChecking=accept-new`); a changed key is still refused. Set this for unattended runs. |
 
 ```bash
 export GITLAB_TOKEN="glpat-XXXXXXXX"
@@ -142,18 +159,35 @@ summary repos=2 dirty=0 ahead=0 behind=1 errors=0
 tracking ref, so ahead/behind are unknowable rather than zero — do not read
 `0/0` as "in sync" when that marker is present.
 
-### `gitty ls` — preview a group's contents
+### `gitty ls` — browse groups and projects
 
-Lists remote groups/projects under a target and whether each project is
-already checked out. Contacts the API; never runs git or writes to disk.
+Lists remote groups/projects under a target and whether each project is already
+checked out. Contacts the API; never runs git or writes to disk.
+
+The target is a POSITIONAL argument resolved like a shell path against the
+workspace directory you are in (`--path` still works but cannot be combined
+with it):
+
+| Argument      | Meaning |
+| :------------ | :------ |
+| *(none)* or `.` | The current context: the workspace's `root_path`, or the instance's top-level groups at the workspace root. |
+| `/`           | Always the instance's top-level groups. |
+| `a/b`         | Relative to the current context. |
+| `/a/b`        | Absolute, from the instance root. |
+| `..`          | The parent group; clamped at the instance root. |
 
 | Flag       | Type    | Default | Description |
 | :--------- | :------ | :------ | :---------- |
-| `--path`   | string  | `""`    | Group path to list. Required unless run from a managed subgroup directory. |
 | `--token`  | string  | `""`    | Access token; falls back to env vars. Required unless `--anon`. |
 | `--anon`   | boolean | `false` | List public resources without a token. |
 | `--nested` | boolean | `false` | Recurse into subgroups. Per-group counts are only complete in this mode. |
-| `--format` | string  | `text`  | `text` (event lines), `tree` (indented), or `json`. Prefer `json` when parsing. |
+| `--format` | string  | `auto`  | `auto`, `tree`, `text`, or `json`. |
+| `--color`  | string  | `auto`  | `auto`, `always`, or `never`. `NO_COLOR` is honoured. |
+
+Output adapts to the destination, like `ls(1)`: a colored tree on a terminal,
+and the greppable one-event-per-line `text` format when piped or redirected.
+**When parsing, pass `--format=json` explicitly** rather than relying on
+detection. The text form is:
 
 ```
 group tenant/images projects=2
@@ -162,9 +196,7 @@ project tenant/images/lib new
 summary groups=1 projects=2 new=1 present=1
 ```
 
-Use `ls` to answer "what would a sync clone, and how much?" without touching
-the filesystem; use `sync --dry-run` when you want the plan in sync's own
-event vocabulary.
+Flags may appear before or after the positional argument.
 
 ### `gitty agent schema` — emit a machine-readable tool schema
 
@@ -218,7 +250,7 @@ gitty sync --path=tenant/images --nested
 
 1. Run `gitty agent schema` to discover the available commands and arguments.
 2. Ensure a workspace exists: if there is no `.gitty/config`, run `gitty init`
-   (choose `--http` for CI/token-based cloning).
+   (HTTP(S) is the default and needs no SSH keys; pass `--ssh` to use keys).
 3. Ensure a token is available via `--token` or the `GITLAB_TOKEN` /
    `CI_JOB_TOKEN` environment variable (or pass `--anon` for public groups).
 4. Optionally run `gitty ls --path=<group> --nested --format=json` to see how
@@ -230,15 +262,15 @@ gitty sync --path=tenant/images --nested
 
 ## CI/CD example (GitLab)
 
-`gitty` auto-detects `CI_JOB_TOKEN`. Use `--http` because CI runners usually
-cannot use SSH.
+`gitty` auto-detects `CI_JOB_TOKEN`. HTTP(S) is the default transport, so a CI
+runner needs no SSH keys.
 
 ```yaml
 clone_all_repos:
   image: golang:latest
   script:
     - go build -o gitty .
-    - ./gitty init --http
+    - ./gitty init
     - ./gitty sync --path="tenant/images" --nested
 ```
 
@@ -247,9 +279,20 @@ clone_all_repos:
 - `sync` must be run from a workspace directory; if there is no `.gitty/config`
   it exits 2 with an error telling you to run `gitty init` first.
 - SSH cloning uses the local git environment (`SSH_AUTH_SOCK`, `~/.gitconfig`)
-  and requires working SSH keys; in `--http` mode gitty authenticates git
+  and requires working SSH keys; in the default HTTP(S) mode gitty authenticates git
   itself with the resolved token, and interactive credential prompts are
   disabled so bad credentials fail fast instead of hanging.
+- SSH host keys: ssh prompts for confirmation of an unknown host key and reads
+  the answer from the terminal, not from gitty. gitty syncs the first
+  repository alone so that prompt happens once before the worker pool fans
+  out. For unattended runs pass `--accept-new-host-keys`, which records
+  unknown keys automatically (a changed key is still refused).
+- Transport is pinned: whichever URL gitty selects (HTTPS by default, SSH with
+  `--ssh`) is the URL git contacts. A `url.<base>.insteadOf` rule in the
+  local git config cannot silently switch the transport, which would otherwise
+  turn an HTTP workspace into SSH clones and strand the injected credentials.
+  gitty notes on stderr when it overrides such a rule. To clone over SSH, run
+  `gitty init --ssh` rather than relying on a rewrite.
 - The tool never deletes local repositories; it only clones new ones and
   fast-forwards existing ones. Even `--reclone-broken` renames aside rather
   than deleting.

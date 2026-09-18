@@ -28,6 +28,9 @@ type gitlabSource interface {
 	// Projects returns the projects directly in target, or all projects
 	// including those in subgroups when nested is true.
 	Projects(target string, nested bool) ([]*gitlab.Project, error)
+	// TopLevelGroups returns the instance's top-level groups — the namespaces
+	// visible to the caller, with no parent.
+	TopLevelGroups() ([]*gitlab.Group, error)
 }
 
 // gitRunner executes a git command in dir with extra environment entries and
@@ -61,8 +64,18 @@ type syncer struct {
 	cred          credential
 	exePath       string // this binary, for the askpass re-exec
 
+	// acceptNewHostKeys maps to ssh's StrictHostKeyChecking=accept-new:
+	// unknown hosts are recorded without prompting, a changed key is still
+	// refused. Opt-in, because it trades a confirmation prompt for
+	// trust-on-first-use.
+	acceptNewHostKeys bool
+
 	out    io.Writer
 	errOut io.Writer
+
+	// hintOnce keeps the "how to allow this host" guidance to a single line
+	// per run instead of repeating it for every rejected repository.
+	hintOnce sync.Once
 
 	mu     sync.Mutex
 	counts syncCounts
@@ -170,20 +183,58 @@ func (s *syncer) reportGitFailure(path string, args []string, out []byte, err er
 		}
 	}
 	fmt.Fprintf(s.errOut, "--- end %s ---\n", path)
+	if hint := s.authFailureHint(out); hint != "" {
+		fmt.Fprintln(s.errOut, hint)
+	}
+}
+
+// authFailureHint returns guidance when git's output looks like an HTTP
+// authentication or authorization failure. Since gitty clones over HTTP(S),
+// the usual cause is a token that can reach the API but not the repositories:
+// GitLab's `api` and `read_api` scopes do not grant git access, which
+// `read_repository` does. That is easy to misread as "my token is wrong" when
+// the same token works fine for listing groups.
+func (s *syncer) authFailureHint(out []byte) string {
+	if !s.cfg.HTTP || s.cred.token == "" {
+		return ""
+	}
+	lower := strings.ToLower(string(out))
+	for _, marker := range []string{
+		"authentication failed",
+		"http basic: access denied",
+		"401 unauthorized",
+		"403 forbidden",
+		"could not read username",
+	} {
+		if strings.Contains(lower, marker) {
+			return fmt.Sprintf(
+				"hint: gitty clones over HTTP(S) and authenticated git with the %s token. "+
+					"That token needs the %s scope (or %s) — %s alone lets it list groups "+
+					"but not clone. Re-run 'gitty init' to check the token's scopes, or "+
+					"'gitty init --force --ssh' to clone with SSH keys instead.",
+				s.cred.source, scopeReadRepo, scopeAPI, scopeReadAPI)
+		}
+	}
+	return ""
 }
 
 // syncOptions bundles the sync command's flags.
 type syncOptions struct {
-	Path          string
-	Token         string
-	DryRun        bool
-	Groups        bool
-	Repos         bool
-	Nested        bool
-	Anon          bool
-	Verbose       bool
-	RecloneBroken bool
-	Jobs          int
+	Path              string
+	Token             string
+	DryRun            bool
+	Groups            bool
+	Repos             bool
+	Nested            bool
+	Anon              bool
+	Verbose           bool
+	RecloneBroken     bool
+	AcceptNewHostKeys bool
+	Jobs              int
+
+	// AllowCloneHosts adds trusted clone hosts for this run only; see
+	// Config.AllowCloneHosts.
+	AllowCloneHosts []string
 }
 
 // maxJobs bounds --jobs: beyond ~16 concurrent clones the bottleneck is the
@@ -209,8 +260,13 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.nested = opts.Nested
 	s.verbose = opts.Verbose
 	s.recloneBroken = opts.RecloneBroken
+	s.acceptNewHostKeys = opts.AcceptNewHostKeys
 	s.jobs = opts.Jobs
+	s.cfg.AllowCloneHosts(opts.AllowCloneHosts)
 
+	if s.verbose {
+		s.diagf("gitty %s", versionString())
+	}
 	if s.verbose && s.credentialEnv() != nil {
 		s.diagf("HTTP auth: injecting %s credential (username %s) via askpass", s.cred.source, s.cred.username)
 	}
@@ -220,6 +276,9 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	}
 	if opts.DryRun {
 		s.diagf("=== DRY RUN MODE ENABLED: No changes will be made ===")
+	}
+	if opts.Repos && !opts.DryRun {
+		s.warnIfURLRewritten(ctx)
 	}
 
 	if opts.Groups {
@@ -289,10 +348,14 @@ func (s *syncer) syncGroups(ctx context.Context, target string) {
 			continue
 		}
 
+		// Every field but root_path is inherited, so syncing from inside a
+		// managed subgroup directory behaves exactly like syncing from the
+		// workspace root.
 		subCfg := &Config{
-			URL:      s.cfg.URL,
-			HTTP:     s.cfg.HTTP,
-			RootPath: g.FullPath,
+			URL:        s.cfg.URL,
+			HTTP:       s.cfg.HTTP,
+			RootPath:   g.FullPath,
+			CloneHosts: append([]string(nil), s.cfg.CloneHosts...),
 		}
 		if err := SaveConfigTo(groupDest, subCfg); err != nil {
 			s.event("error", g.FullPath, "saving config failed")
@@ -316,6 +379,13 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	}
 
 	s.diagf("Found %d projects.", len(allProjects))
+
+	// Sync one repository on its own first so an SSH host-key prompt happens
+	// once rather than once per worker (see needsHostKeyWarmup).
+	if len(allProjects) > 1 && s.needsHostKeyWarmup(ctx, ".", s.cloneURL(allProjects[0])) {
+		s.syncOneRepo(ctx, allProjects[0])
+		allProjects = allProjects[1:]
+	}
 
 	// Dispatch to a bounded worker pool. jobs=1 preserves serial FIFO
 	// behavior; workers rely on the syncer mutex for line-atomic output.
@@ -388,10 +458,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		return
 	}
 
-	cloneURL := p.SSHURLToRepo
-	if s.cfg.HTTP {
-		cloneURL = p.HTTPURLToRepo
-	}
+	cloneURL := s.cloneURL(p)
 
 	// Calculate destination relative to where we ran the command.
 	relPath := getLocalRelPath(p.PathWithNamespace, s.cfg.RootPath)
@@ -417,6 +484,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		}
 		if err := s.runGit(ctx, p.PathWithNamespace, repoDest, env, args...); err == nil {
 			s.event("pull", p.PathWithNamespace)
+			s.reportResolvedOrigin(ctx, p.PathWithNamespace, repoDest, cloneURL)
 		}
 		return
 	}
@@ -426,14 +494,11 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		return
 	}
 
-	// Clone (or reclone): verify the clone URL points at the configured
-	// instance before handing it to git, so a compromised or misconfigured
-	// API response cannot redirect the clone to an attacker-controlled host.
-	if ok, err := hostsMatch(s.cfg.URL, cloneURL); err != nil || !ok {
-		s.event("error", p.PathWithNamespace, "clone URL host does not match the configured instance")
-		s.diagf("%s: clone URL %q does not match instance %q", p.PathWithNamespace, redactURL(cloneURL), s.cfg.URL)
-		return
-	}
+	// Clone (or reclone). gitty hands git the URL the API advertised and lets
+	// git's own configuration decide where that points; the probe below only
+	// steers ssh and reports an unexpected host, it never blocks the clone.
+	effective := s.effectiveURL(ctx, ".", cloneURL)
+	s.noteForeignHost("clone URL", cloneURL, effective)
 
 	kind := "clone"
 	if state == destBroken {
@@ -466,9 +531,31 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 	if env != nil {
 		args = append([]string{"-c", "credential.helper="}, args...)
 	}
+	env = append(env, s.sshEnvFor(effective)...)
 	if err := s.runGit(ctx, p.PathWithNamespace, ".", env, args...); err == nil {
 		s.event(kind, p.PathWithNamespace)
+		s.reportResolvedOrigin(ctx, p.PathWithNamespace, repoDest, cloneURL)
 	}
+}
+
+// reportResolvedOrigin says, under --verbose, which URL git actually used for
+// a checkout's origin — resolved by git itself, from inside the repository,
+// where every part of the user's configuration is in effect. That is the
+// ground truth no pre-clone guess can be, and the quickest way to confirm
+// whether a url.<base>.insteadOf rule took effect on a given repository.
+func (s *syncer) reportResolvedOrigin(ctx context.Context, path, dir, advertised string) {
+	if !s.verbose {
+		return
+	}
+	resolved := s.effectiveURL(ctx, dir, "origin")
+	if resolved == "origin" {
+		return // the probe failed; nothing trustworthy to report
+	}
+	if advertised != "" && resolved != advertised {
+		s.diagf("%s: origin %s (rewritten by git config from %s)", path, redactURL(resolved), redactURL(advertised))
+		return
+	}
+	s.diagf("%s: origin %s", path, redactURL(resolved))
 }
 
 // execGit runs a git command with the user's environment (SSH_AUTH_SOCK,
@@ -518,36 +605,208 @@ func resolveCredential(flagToken string) credential {
 	return credential{}
 }
 
+// resolveCredentialFor applies the same order, except that --anon means
+// anonymous: an ambient GITLAB_TOKEN or CI_JOB_TOKEN in the environment is
+// ignored rather than silently used. Without this, a stale, expired or
+// wrongly-scoped token left in the shell turns an explicitly anonymous run
+// into a 401. Combining --anon with an explicit --token is contradictory and
+// is reported as a usage error.
+func resolveCredentialFor(flagToken string, anon bool) (credential, error) {
+	if !anon {
+		return resolveCredential(flagToken), nil
+	}
+	if flagToken != "" {
+		return credential{}, usageErrf("--anon and --token are mutually exclusive")
+	}
+	return credential{}, nil
+}
+
 // resolveToken returns just the token from the fixed resolution order.
 func resolveToken(flagToken string) string {
 	return resolveCredential(flagToken).token
 }
 
+// effectiveURL is a best-effort answer to "where will git actually send this
+// URL", after the local git configuration's url.<base>.insteadOf rules.
+// "git ls-remote --get-url" performs that resolution without touching the
+// network.
+//
+// It is advisory only, and deliberately never gates a git invocation. git
+// resolves a `[includeIf "gitdir:..."]` section against the repository it is
+// operating on, so a rule living in such an include is invisible from anywhere
+// that is not that repository — including the workspace root, where a clone
+// starts. A clone still picks the rule up (git creates the gitdir, then
+// fetches), which is exactly the case where predicting the URL up front gets
+// it wrong. So gitty uses this to steer ssh and to say something useful on
+// stderr, and lets git decide where to go.
+//
+// dir should be the repository the command will run in, when there is one.
+// If the probe fails, rawURL is the best available answer.
+func (s *syncer) effectiveURL(ctx context.Context, dir, rawURL string) string {
+	if rawURL == "" {
+		return rawURL
+	}
+	out, err := s.git(ctx, dir, nil, "ls-remote", "--get-url", rawURL)
+	if err != nil {
+		return rawURL
+	}
+	if got := strings.TrimSpace(string(out)); got != "" {
+		return got
+	}
+	return rawURL
+}
+
+// noteForeignHost reports, once per run, that repositories are being cloned or
+// fetched from a host other than the configured instance — and that the token
+// goes there with them.
+//
+// It is a note rather than a refusal. gitty cannot know where git will end up
+// before git runs (see effectiveURL), and the local git config is the
+// authority on that; blocking on a guess breaks the legitimate setups where an
+// instance advertises URLs on an external host that the user's own config
+// rewrites to an internal one. Listing the host with --allow-clone-host says
+// "yes, I know" and silences this.
+func (s *syncer) noteForeignHost(what, rawURL, effective string) {
+	if ok, err := s.cfg.AllowsHost(effective); ok && err == nil {
+		return
+	}
+	s.hintOnce.Do(func() {
+		s.diagf("note: %s %s is not on the configured instance %s; git decides where that really goes (your url.insteadOf rules apply, including ones in conditional includes that are only visible from inside a repository) and any token travels with it",
+			what, redactURL(effective), s.cfg.URL)
+		s.diagf("hint: --verbose shows the URL git actually resolved for each repository; if this host is expected, list it with --allow-clone-host=<host> to silence this note")
+	})
+}
+
+// warnIfURLRewritten notes once, on stderr, that the local git configuration
+// redirects the configured instance somewhere else, so a surprising transport
+// is visible rather than silent.
+func (s *syncer) warnIfURLRewritten(ctx context.Context) {
+	probe := strings.TrimSuffix(s.cfg.URL, "/") + "/"
+	got := s.effectiveURL(ctx, ".", probe)
+	if got == probe {
+		return
+	}
+	s.diagf("note: local git config rewrites %s to %s (url.insteadOf); gitty is following that",
+		probe, redactURL(got))
+}
+
 // authForCheckout prepares a network git command to run inside an existing
-// checkout: it returns the credential environment and the final argv. When
-// credentials would be injected it first verifies the checkout's own origin
-// still points at the configured instance — a user may have re-pointed it
-// since the clone, and the token must never travel to another host. ok=false
-// means the caller must not run the command (an error event was emitted).
+// checkout: it returns the environment and the final argv. Running inside the
+// repository is what lets git apply that repository's own configuration,
+// including `[includeIf "gitdir:..."]` sections. ok=false means the caller must
+// not run the command (an error event was emitted).
 func (s *syncer) authForCheckout(ctx context.Context, path, dir string, args ...string) ([]string, []string, bool) {
 	env := s.credentialEnv()
-	if env == nil {
-		return nil, args, true
-	}
 
-	originOut, err := s.git(ctx, dir, nil, "remote", "get-url", "origin")
+	// Read the checkout's configured origin, unrewritten: it is what git will
+	// rewrite via insteadOf when it contacts the remote.
+	origin, err := s.originOf(ctx, dir)
 	if err != nil {
 		s.event("error", path, "reading origin remote failed")
-		s.diagf("%s: git remote get-url origin: %v", path, err)
+		s.diagf("%s: git config --get remote.origin.url: %v", path, err)
 		return nil, nil, false
 	}
-	origin := strings.TrimSpace(string(originOut))
-	if ok, err := hostsMatch(s.cfg.URL, origin); err != nil || !ok {
-		s.event("error", path, "origin host does not match the configured instance")
-		s.diagf("%s: origin %q does not match instance %q; not sending credentials", path, redactURL(origin), s.cfg.URL)
-		return nil, nil, false
+
+	// Resolve what git will really contact. Inside the checkout this sees the
+	// repository's full configuration, gitdir-conditional includes and all.
+	effective := s.effectiveURL(ctx, dir, origin)
+
+	if env != nil {
+		s.noteForeignHost("origin", origin, effective)
+		args = append([]string{"-c", "credential.helper="}, args...)
 	}
-	return env, append([]string{"-c", "credential.helper="}, args...), true
+	// ssh may still need steering: always in SSH mode, and over HTTP when the
+	// user's git config rewrites this remote to an SSH URL.
+	env = append(env, s.sshEnvFor(effective)...)
+
+	return env, args, true
+}
+
+// sshEnv returns the extra environment that steers ssh for SSH-mode clones,
+// pulls, and fetches. It is empty unless gitty has something to say: over HTTP
+// ssh is not involved at all, and without --accept-new-host-keys gitty leaves
+// ssh's host-key policy exactly as the user configured it.
+func (s *syncer) sshEnv() []string { return s.sshEnvFor("") }
+
+// sshEnvFor is sshEnv for a remote whose effective URL is known. Over HTTP,
+// ssh is normally not involved — but a workspace honouring the local git
+// config may have its HTTP URL rewritten to an SSH one, in which case ssh is
+// in the path after all and still needs steering.
+//
+// A GIT_SSH_COMMAND the user already set is preserved and extended, so a
+// custom ssh binary or existing options keep working.
+func (s *syncer) sshEnvFor(effectiveURL string) []string {
+	if !s.acceptNewHostKeys {
+		return nil
+	}
+	if s.cfg.HTTP && !isSSHURL(effectiveURL) {
+		return nil
+	}
+	base := strings.TrimSpace(os.Getenv("GIT_SSH_COMMAND"))
+	if base == "" {
+		base = "ssh"
+	}
+	return []string{"GIT_SSH_COMMAND=" + base + " -o StrictHostKeyChecking=accept-new"}
+}
+
+// needsHostKeyWarmup reports whether the first repository should be handled on
+// its own before the worker pool starts, given a representative remote URL.
+//
+// Over SSH the first connection to a host whose key is not yet in known_hosts
+// prompts for confirmation, and ssh reads that answer straight from the
+// terminal. If every worker starts at once they all reach that prompt before
+// any of them has recorded the accepted key, so the user is asked once per
+// repository for the same fingerprint — and the concurrent appends to
+// known_hosts can lose each other's writes. Handling one repository first lets
+// that happen exactly once.
+//
+// An HTTP workspace can land on ssh too, when the local git config rewrites
+// its URLs, so the decision follows the effective URL rather than the
+// configured transport. sampleURL is resolved through those rewrites; an empty
+// one means "unknown", which falls back to the configured transport.
+func (s *syncer) needsHostKeyWarmup(ctx context.Context, dir, sampleURL string) bool {
+	if s.dryRun || s.jobs <= 1 {
+		return false
+	}
+	if !s.cfg.HTTP {
+		return true
+	}
+	return isSSHURL(s.effectiveURL(ctx, dir, sampleURL))
+}
+
+// originOf returns a checkout's configured origin URL, unrewritten.
+//
+// "git config --get" is deliberate: "git remote get-url" applies insteadOf
+// itself and would hand back the already-rewritten URL, while callers here
+// want the raw one so they can resolve it themselves and compare the two.
+func (s *syncer) originOf(ctx context.Context, dir string) (string, error) {
+	out, err := s.git(ctx, dir, nil, "config", "--get", "remote.origin.url")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// cloneURL returns the remote URL gitty would hand git for a project, per the
+// workspace's configured transport. The local git config may still rewrite it.
+func (s *syncer) cloneURL(p *gitlab.Project) string {
+	if s.cfg.HTTP {
+		return p.HTTPURLToRepo
+	}
+	return p.SSHURLToRepo
+}
+
+// isSSHURL reports whether a git remote URL uses an SSH transport, in either
+// the ssh:// form or the scp-like [user@]host:path form.
+func isSSHURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.Contains(raw, "://") {
+		return strings.HasPrefix(raw, "ssh://") || strings.HasPrefix(raw, "git+ssh://")
+	}
+	return strings.Contains(raw, ":")
 }
 
 // credentialEnv builds the extra environment for a git invocation that may
@@ -660,22 +919,13 @@ func extractHost(raw string) string {
 	return strings.ToLower(u.Hostname())
 }
 
-// hostsMatch reports whether a clone URL targets the same host as the
-// configured GitLab instance. It returns an error when either host cannot be
-// determined, which callers treat as a mismatch.
-func hostsMatch(configURL, cloneURL string) (bool, error) {
-	ch := extractHost(configURL)
-	rh := extractHost(cloneURL)
-	if ch == "" || rh == "" {
-		return false, fmt.Errorf("could not determine host (config %q, clone %q)", configURL, cloneURL)
-	}
-	return ch == rh, nil
-}
-
 // gitlabClientSource adapts a *gitlab.Client to the gitlabSource interface,
 // handling pagination for each listing.
 type gitlabClientSource struct {
 	client *gitlab.Client
+	// authenticated records whether a token was supplied, which decides
+	// whether a top-level listing can be scoped to the caller's memberships.
+	authenticated bool
 }
 
 func (s gitlabClientSource) Subgroups(target string, nested bool) ([]*gitlab.Group, error) {
@@ -717,6 +967,38 @@ func (s gitlabClientSource) Subgroups(target string, nested bool) ([]*gitlab.Gro
 func (s gitlabClientSource) Group(target string) (*gitlab.Group, error) {
 	g, _, err := s.client.Groups.GetGroup(target, nil)
 	return g, err
+}
+
+// maxTopLevelPages bounds the top-level group listing. An unauthenticated
+// listing on a large instance would otherwise walk every public group on it.
+const maxTopLevelPages = 10
+
+func (s gitlabClientSource) TopLevelGroups() ([]*gitlab.Group, error) {
+	var all []*gitlab.Group
+	topLevel := true
+	opts := &gitlab.ListGroupsOptions{
+		TopLevelOnly: &topLevel,
+		ListOptions:  gitlab.ListOptions{PerPage: 100, Page: 1},
+	}
+	// With credentials, restrict the listing to namespaces the caller is
+	// actually a member of — "my groups" is the useful answer, and an
+	// unrestricted listing returns every group visible on the instance.
+	if s.authenticated {
+		level := gitlab.GuestPermissions
+		opts.MinAccessLevel = &level
+	}
+	for page := 0; page < maxTopLevelPages; page++ {
+		groups, resp, err := s.client.Groups.ListGroups(opts)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, groups...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return all, nil
 }
 
 func (s gitlabClientSource) Projects(target string, nested bool) ([]*gitlab.Project, error) {

@@ -73,6 +73,7 @@ func gittyEnv(extraEnv []string) []string {
 // stderr, and tests assert against the correct stream.
 func runGitty(t *testing.T, dir string, extraEnv []string, args ...string) (string, string, int) {
 	t.Helper()
+	publishFixtures()
 	cmd := exec.Command(gittyBin, args...)
 	cmd.Dir = dir
 	cmd.Env = gittyEnv(extraEnv)
@@ -88,6 +89,14 @@ func runGitty(t *testing.T, dir string, extraEnv []string, args ...string) (stri
 		return stdout.String(), stderr.String(), ee.ExitCode()
 	}
 	return stdout.String(), stderr.String(), 0
+}
+
+// publishFixtures makes every fixture written so far visible to the fake
+// server's handlers. Call it immediately before anything that makes the
+// server serve a request.
+func publishFixtures() {
+	fixtureGate.Lock()
+	fixtureGate.Unlock() //nolint:staticcheck // the edge is the point, not the critical section
 }
 
 // gitRun executes git with a fixed identity for repo fixtures.
@@ -125,10 +134,13 @@ type fakeGitLab struct {
 	gitRoot string
 
 	// requireToken, when non-empty, makes API calls 401 unless the
-	// PRIVATE-TOKEN header matches. pageSize, when > 0, paginates project
-	// listings to exercise the client's pagination loop.
-	requireToken string
-	pageSize     int
+	// PRIVATE-TOKEN header matches. rejectAnyToken instead rejects every
+	// request that carries a token at all, so a test can prove a run really
+	// was anonymous. pageSize, when > 0, paginates project listings to
+	// exercise the client's pagination loop.
+	requireToken   string
+	rejectAnyToken bool
+	pageSize       int
 
 	// gitDelayNs slows every /git/ request so tests can catch a sync mid-git
 	// (SIGINT, concurrency); atomic because tests adjust it while the server
@@ -145,7 +157,14 @@ type fakeGitLab struct {
 	gitAuthUser string
 	gitAuthPass string
 
+	// authUser and authScopes back the /user and
+	// /personal_access_tokens/self endpoints used by init's token check.
+	// authScopes nil means the instance does not support introspection.
+	authUser   string
+	authScopes []string
+
 	groups      map[string]apiGroup
+	topLevel    []apiGroup
 	subgroups   map[string][]apiGroup
 	descendants map[string][]apiGroup
 	projects    map[string][]apiProject
@@ -169,7 +188,19 @@ func newFakeGitLab(t *testing.T) *fakeGitLab {
 	return f
 }
 
+// fixtureGate orders the fixture fields a test sets on its own goroutine
+// against the fake server's handler goroutines. httptest starts serving inside
+// newFakeGitLab, before the test has filled in its groups, projects and auth
+// settings, so without an explicit edge those writes race every handler read.
+// Handlers take the read side — concurrency tests still need to overlap — and
+// launching the binary takes the write side once, which publishes everything
+// the test set up beforehand.
+var fixtureGate sync.RWMutex
+
 func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fixtureGate.RLock()
+	defer fixtureGate.RUnlock()
+
 	if strings.HasPrefix(r.URL.Path, "/git/") {
 		f.gitHits.Add(1)
 		cur := f.gitInflight.Add(1)
@@ -207,6 +238,38 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if f.requireToken != "" && r.Header.Get("PRIVATE-TOKEN") != f.requireToken {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "401 Unauthorized"})
+		return
+	}
+	if f.rejectAnyToken && r.Header.Get("PRIVATE-TOKEN") != "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "401 Unauthorized"})
+		return
+	}
+
+	// Endpoints backing `gitty init`'s token check.
+	if r.URL.Path == "/api/v4/user" {
+		if f.authUser == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "401 Unauthorized"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"username": f.authUser})
+		return
+	}
+	if r.URL.Path == "/api/v4/personal_access_tokens/self" {
+		if f.authScopes == nil {
+			// Stand in for an instance too old to support introspection.
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "404 Not Found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": 1, "name": "test", "scopes": f.authScopes,
+			"active": true, "revoked": false,
+		})
+		return
+	}
+
+	// The top-level group listing that backs `gitty ls /`.
+	if r.URL.Path == "/api/v4/groups" {
+		writeJSON(w, http.StatusOK, orEmptyGroups(f.topLevel))
 		return
 	}
 
@@ -358,6 +421,7 @@ func (f *fakeGitLab) pushUpdate(t *testing.T, work, name, file, content string) 
 // mid-run. The returned buffers fill as the process writes.
 func startGitty(t *testing.T, dir string, extraEnv []string, args ...string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
+	publishFixtures()
 	cmd := exec.Command(gittyBin, args...)
 	cmd.Dir = dir
 	cmd.Env = gittyEnv(extraEnv)
@@ -412,6 +476,296 @@ func TestE2EInitWritesConfig(t *testing.T) {
 	if cfg.URL != "https://gitlab.example.com" || !cfg.HTTP || cfg.RootPath != "" {
 		t.Errorf("unexpected config: %+v", cfg)
 	}
+}
+
+// TestE2EAnonIgnoresAmbientToken is the regression guard for "auth issues when
+// GITLAB_TOKEN is set": --anon means anonymous, so a stale, expired or
+// wrongly-scoped token left in the environment must not be picked up and turn
+// an explicitly anonymous run into a 401.
+func TestE2EAnonIgnoresAmbientToken(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/publicrepo", map[string]string{"p.txt": "p"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(150, "acme/publicrepo")}
+	// The server rejects any token it is sent; anonymous requests are fine.
+	f.rejectAnyToken = true
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws,
+		[]string{"GITLAB_TOKEN=glpat-stale-and-wrong"},
+		"sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("--anon exit = %d, want 0 — the ambient token must be ignored:\n%s\n%s",
+			code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/publicrepo\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+
+	f.mu.Lock()
+	seen := f.lastToken
+	f.mu.Unlock()
+	if seen != "" {
+		t.Errorf("server saw token %q during an --anon run, want none", seen)
+	}
+}
+
+func TestE2EAnonAndTokenConflict(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	ws := initWorkspace(t, f)
+	_, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--token=x")
+	if code != 2 || !strings.Contains(stderr, "mutually exclusive") {
+		t.Errorf("exit = %d, want 2 with a conflict message:\n%s", code, stderr)
+	}
+}
+
+// The token can reach git from the environment, not just from --token.
+func TestE2EHTTPAuthFromEnvToken(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-env-clone-token"
+	f := newFakeGitLab(t)
+	f.gitAuthUser, f.gitAuthPass = "oauth2", token
+	f.requireToken = token
+	f.addRepo(t, "acme/envrepo", map[string]string{"e.txt": "e"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(151, "acme/envrepo")}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token}, "sync", "--path=acme")
+	if code != 0 {
+		t.Fatalf("clone with GITLAB_TOKEN exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	f.mu.Lock()
+	gitAuth := f.lastGitAuth
+	f.mu.Unlock()
+	if gitAuth != "oauth2:"+token {
+		t.Errorf("git server saw auth %q, want oauth2:%s", gitAuth, token)
+	}
+	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
+}
+
+// A token that authenticates the API but cannot clone is the most likely
+// failure now that gitty clones over HTTP(S); the error must say so.
+func TestE2EScopeHintOnCloneAuthFailure(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-api-only"
+	f := newFakeGitLab(t)
+	f.requireToken = token         // the API accepts it
+	f.gitAuthUser = "oauth2"       // but git demands a different secret,
+	f.gitAuthPass = "other-secret" // standing in for a missing repo scope
+	f.addRepo(t, "acme/scoped", map[string]string{"s.txt": "s"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(152, "acme/scoped")}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token}, "sync", "--path=acme")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "error acme/scoped git clone failed") {
+		t.Errorf("missing clone failure event:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "read_repository") {
+		t.Errorf("expected a token-scope hint on stderr:\n%s", stderr)
+	}
+	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
+}
+
+// TestE2EInitVerifiesToken covers the token check `gitty init` runs so that a
+// missing, rejected or under-scoped token is reported up front rather than as
+// a confusing 401 part-way through a sync.
+func TestE2EInitVerifiesToken(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-init-check"
+
+	newServer := func(t *testing.T, scopes []string) *fakeGitLab {
+		f := newFakeGitLab(t)
+		f.requireToken = token
+		f.authUser = "alice"
+		f.authScopes = scopes
+		return f
+	}
+
+	t.Run("no token at all", func(t *testing.T) {
+		f := newFakeGitLab(t)
+		ws := t.TempDir()
+		stdout, stderr, code := runGitty(t, ws, nil, "init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0 (the check is advisory):\n%s\n%s", code, stdout, stderr)
+		}
+		for _, want := range []string{"No GitLab token found", "export GITLAB_TOKEN=", "--anon"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("stderr missing %q:\n%s", want, stderr)
+			}
+		}
+	})
+
+	t.Run("rejected token", func(t *testing.T) {
+		f := newServer(t, []string{"api"})
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=wrong-token"},
+			"init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0", code)
+		}
+		if !strings.Contains(stderr, "REJECTED") {
+			t.Errorf("stderr should report the rejection:\n%s", stderr)
+		}
+	})
+
+	t.Run("api-only token warns about cloning", func(t *testing.T) {
+		f := newServer(t, []string{"read_api"})
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0:\n%s", code, stderr)
+		}
+		for _, want := range []string{"@alice", "Scopes: read_api", "WARNING", "read_repository"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("stderr missing %q:\n%s", want, stderr)
+			}
+		}
+	})
+
+	t.Run("sufficient token is reported clean", func(t *testing.T) {
+		f := newServer(t, []string{"read_api", "read_repository"})
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0:\n%s", code, stderr)
+		}
+		if !strings.Contains(stderr, "@alice") {
+			t.Errorf("stderr should name the authenticated user:\n%s", stderr)
+		}
+		if strings.Contains(stderr, "WARNING") {
+			t.Errorf("a sufficient token should raise no warning:\n%s", stderr)
+		}
+	})
+
+	t.Run("instance without introspection says scopes are unknown", func(t *testing.T) {
+		f := newServer(t, nil) // /personal_access_tokens/self returns 404
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0:\n%s", code, stderr)
+		}
+		if !strings.Contains(stderr, "did not report the token's scopes") {
+			t.Errorf("stderr should say scopes are unknown:\n%s", stderr)
+		}
+	})
+
+	t.Run("--verify=false skips the check entirely", func(t *testing.T) {
+		f := newServer(t, []string{"read_api"})
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url="+f.srv.URL, "--verify=false")
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0:\n%s", code, stderr)
+		}
+		if strings.Contains(stderr, "Scopes:") || strings.Contains(stderr, "No GitLab token") {
+			t.Errorf("--verify=false should not run the check:\n%s", stderr)
+		}
+	})
+
+	t.Run("an unreachable instance does not fail init", func(t *testing.T) {
+		ws := t.TempDir()
+		stdout, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url=http://127.0.0.1:1") // nothing listening
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0 — an offline init must still work:\n%s\n%s",
+				code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "Initialized gitty root") {
+			t.Errorf("the workspace should still be created:\n%s", stdout)
+		}
+		if strings.Contains(stderr, "REJECTED") {
+			t.Errorf("an unreachable instance must not be reported as a bad token:\n%s", stderr)
+		}
+	})
+}
+
+func TestE2EInitTransportDefaults(t *testing.T) {
+	skipIfShort(t)
+
+	parse := func(t *testing.T, ws string) Config {
+		t.Helper()
+		var cfg Config
+		if err := toml.Unmarshal([]byte(readFileT(t, filepath.Join(ws, ConfigDir, ConfigName))), &cfg); err != nil {
+			t.Fatalf("parsing config: %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("defaults to http", func(t *testing.T) {
+		ws := t.TempDir()
+		stdout, stderr, code := runGitty(t, ws, nil, "init")
+		if code != 0 {
+			t.Fatalf("init exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		if !parse(t, ws).HTTP {
+			t.Error("plain 'gitty init' should select HTTP")
+		}
+		if !strings.Contains(stdout, "HTTP") {
+			t.Errorf("init should report the transport it chose:\n%s", stdout)
+		}
+	})
+
+	t.Run("--ssh opts out", func(t *testing.T) {
+		ws := t.TempDir()
+		stdout, stderr, code := runGitty(t, ws, nil, "init", "--ssh")
+		if code != 0 {
+			t.Fatalf("init --ssh exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		if parse(t, ws).HTTP {
+			t.Error("--ssh should select SSH")
+		}
+		if !strings.Contains(stdout, "SSH") {
+			t.Errorf("init should report the transport it chose:\n%s", stdout)
+		}
+	})
+
+	t.Run("--http still works for existing scripts", func(t *testing.T) {
+		ws := t.TempDir()
+		if _, stderr, code := runGitty(t, ws, nil, "init", "--http"); code != 0 {
+			t.Fatalf("init --http exit = %d:\n%s", code, stderr)
+		}
+		if !parse(t, ws).HTTP {
+			t.Error("--http should select HTTP")
+		}
+	})
+
+	t.Run("--http and --ssh conflict", func(t *testing.T) {
+		_, stderr, code := runGitty(t, t.TempDir(), nil, "init", "--http", "--ssh")
+		if code != 2 || !strings.Contains(stderr, "mutually exclusive") {
+			t.Errorf("exit = %d, want 2 with a conflict message:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("an existing SSH workspace keeps its transport", func(t *testing.T) {
+		// Flipping gitty's default must never re-point a workspace that was
+		// already initialized: the stored config wins.
+		ws := t.TempDir()
+		if _, stderr, code := runGitty(t, ws, nil, "init", "--ssh"); code != 0 {
+			t.Fatalf("init --ssh failed:\n%s", stderr)
+		}
+		if parse(t, ws).HTTP {
+			t.Fatal("setup: expected an SSH workspace")
+		}
+		// Re-reading it (any later command) must still see SSH.
+		if cfg := parse(t, ws); cfg.HTTP {
+			t.Error("an existing SSH workspace must stay SSH")
+		}
+	})
 }
 
 func TestE2EInitRefusesClobber(t *testing.T) {
@@ -896,6 +1250,118 @@ func TestE2EStatusReportsNoUpstream(t *testing.T) {
 	}
 }
 
+// TestE2ELsShellSemantics covers ls behaving like ls(1): a positional argument
+// instead of a required flag, flags on either side of it, "." and "/" and ".."
+// resolved against the workspace's current context, and a bare `ls` that needs
+// no argument at all.
+func TestE2ELsShellSemantics(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.groups["acme/team"] = apiGroup{ID: 2, FullPath: "acme/team"}
+	f.descendants["acme"] = []apiGroup{f.groups["acme/team"]}
+	f.subgroups["acme"] = []apiGroup{f.groups["acme/team"]}
+	f.projects["acme"] = []apiProject{f.project(160, "acme/alpha")}
+	f.projects["acme/team"] = []apiProject{f.project(161, "acme/team/beta")}
+	f.topLevel = []apiGroup{{ID: 1, FullPath: "acme"}, {ID: 9, FullPath: "other"}}
+
+	ws := initWorkspace(t, f)
+
+	t.Run("positional argument", func(t *testing.T) {
+		stdout, stderr, code := runGitty(t, ws, nil, "ls", "acme", "--anon")
+		if code != 0 {
+			t.Fatalf("exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "project acme/alpha new") {
+			t.Errorf("missing project line:\n%s", stdout)
+		}
+	})
+
+	t.Run("flags after the positional argument", func(t *testing.T) {
+		// The flag package stops at the first non-flag argument, so this only
+		// works because gitty permutes the arguments itself.
+		stdout, stderr, code := runGitty(t, ws, nil, "ls", "acme", "--nested", "--anon")
+		if code != 0 {
+			t.Fatalf("exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "project acme/team/beta new") {
+			t.Errorf("--nested after the argument was not honored:\n%s", stdout)
+		}
+	})
+
+	t.Run("bare ls at the workspace root lists top-level groups", func(t *testing.T) {
+		stdout, stderr, code := runGitty(t, ws, nil, "ls", "--anon")
+		if code != 0 {
+			t.Fatalf("exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		for _, want := range []string{"group acme ", "group other "} {
+			if !strings.Contains(stdout, want) {
+				t.Errorf("missing %q:\n%s", want, stdout)
+			}
+		}
+	})
+
+	t.Run("slash is the instance root", func(t *testing.T) {
+		stdout, _, code := runGitty(t, ws, nil, "ls", "/", "--anon")
+		if code != 0 || !strings.Contains(stdout, "group other ") {
+			t.Errorf("exit = %d, ls / should list top-level groups:\n%s", code, stdout)
+		}
+	})
+
+	t.Run("dot and relative paths from a managed subgroup", func(t *testing.T) {
+		// Build the managed directory tree so there is a subgroup to run in.
+		if _, stderr, code := runGitty(t, ws, nil, "sync", "--groups", "--nested", "--path=acme", "--anon"); code != 0 {
+			t.Fatalf("groups sync failed:\n%s", stderr)
+		}
+		sub := filepath.Join(ws, "acme", "team")
+
+		// A bare ls there lists that subgroup, with no --path anywhere.
+		stdout, _, code := runGitty(t, sub, nil, "ls", "--anon")
+		if code != 0 || !strings.Contains(stdout, "project acme/team/beta new") {
+			t.Errorf("bare ls in a subgroup: exit = %d:\n%s", code, stdout)
+		}
+
+		// "." is the same thing.
+		dotOut, _, code := runGitty(t, sub, nil, "ls", ".", "--anon")
+		if code != 0 || dotOut != stdout {
+			t.Errorf("'ls .' should match a bare ls:\n%s\nvs\n%s", dotOut, stdout)
+		}
+
+		// ".." walks up to the parent group.
+		upOut, _, code := runGitty(t, sub, nil, "ls", "..", "--anon")
+		if code != 0 || !strings.Contains(upOut, "group acme projects=") {
+			t.Errorf("'ls ..' should list the parent group: exit = %d:\n%s", code, upOut)
+		}
+
+		// An absolute path ignores the current context entirely.
+		absOut, _, code := runGitty(t, sub, nil, "ls", "/acme", "--anon")
+		if code != 0 || !strings.Contains(absOut, "project acme/alpha new") {
+			t.Errorf("'ls /acme' should resolve from the instance root:\n%s", absOut)
+		}
+	})
+
+	t.Run("argument and --path together conflict", func(t *testing.T) {
+		_, stderr, code := runGitty(t, ws, nil, "ls", "acme", "--path=acme", "--anon")
+		if code != 2 || !strings.Contains(stderr, "not both") {
+			t.Errorf("exit = %d, want 2 with a conflict message:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("piped output is greppable and uncolored", func(t *testing.T) {
+		// runGitty captures through a pipe, so auto-detection must pick the
+		// event format with no ANSI escapes.
+		stdout, _, code := runGitty(t, ws, nil, "ls", "acme", "--anon")
+		if code != 0 {
+			t.Fatalf("exit = %d", code)
+		}
+		if strings.Contains(stdout, "\x1b[") {
+			t.Errorf("piped ls must not emit ANSI escapes:\n%q", stdout)
+		}
+		assertGreppableStdout(t, stdout)
+	})
+}
+
 func TestE2ELs(t *testing.T) {
 	skipIfShort(t)
 
@@ -949,7 +1415,12 @@ func TestE2ELs(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("ls --format=tree exit = %d:\n%s", code, stdout)
 	}
-	for _, want := range []string{"acme (1 project)\n", "  = alpha\n", "  team (1 project)\n", "    = beta\n"} {
+	for _, want := range []string{
+		"acme/ (1 project)",
+		"├── team/ (1 project)",
+		"│   └── beta  present",
+		"└── alpha  present",
+	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("tree output missing %q:\n%s", want, stdout)
 		}
@@ -988,7 +1459,7 @@ func TestE2EVerbose(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("verbose sync exit = %d:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, "exec git clone") {
+	if !strings.Contains(stderr, "exec git ") || !strings.Contains(stderr, " clone ") {
 		t.Errorf("verbose exec line missing from stderr:\n%s", stderr)
 	}
 	if strings.Contains(stdout, "exec git") {
@@ -1057,28 +1528,39 @@ func TestE2EUnknownGroupFailsNonZero(t *testing.T) {
 	}
 }
 
-func TestE2EForeignCloneHostRejected(t *testing.T) {
+func TestE2EForeignCloneHostIsNoted(t *testing.T) {
 	skipIfShort(t)
 
 	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/elsewhere", map[string]string{"e.txt": "e"})
 	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	// The same server under another name: the clone can really succeed, so the
+	// test proves gitty does not stand in the way of it.
+	gitHost := strings.Replace(f.srv.URL, "127.0.0.1", "localhost", 1)
 	f.projects["acme"] = []apiProject{{
 		ID:                60,
-		PathWithNamespace: "acme/hijack",
-		HTTPURLToRepo:     "http://evil.invalid/hijack.git",
-		SSHURLToRepo:      "git@evil.invalid:hijack.git",
+		PathWithNamespace: "acme/elsewhere",
+		HTTPURLToRepo:     gitHost + "/git/acme/elsewhere.git",
+		SSHURLToRepo:      "git@example.invalid:acme/elsewhere.git",
 	}}
 
 	ws := initWorkspace(t, f)
 	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
-	if code != 1 {
-		t.Errorf("foreign-host sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0 (an unexpected host is a note):\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "error acme/hijack clone URL host does not match") {
-		t.Errorf("expected host-mismatch error event on stdout:\n%s", stdout)
+	if !strings.Contains(stdout, "clone acme/elsewhere\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
 	}
-	if _, err := os.Stat(filepath.Join(ws, "acme", "hijack")); !os.IsNotExist(err) {
-		t.Error("foreign-host project must not be cloned")
+	if got := readFileT(t, filepath.Join(ws, "acme", "elsewhere", "e.txt")); got != "e" {
+		t.Errorf("cloned file = %q, want e", got)
+	}
+	// The note belongs on stderr, never in the event stream.
+	if !strings.Contains(stderr, "localhost") || !strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("expected a note naming the host and how to silence it:\n%s", stderr)
+	}
+	if strings.Contains(stdout, "note:") || strings.Contains(stdout, "hint:") {
+		t.Errorf("diagnostics leaked into the event stream:\n%s", stdout)
 	}
 }
 
@@ -1464,11 +1946,255 @@ func TestE2EDivergedCheckoutFailsPull(t *testing.T) {
 	if !strings.Contains(stdout, "error acme/portal git pull failed") {
 		t.Errorf("expected pull failure event on stdout:\n%s", stdout)
 	}
-	if !strings.Contains(stderr, "--- git pull --ff-only for acme/portal failed") {
+	if !strings.Contains(stderr, "pull --ff-only for acme/portal failed") {
 		t.Errorf("expected attributed git output block on stderr:\n%s", stderr)
 	}
 	// The local commit must survive: --ff-only never merges or overwrites.
 	if got := readFileT(t, filepath.Join(local, "README.md")); got != "v2-local" {
 		t.Errorf("local README = %q, want v2-local preserved", got)
+	}
+}
+
+// TestE2EInsteadOfRewritesAreFollowed is the regression guard for gitty
+// honouring the local git configuration. Instances often advertise clone URLs
+// on a canonical host the client cannot reach, and the user bridges that with
+// a url.<base>.insteadOf rule. gitty adds no override of its own, so git
+// applies that rule for clones and pulls exactly as it would for a git clone
+// typed by hand — and the rewritten destination is accepted without any flag,
+// because it came from the user's own machine rather than from the API.
+func TestE2EInsteadOfRewritesAreFollowed(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	work := f.addRepo(t, "acme/rewritten", map[string]string{"r.txt": "r"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	// The API advertises a canonical host that does not resolve; only the
+	// user's rewrite makes it reachable, so a successful clone proves the
+	// rewrite was applied.
+	const canonical = "https://gitlab.canonical.invalid"
+	f.projects["acme"] = []apiProject{{
+		ID:                150,
+		PathWithNamespace: "acme/rewritten",
+		HTTPURLToRepo:     canonical + "/git/acme/rewritten.git",
+		SSHURLToRepo:      "git@gitlab.canonical.invalid:acme/rewritten.git",
+	}}
+
+	home := t.TempDir()
+	gitconfig := "[url \"" + f.srv.URL + "/\"]\n\tinsteadOf = " + canonical + "/\n"
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(gitconfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "XDG_CONFIG_HOME="}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0 (the rewrite must be honoured):\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/rewritten\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "rewritten", "r.txt")); got != "r" {
+		t.Errorf("cloned file = %q, want r", got)
+	}
+
+	// The pull path honours the rewrite too: git stores the unrewritten URL
+	// as origin, so a re-sync has to resolve it the same way.
+	f.pushUpdate(t, work, "acme/rewritten", "r.txt", "r2")
+	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("re-sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "pull acme/rewritten\n") {
+		t.Errorf("missing pull event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "rewritten", "r.txt")); got != "r2" {
+		t.Errorf("pulled file = %q, want r2", got)
+	}
+
+	// Without the rewrite the canonical host is simply unreachable, so the
+	// same workspace fails inside git. That is what makes the clones above
+	// meaningful: they were the user's git config talking, not gitty quietly
+	// substituting a URL of its own.
+	ws2 := t.TempDir()
+	if _, _, code := runGitty(t, ws2, nil, "init", "--url="+f.srv.URL, "--verify=false"); code != 0 {
+		t.Fatalf("init exit = %d", code)
+	}
+	stdout, stderr, code = runGitty(t, ws2, nil, "sync", "--path=acme", "--anon")
+	if code != 1 || !strings.Contains(stdout, "error acme/rewritten git clone failed\n") {
+		t.Errorf("the unrewritten canonical host should fail in git (exit %d):\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "gitlab.canonical.invalid") {
+		t.Errorf("expected a note naming the unexpected host:\n%s", stderr)
+	}
+}
+
+// TestE2EAllowCloneHost covers the split deployment: the API lives on one host
+// and advertises clone URLs on another, with no git-config rewrite involved.
+// gitty refuses that by default — the check is what stops a hostile API
+// response redirecting a clone — and the user names the extra host to opt in.
+func TestE2EAllowCloneHost(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/split", map[string]string{"s.txt": "s"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+
+	// The same test server reached under a different name, so the clone really
+	// succeeds either way — the flag changes the reporting, not the outcome.
+	gitHost := strings.Replace(f.srv.URL, "127.0.0.1", "localhost", 1)
+	f.projects["acme"] = []apiProject{{
+		ID:                160,
+		PathWithNamespace: "acme/split",
+		HTTPURLToRepo:     gitHost + "/git/acme/split.git",
+		SSHURLToRepo:      "git@example.invalid:acme/split.git",
+	}}
+
+	ws := initWorkspace(t, f)
+
+	// Unlisted: cloned, and noted on stderr.
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/split\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "split", "s.txt")); got != "s" {
+		t.Errorf("cloned file = %q, want s", got)
+	}
+	if !strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("expected a note about the unexpected host:\n%s", stderr)
+	}
+
+	// An allow list that does not cover the host still notes it.
+	ws2 := t.TempDir()
+	if _, _, code := runGitty(t, ws2, nil, "init", "--url="+f.srv.URL, "--allow-clone-host=elsewhere.invalid", "--verify=false"); code != 0 {
+		t.Fatalf("init --allow-clone-host exit = %d", code)
+	}
+	if _, stderr, _ := runGitty(t, ws2, nil, "sync", "--path=acme", "--anon"); !strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("an unrelated allowed host should not silence the note:\n%s", stderr)
+	}
+
+	// Listing the right host does silence it.
+	ws3 := t.TempDir()
+	if _, _, code := runGitty(t, ws3, nil, "init", "--url="+f.srv.URL, "--allow-clone-host=localhost", "--verify=false"); code != 0 {
+		t.Fatalf("init --allow-clone-host exit = %d", code)
+	}
+	stdout, stderr, code = runGitty(t, ws3, nil, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync from an allowing workspace exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/split\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("listing the host should silence the note:\n%s", stderr)
+	}
+
+	// Subgroup workspaces inherit the setting, so syncing from inside one
+	// behaves like syncing from the root.
+	f.subgroups["acme"] = []apiGroup{{ID: 2, FullPath: "acme/team"}}
+	f.groups["acme/team"] = apiGroup{ID: 2, FullPath: "acme/team"}
+	f.projects["acme/team"] = []apiProject{{
+		ID:                161,
+		PathWithNamespace: "acme/team/nested",
+		HTTPURLToRepo:     gitHost + "/git/acme/team/nested.git",
+	}}
+	f.addRepo(t, "acme/team/nested", map[string]string{"n.txt": "n"})
+
+	if _, _, code := runGitty(t, ws3, nil, "sync", "--path=acme", "--groups", "--anon"); code != 0 {
+		t.Fatalf("group sync exit = %d", code)
+	}
+	stdout, stderr, code = runGitty(t, filepath.Join(ws3, "acme", "team"), nil, "sync", "--anon")
+	if code != 0 {
+		t.Fatalf("sync from the subgroup exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/team/nested\n") {
+		t.Errorf("subgroup sync did not clone:\n%s\n%s", stdout, stderr)
+	}
+	if strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("subgroup workspace did not inherit clone_hosts:\n%s", stderr)
+	}
+}
+
+// TestE2EIncludeIfRewriteIsHonoured is the regression guard for gitty getting
+// between git and a conditionally-included config.
+//
+// git evaluates an `[includeIf "gitdir:..."]` section against the repository it
+// is working on, so a url.<base>.insteadOf rule inside one is invisible from
+// anywhere that is not that repository — including the workspace root, where a
+// clone is launched from. A clone still picks the rule up, because git creates
+// the gitdir and only then fetches. Any attempt by gitty to predict the final
+// URL from the workspace root therefore gets it wrong, which is why the
+// clone-URL host check reports rather than refuses.
+func TestE2EIncludeIfRewriteIsHonoured(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	work := f.addRepo(t, "acme/internal", map[string]string{"i.txt": "i"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	// The API advertises the external endpoint, which does not resolve.
+	const external = "https://gitlab.external.invalid"
+	f.projects["acme"] = []apiProject{{
+		ID:                170,
+		PathWithNamespace: "acme/internal",
+		HTTPURLToRepo:     external + "/git/acme/internal.git",
+		SSHURLToRepo:      "git@gitlab.external.invalid:acme/internal.git",
+	}}
+
+	ws := t.TempDir()
+
+	// The rewrite lives in a second file, pulled in by a gitdir condition
+	// scoped to the workspace — the shape gitty could not see.
+	home := t.TempDir()
+	inner := filepath.Join(home, "internal.gitconfig")
+	if err := os.WriteFile(inner,
+		[]byte("[url \""+f.srv.URL+"/\"]\n\tinsteadOf = "+external+"/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"),
+		[]byte("[includeIf \"gitdir:"+ws+"/\"]\n\tpath = "+inner+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "XDG_CONFIG_HOME="}
+
+	if _, _, code := runGitty(t, ws, env, "init", "--url="+f.srv.URL, "--verify=false"); code != 0 {
+		t.Fatalf("init exit = %d", code)
+	}
+
+	stdout, stderr, code := runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0 (the included rewrite must be honoured):\n%s\n%s",
+			code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/internal\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "internal", "i.txt")); got != "i" {
+		t.Errorf("cloned file = %q, want i", got)
+	}
+
+	// And the pull path, which runs inside the checkout where the condition
+	// matches directly.
+	f.pushUpdate(t, work, "acme/internal", "i.txt", "i2")
+	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("re-sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "pull acme/internal\n") {
+		t.Errorf("missing pull event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "internal", "i.txt")); got != "i2" {
+		t.Errorf("pulled file = %q, want i2", got)
+	}
+
+	// status --fetch runs inside the checkouts too, so it must work as well.
+	stdout, stderr, code = runGitty(t, ws, env, "status", "--fetch", "--anon")
+	if code != 0 {
+		t.Fatalf("status --fetch exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "status acme/internal branch=") {
+		t.Errorf("missing status event:\n%s", stdout)
 	}
 }

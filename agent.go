@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "1.3.0"
+const AgentSchemaVersion = "3.0.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -81,15 +81,33 @@ func buildAgentSchema() AgentSchema {
 							Description: "Base URL of the GitLab instance. Change this for self-hosted GitLab.",
 							Default:     "https://gitlab.com",
 						},
+						"ssh": {
+							Type:        "boolean",
+							Description: "Clone over SSH (git@...) using local SSH keys, instead of the default HTTP(S). Prefer the default for unattended runs: the token gitty already needs for the API authenticates the clones too, so no SSH key is required.",
+							Default:     false,
+						},
 						"http": {
 							Type:        "boolean",
-							Description: "Use HTTP(S) cloning (https://...) instead of the default SSH (git@...). Recommended for CI runners.",
-							Default:     false,
+							Description: "Clone over HTTP(S). This is the default; the flag is accepted for compatibility and is mutually exclusive with ssh.",
+							Default:     true,
 						},
 						"force": {
 							Type:        "boolean",
 							Description: "Overwrite an existing .gitty/config. Without this, init refuses to clobber an initialized workspace.",
 							Default:     false,
+						},
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token to verify. Falls back to GITLAB_TOKEN or CI_JOB_TOKEN. Used only for the verification check; it is never stored in the workspace.",
+						},
+						"verify": {
+							Type:        "boolean",
+							Description: "Check the token against the instance and report the authenticated user, the token's scopes, and any scope this workspace needs but the token lacks (notably read_repository for HTTP cloning). Advisory only: it never fails init. Set false for offline setup.",
+							Default:     true,
+						},
+						"allow-clone-host": {
+							Type:        "string",
+							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
 						},
 					},
 				},
@@ -133,6 +151,11 @@ func buildAgentSchema() AgentSchema {
 							Description: "Number of concurrent repo clone/pull operations (1-16).",
 							Default:     4,
 						},
+						"accept-new-host-keys": {
+							Type:        "boolean",
+							Description: "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed host key is still refused. Set this for unattended runs, where an interactive host-key prompt would otherwise hang the job.",
+							Default:     false,
+						},
 						"groups": {
 							Type:        "boolean",
 							Description: "Fetch groups/subgroups and create their directory structure locally (with per-directory configs).",
@@ -152,6 +175,10 @@ func buildAgentSchema() AgentSchema {
 							Type:        "boolean",
 							Description: "Print what would happen without creating directories or executing git commands.",
 							Default:     false,
+						},
+						"allow-clone-host": {
+							Type:        "string",
+							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
 						},
 					},
 					Required: []string{"path"},
@@ -187,10 +214,19 @@ func buildAgentSchema() AgentSchema {
 							Description: "Number of concurrent repositories to inspect (1-16).",
 							Default:     4,
 						},
+						"accept-new-host-keys": {
+							Type:        "boolean",
+							Description: "With fetch over SSH, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new).",
+							Default:     false,
+						},
 						"verbose": {
 							Type:        "boolean",
 							Description: "Print each git invocation and its output to stderr, with URLs redacted.",
 							Default:     false,
+						},
+						"allow-clone-host": {
+							Type:        "string",
+							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
 						},
 					},
 				},
@@ -208,7 +244,7 @@ func buildAgentSchema() AgentSchema {
 					Properties: map[string]SchemaProp{
 						"path": {
 							Type:        "string",
-							Description: "GitLab group or subgroup path to list (e.g., 'tenant/images'). Required unless run from a managed subgroup directory that already has its own config.",
+							Description: "Group to list, resolved like a shell path against the workspace directory the command runs in: omitted or '.' means the current context (the instance's top-level groups at the workspace root), '/' always means the instance's top-level groups, '..' the parent group, and a leading '/' makes it absolute. Passed as a positional argument (--path is also accepted, but not both).",
 						},
 						"token": {
 							Type:        "string",
@@ -226,16 +262,20 @@ func buildAgentSchema() AgentSchema {
 						},
 						"format": {
 							Type:        "string",
-							Description: "Output format: 'text' for greppable 'group'/'project' event lines, 'tree' for an indented namespace tree, or 'json' for a structured document. Prefer json when consuming programmatically.",
-							Default:     "text",
+							Description: "Output format: 'auto' (an indented tree on a terminal, greppable event lines when piped), 'tree', 'text', or 'json'. Always pass 'json' explicitly when consuming this programmatically rather than relying on auto-detection.",
+							Default:     "auto",
+						},
+						"color": {
+							Type:        "string",
+							Description: "Colorize the tree: 'auto' (only on a terminal), 'always', or 'never'. NO_COLOR is honoured. Irrelevant for the text and json formats.",
+							Default:     "auto",
 						},
 					},
-					Required: []string{"path"},
 				},
 				Invocation: Invocation{
 					Command:   "gitty",
 					BaseArgs:  []string{"ls"},
-					FlagStyle: "--<name>=<value> for strings, --<name> for booleans",
+					FlagStyle: "the 'path' argument is positional (gitty ls <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it",
 				},
 			},
 			{

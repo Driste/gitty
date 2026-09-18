@@ -144,31 +144,77 @@ func TestExtractHost(t *testing.T) {
 	}
 }
 
-func TestHostsMatch(t *testing.T) {
+func TestConfigAllowsHost(t *testing.T) {
 	tests := []struct {
-		name      string
-		configURL string
-		cloneURL  string
-		want      bool
-		wantErr   bool
+		name       string
+		configURL  string
+		cloneHosts []string
+		remoteURL  string
+		want       bool
+		wantErr    bool
 	}{
-		{name: "matching https", configURL: "https://gitlab.com", cloneURL: "https://gitlab.com/acme/repo.git", want: true},
-		{name: "matching ssh", configURL: "https://gitlab.com", cloneURL: "git@gitlab.com:acme/repo.git", want: true},
-		{name: "mismatched host is rejected", configURL: "https://gitlab.com", cloneURL: "https://evil.example.com/acme/repo.git", want: false},
-		{name: "unparseable clone host errors", configURL: "https://gitlab.com", cloneURL: "", want: false, wantErr: true},
+		{name: "matching https", configURL: "https://gitlab.com", remoteURL: "https://gitlab.com/acme/repo.git", want: true},
+		{name: "matching ssh", configURL: "https://gitlab.com", remoteURL: "git@gitlab.com:acme/repo.git", want: true},
+		{name: "mismatched host is rejected", configURL: "https://gitlab.com", remoteURL: "https://evil.example.com/acme/repo.git", want: false},
+		{name: "unparseable clone host errors", configURL: "https://gitlab.com", remoteURL: "", want: false, wantErr: true},
+		{
+			name:       "allowed clone host is accepted",
+			configURL:  "https://gitlab.example.com",
+			cloneHosts: []string{"git.internal"},
+			remoteURL:  "https://git.internal/acme/repo.git",
+			want:       true,
+		},
+		{
+			name:       "allowed clone host may be given as a URL",
+			configURL:  "https://gitlab.example.com",
+			cloneHosts: []string{"https://git.internal/"},
+			remoteURL:  "git@git.internal:acme/repo.git",
+			want:       true,
+		},
+		{
+			name:       "a host outside the allow list is still rejected",
+			configURL:  "https://gitlab.example.com",
+			cloneHosts: []string{"git.internal"},
+			remoteURL:  "https://evil.example.com/acme/repo.git",
+			want:       false,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := hostsMatch(tc.configURL, tc.cloneURL)
+			cfg := &Config{URL: tc.configURL, CloneHosts: tc.cloneHosts}
+			got, err := cfg.AllowsHost(tc.remoteURL)
 			if tc.wantErr && err == nil {
-				t.Errorf("hostsMatch(%q, %q) expected an error, got nil", tc.configURL, tc.cloneURL)
+				t.Errorf("AllowsHost(%q) expected an error, got nil", tc.remoteURL)
 			}
 			if !tc.wantErr && err != nil {
-				t.Errorf("hostsMatch(%q, %q) unexpected error: %v", tc.configURL, tc.cloneURL, err)
+				t.Errorf("AllowsHost(%q) unexpected error: %v", tc.remoteURL, err)
 			}
 			if got != tc.want {
-				t.Errorf("hostsMatch(%q, %q) = %v, want %v", tc.configURL, tc.cloneURL, got, tc.want)
+				t.Errorf("AllowsHost(%q) = %v, want %v", tc.remoteURL, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsSSHURL(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want bool
+	}{
+		{raw: "https://gitlab.com/acme/repo.git", want: false},
+		{raw: "http://gitlab.com/acme/repo.git", want: false},
+		{raw: "https://gitlab.example.com:8443/acme/repo.git", want: false},
+		{raw: "ssh://git@gitlab.com/acme/repo.git", want: true},
+		{raw: "git@gitlab.com:acme/repo.git", want: true},
+		{raw: "gitlab.com:acme/repo.git", want: true},
+		{raw: "", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.raw, func(t *testing.T) {
+			if got := isSSHURL(tc.raw); got != tc.want {
+				t.Errorf("isSSHURL(%q) = %v, want %v", tc.raw, got, tc.want)
 			}
 		})
 	}
@@ -181,9 +227,18 @@ func TestHostsMatch(t *testing.T) {
 type fakeSource struct {
 	subgroups map[string][]*gitlab.Group
 	groups    map[string]*gitlab.Group
+	topLevel  []*gitlab.Group
 	projects  map[string][]*gitlab.Project
 	subErr    error
 	projErr   error
+	topErr    error
+}
+
+func (f fakeSource) TopLevelGroups() ([]*gitlab.Group, error) {
+	if f.topErr != nil {
+		return nil, f.topErr
+	}
+	return f.topLevel, nil
 }
 
 func (f fakeSource) Subgroups(target string, nested bool) ([]*gitlab.Group, error) {
@@ -217,6 +272,15 @@ type recordingGit struct {
 }
 
 func (r *recordingGit) run(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
+	// "ls-remote --get-url" is the read-only probe that resolves the local git
+	// config's insteadOf rewrites; it runs no network operation and is not a
+	// git action, so it is answered (unchanged, i.e. no rewrite configured)
+	// without being recorded. Tests that care about rewrites use
+	// configAwareGit instead.
+	if len(args) == 3 && args[0] == "ls-remote" && args[1] == "--get-url" {
+		return []byte(args[2] + "\n"), nil
+	}
+
 	r.mu.Lock()
 	r.calls = append(r.calls, append([]string{dir}, args...))
 	r.envs = append(r.envs, extraEnv)
@@ -240,6 +304,30 @@ func (r *recordingGit) lastEnv() []string {
 		return nil
 	}
 	return r.envs[len(r.envs)-1]
+}
+
+// gitSubArgs strips a recorded invocation down to the git subcommand and its
+// arguments: element 0 is the working directory, and gitty may prepend any
+// number of "-c key=value" option pairs (the credential-helper reset). Tests
+// assert on the subcommand, not on option ordering.
+func gitSubArgs(call []string) []string {
+	args := call[1:]
+	for len(args) >= 2 && args[0] == "-c" {
+		args = args[2:]
+	}
+	return args
+}
+
+// findCall returns the first recorded invocation whose subcommand matches.
+func (r *recordingGit) findCall(subcommand string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.calls {
+		if sub := gitSubArgs(c); len(sub) > 0 && sub[0] == subcommand {
+			return c
+		}
+	}
+	return nil
 }
 
 // newTestSyncer builds a syncer over the given fakes with buffered streams.
@@ -300,10 +388,9 @@ func TestSyncReposClonesNewProjects(t *testing.T) {
 	if rec.callCount() != 1 {
 		t.Fatalf("expected 1 git call, got %d: %v", rec.callCount(), rec.calls)
 	}
-	got := rec.calls[0]
-	// dir, "clone", url, dest
-	if got[1] != "clone" || got[2] != "https://gitlab.com/acme/repo.git" || got[3] != "acme/repo" {
-		t.Errorf("unexpected clone invocation: %v", got)
+	got := gitSubArgs(rec.calls[0])
+	if len(got) != 3 || got[0] != "clone" || got[1] != "https://gitlab.com/acme/repo.git" || got[2] != "acme/repo" {
+		t.Errorf("unexpected clone invocation: %v", rec.calls[0])
 	}
 	assertEventLines(t, stdout)
 }
@@ -342,12 +429,14 @@ func TestSyncReposPullsExistingProjects(t *testing.T) {
 	if !strings.Contains(stdout.String(), "pull acme/repo\n") {
 		t.Errorf("missing pull event:\n%s", stdout.String())
 	}
-	if rec.callCount() != 1 {
-		t.Fatalf("expected 1 git call, got %d: %v", rec.callCount(), rec.calls)
+	// The pull is preceded by a local "config --get remote.origin.url" read,
+	// which supplies both the credential host check and the insteadOf pin.
+	pull := rec.findCall("pull")
+	if pull == nil {
+		t.Fatalf("no pull invocation recorded: %v", rec.calls)
 	}
-	got := rec.calls[0]
-	if got[1] != "pull" || got[2] != "--ff-only" {
-		t.Errorf("expected 'git pull --ff-only', got: %v", got)
+	if got := gitSubArgs(pull); len(got) != 2 || got[0] != "pull" || got[1] != "--ff-only" {
+		t.Errorf("expected 'git pull --ff-only', got: %v", pull)
 	}
 }
 
@@ -375,21 +464,21 @@ func TestSyncReposCountsGitFailures(t *testing.T) {
 		t.Errorf("missing error event:\n%s", stdout.String())
 	}
 	// The captured git output must land on stderr as an attributed block.
-	if !strings.Contains(stderr.String(), "--- git clone") || !strings.Contains(stderr.String(), "simulated git output") {
+	if !strings.Contains(stderr.String(), "clone https://gitlab.com/acme/repo.git") || !strings.Contains(stderr.String(), "simulated git output") {
 		t.Errorf("missing attributed git failure block on stderr:\n%s", stderr.String())
 	}
 }
 
-func TestSyncReposRejectsForeignHost(t *testing.T) {
+func TestSyncReposNotesForeignHost(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	rec := &recordingGit{}
-	s, stdout, _ := newTestSyncer(
+	s, stdout, stderr := newTestSyncer(
 		&Config{URL: "https://gitlab.com", HTTP: true},
 		fakeSource{
 			projects: map[string][]*gitlab.Project{
 				"acme": {
-					{PathWithNamespace: "acme/repo", HTTPURLToRepo: "https://evil.example.com/acme/repo.git"},
+					{PathWithNamespace: "acme/repo", HTTPURLToRepo: "https://other.example.com/acme/repo.git"},
 				},
 			},
 		},
@@ -397,14 +486,21 @@ func TestSyncReposRejectsForeignHost(t *testing.T) {
 	)
 
 	s.syncRepos(context.Background(), "acme")
-	if s.counts.errors != 1 {
-		t.Errorf("errors = %d, want 1 (foreign host rejected)", s.counts.errors)
+
+	// gitty reports the unexpected host but does not override git: where a URL
+	// ends up is the local git configuration's decision, and gitty cannot see
+	// a gitdir-conditional rewrite from outside the repository anyway.
+	if s.counts.errors != 0 {
+		t.Errorf("errors = %d, want 0 (a foreign host is a note, not a refusal)", s.counts.errors)
 	}
-	if !strings.Contains(stdout.String(), "error acme/repo clone URL host does not match") {
-		t.Errorf("missing host-mismatch error event:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "clone acme/repo") {
+		t.Errorf("expected the clone to proceed:\n%s", stdout.String())
 	}
-	if rec.callCount() != 0 {
-		t.Errorf("git should not run for a foreign host, got calls: %v", rec.calls)
+	if !strings.Contains(stderr.String(), "other.example.com") {
+		t.Errorf("expected a note naming the host:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--allow-clone-host") {
+		t.Errorf("note should say how to silence it:\n%s", stderr.String())
 	}
 }
 
@@ -612,7 +708,7 @@ func TestVerboseExecLinesGoToStderr(t *testing.T) {
 	s.verbose = true
 
 	s.syncRepos(context.Background(), "acme")
-	if !strings.Contains(stderr.String(), "exec git clone") {
+	if !strings.Contains(stderr.String(), "exec git ") || !strings.Contains(stderr.String(), " clone ") {
 		t.Errorf("verbose exec line missing from stderr:\n%s", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "exec git") {
@@ -759,7 +855,7 @@ func TestSyncOneRepoBrokenCheckout(t *testing.T) {
 		if !strings.Contains(stdout.String(), "reclone acme/repo\n") {
 			t.Errorf("missing reclone event:\n%s", stdout.String())
 		}
-		if rec.callCount() != 1 || rec.calls[0][1] != "clone" {
+		if rec.callCount() != 1 || gitSubArgs(rec.calls[0])[0] != "clone" {
 			t.Errorf("expected one clone call, got: %v", rec.calls)
 		}
 		// The junk must be preserved in the aside dir, not deleted.
@@ -803,7 +899,7 @@ func TestSyncOneRepoBrokenCheckout(t *testing.T) {
 		if !strings.Contains(stdout.String(), "clone acme/repo\n") {
 			t.Errorf("empty dir should be recovered via clone:\n%s", stdout.String())
 		}
-		if rec.callCount() != 1 || rec.calls[0][1] != "clone" {
+		if rec.callCount() != 1 || gitSubArgs(rec.calls[0])[0] != "clone" {
 			t.Errorf("expected one clone call, got: %v", rec.calls)
 		}
 	})
@@ -883,7 +979,7 @@ func TestSyncReposParallelCountsAndEvents(t *testing.T) {
 func TestJobsValidation(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := runInit("https://gitlab.com", true, false); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com", HTTP: true}); err != nil {
 		t.Fatal(err)
 	}
 

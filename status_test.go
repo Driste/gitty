@@ -152,7 +152,7 @@ func TestRunStatusRequiresWorkspace(t *testing.T) {
 
 func TestRunStatusFetchRequiresToken(t *testing.T) {
 	t.Chdir(t.TempDir())
-	if err := runInit("https://gitlab.com", true, false); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com", HTTP: true}); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GITLAB_TOKEN", "")
@@ -170,7 +170,7 @@ func TestRunStatusFetchRequiresToken(t *testing.T) {
 
 func TestRunStatusJobsValidation(t *testing.T) {
 	t.Chdir(t.TempDir())
-	if err := runInit("https://gitlab.com", true, false); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com", HTTP: true}); err != nil {
 		t.Fatal(err)
 	}
 	for _, jobs := range []int{0, -1, 17} {

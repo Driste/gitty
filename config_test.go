@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -11,9 +12,10 @@ func TestSaveAndLoadConfigRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 
 	want := &Config{
-		URL:      "https://gitlab.example.com",
-		HTTP:     true,
-		RootPath: "acme/team",
+		URL:        "https://gitlab.example.com",
+		HTTP:       true,
+		RootPath:   "acme/team",
+		CloneHosts: []string{"git.example.com", "mirror.example.com"},
 	}
 	if err := SaveConfigTo(dir, want); err != nil {
 		t.Fatalf("SaveConfigTo returned error: %v", err)
@@ -32,7 +34,7 @@ func TestSaveAndLoadConfigRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadLocalConfig returned error: %v", err)
 	}
-	if *got != *want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("roundtrip mismatch:\n got  %+v\n want %+v", *got, *want)
 	}
 }
@@ -58,7 +60,7 @@ func TestRunSyncErrorsWithoutConfig(t *testing.T) {
 func TestRunSyncErrorsWithoutTokenOrAnon(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := runInit("https://gitlab.com", true, false); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com", HTTP: true}); err != nil {
 		t.Fatalf("runInit: %v", err)
 	}
 
@@ -79,7 +81,7 @@ func TestRunInitWritesConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	if err := runInit("https://gitlab.custom.io", true, false); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.custom.io", HTTP: true}); err != nil {
 		t.Fatalf("runInit: %v", err)
 	}
 
