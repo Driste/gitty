@@ -272,6 +272,15 @@ type recordingGit struct {
 }
 
 func (r *recordingGit) run(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
+	// "ls-remote --get-url" is the read-only probe that resolves the local git
+	// config's insteadOf rewrites; it runs no network operation and is not a
+	// git action, so it is answered (unchanged, i.e. no rewrite configured)
+	// without being recorded. Tests that care about rewrites use
+	// configAwareGit instead.
+	if len(args) == 3 && args[0] == "ls-remote" && args[1] == "--get-url" {
+		return []byte(args[2] + "\n"), nil
+	}
+
 	r.mu.Lock()
 	r.calls = append(r.calls, append([]string{dir}, args...))
 	r.envs = append(r.envs, extraEnv)
@@ -299,8 +308,8 @@ func (r *recordingGit) lastEnv() []string {
 
 // gitSubArgs strips a recorded invocation down to the git subcommand and its
 // arguments: element 0 is the working directory, and gitty may prepend any
-// number of "-c key=value" option pairs (credential-helper reset, insteadOf
-// pin). Tests assert on the subcommand, not on option ordering.
+// number of "-c key=value" option pairs (the credential-helper reset). Tests
+// assert on the subcommand, not on option ordering.
 func gitSubArgs(call []string) []string {
 	args := call[1:]
 	for len(args) >= 2 && args[0] == "-c" {

@@ -19,10 +19,9 @@ type statusOptions struct {
 	AcceptNewHostKeys bool
 	Jobs              int
 
-	// RespectGitConfig and AllowCloneHosts widen the workspace config for
-	// this run only; see Config.ApplyGitOverrides.
-	RespectGitConfig bool
-	AllowCloneHosts  []string
+	// AllowCloneHosts adds trusted clone hosts for this run only; see
+	// Config.AllowCloneHosts.
+	AllowCloneHosts []string
 }
 
 // repoStatus is one checkout's branch and freshness, as reported by
@@ -86,6 +85,17 @@ func statusDetail(st repoStatus) string {
 	return detail
 }
 
+// firstOrigin reads a checkout's origin for the host-key warmup decision. A
+// repo whose origin cannot be read is simply not informative here, so the
+// caller falls back to the configured transport.
+func firstOrigin(ctx context.Context, s *syncer, dir string) string {
+	origin, err := s.originOf(ctx, dir)
+	if err != nil {
+		return ""
+	}
+	return origin
+}
+
 // runStatus reports the branch and freshness of every checkout in the
 // workspace. It needs no GitLab API access; --fetch refreshes remote-tracking
 // refs first, which does require credentials for HTTP remotes.
@@ -99,7 +109,7 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		return usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
 	}
 
-	cfg.ApplyGitOverrides(opts.RespectGitConfig, opts.AllowCloneHosts)
+	cfg.AllowCloneHosts(opts.AllowCloneHosts)
 
 	cred, err := resolveCredentialFor(opts.Token, opts.Anon)
 	if err != nil {
@@ -169,9 +179,11 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 
 	// With --fetch over SSH the first connection may prompt for host-key
 	// confirmation; inspect one repo alone first so that happens once rather
-	// than once per worker (see needsHostKeyWarmup).
+	// than once per worker (see needsHostKeyWarmup). Whether ssh is involved
+	// follows the first checkout's own remote, after the local git config's
+	// rewrites.
 	pending := repos
-	if opts.Fetch && s.needsHostKeyWarmup() && len(pending) > 1 {
+	if opts.Fetch && len(pending) > 1 && s.needsHostKeyWarmup(ctx, pending[0], firstOrigin(ctx, s, pending[0])) {
 		inspect(pending[0])
 		pending = pending[1:]
 	}

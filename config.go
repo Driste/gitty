@@ -36,22 +36,21 @@ type Config struct {
 	CloneHosts []string `toml:"clone_hosts,omitempty"`
 }
 
-// ApplyGitOverrides layers a command's per-run flags onto the workspace
-// config. The flags can only widen what the stored config already allows:
-// --respect-git-config turns rewriting on, --allow-clone-host adds hosts.
-// Making them additive keeps a one-off run from silently contradicting the
-// workspace's own settings.
-func (c *Config) ApplyGitOverrides(respectGitConfig bool, cloneHosts []string) {
-	if respectGitConfig {
-		c.RespectGitConfig = true
-	}
-	c.CloneHosts = append(c.CloneHosts, cloneHosts...)
+// AllowCloneHosts adds hosts from a command's --allow-clone-host flags to the
+// ones the workspace config already lists. It only ever widens the set, so a
+// one-off run cannot silently contradict the workspace's own settings.
+func (c *Config) AllowCloneHosts(hosts []string) {
+	c.CloneHosts = append(c.CloneHosts, hosts...)
 }
 
-// AllowsHost reports whether a clone or origin URL's host is one this
-// workspace may contact: the configured instance's host, or one the user
-// listed in clone_hosts. An empty host on either side is an error, which
-// callers treat as "not allowed".
+// AllowsHost reports whether a URL the GitLab API advertised may be contacted
+// with this workspace's credentials: its host must be the configured
+// instance's, or one the user listed in clone_hosts. An empty host on either
+// side is an error, which callers treat as "not allowed".
+//
+// This applies only to URLs that reached gitty from the API. A destination the
+// local git config rewrote to is the user's own choice and is not checked here
+// — see syncer.checkRemoteHost.
 func (c *Config) AllowsHost(rawURL string) (bool, error) {
 	host := extractHost(rawURL)
 	instance := extractHost(c.URL)
