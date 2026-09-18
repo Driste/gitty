@@ -181,9 +181,18 @@ func TestHostsMatch(t *testing.T) {
 type fakeSource struct {
 	subgroups map[string][]*gitlab.Group
 	groups    map[string]*gitlab.Group
+	topLevel  []*gitlab.Group
 	projects  map[string][]*gitlab.Project
 	subErr    error
 	projErr   error
+	topErr    error
+}
+
+func (f fakeSource) TopLevelGroups() ([]*gitlab.Group, error) {
+	if f.topErr != nil {
+		return nil, f.topErr
+	}
+	return f.topLevel, nil
 }
 
 func (f fakeSource) Subgroups(target string, nested bool) ([]*gitlab.Group, error) {

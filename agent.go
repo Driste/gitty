@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "2.1.0"
+const AgentSchemaVersion = "2.2.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -232,7 +232,7 @@ func buildAgentSchema() AgentSchema {
 					Properties: map[string]SchemaProp{
 						"path": {
 							Type:        "string",
-							Description: "GitLab group or subgroup path to list (e.g., 'tenant/images'). Required unless run from a managed subgroup directory that already has its own config.",
+							Description: "Group to list, resolved like a shell path against the workspace directory the command runs in: omitted or '.' means the current context (the instance's top-level groups at the workspace root), '/' always means the instance's top-level groups, '..' the parent group, and a leading '/' makes it absolute. Passed as a positional argument (--path is also accepted, but not both).",
 						},
 						"token": {
 							Type:        "string",
@@ -250,16 +250,20 @@ func buildAgentSchema() AgentSchema {
 						},
 						"format": {
 							Type:        "string",
-							Description: "Output format: 'text' for greppable 'group'/'project' event lines, 'tree' for an indented namespace tree, or 'json' for a structured document. Prefer json when consuming programmatically.",
-							Default:     "text",
+							Description: "Output format: 'auto' (an indented tree on a terminal, greppable event lines when piped), 'tree', 'text', or 'json'. Always pass 'json' explicitly when consuming this programmatically rather than relying on auto-detection.",
+							Default:     "auto",
+						},
+						"color": {
+							Type:        "string",
+							Description: "Colorize the tree: 'auto' (only on a terminal), 'always', or 'never'. NO_COLOR is honoured. Irrelevant for the text and json formats.",
+							Default:     "auto",
 						},
 					},
-					Required: []string{"path"},
 				},
 				Invocation: Invocation{
 					Command:   "gitty",
 					BaseArgs:  []string{"ls"},
-					FlagStyle: "--<name>=<value> for strings, --<name> for booleans",
+					FlagStyle: "the 'path' argument is positional (gitty ls <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it",
 				},
 			},
 			{

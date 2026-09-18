@@ -155,6 +155,7 @@ type fakeGitLab struct {
 	authScopes []string
 
 	groups      map[string]apiGroup
+	topLevel    []apiGroup
 	subgroups   map[string][]apiGroup
 	descendants map[string][]apiGroup
 	projects    map[string][]apiProject
@@ -242,6 +243,12 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"id": 1, "name": "test", "scopes": f.authScopes,
 			"active": true, "revoked": false,
 		})
+		return
+	}
+
+	// The top-level group listing that backs `gitty ls /`.
+	if r.URL.Path == "/api/v4/groups" {
+		writeJSON(w, http.StatusOK, orEmptyGroups(f.topLevel))
 		return
 	}
 
@@ -1221,6 +1228,118 @@ func TestE2EStatusReportsNoUpstream(t *testing.T) {
 	}
 }
 
+// TestE2ELsShellSemantics covers ls behaving like ls(1): a positional argument
+// instead of a required flag, flags on either side of it, "." and "/" and ".."
+// resolved against the workspace's current context, and a bare `ls` that needs
+// no argument at all.
+func TestE2ELsShellSemantics(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.groups["acme/team"] = apiGroup{ID: 2, FullPath: "acme/team"}
+	f.descendants["acme"] = []apiGroup{f.groups["acme/team"]}
+	f.subgroups["acme"] = []apiGroup{f.groups["acme/team"]}
+	f.projects["acme"] = []apiProject{f.project(160, "acme/alpha")}
+	f.projects["acme/team"] = []apiProject{f.project(161, "acme/team/beta")}
+	f.topLevel = []apiGroup{{ID: 1, FullPath: "acme"}, {ID: 9, FullPath: "other"}}
+
+	ws := initWorkspace(t, f)
+
+	t.Run("positional argument", func(t *testing.T) {
+		stdout, stderr, code := runGitty(t, ws, nil, "ls", "acme", "--anon")
+		if code != 0 {
+			t.Fatalf("exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "project acme/alpha new") {
+			t.Errorf("missing project line:\n%s", stdout)
+		}
+	})
+
+	t.Run("flags after the positional argument", func(t *testing.T) {
+		// The flag package stops at the first non-flag argument, so this only
+		// works because gitty permutes the arguments itself.
+		stdout, stderr, code := runGitty(t, ws, nil, "ls", "acme", "--nested", "--anon")
+		if code != 0 {
+			t.Fatalf("exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "project acme/team/beta new") {
+			t.Errorf("--nested after the argument was not honored:\n%s", stdout)
+		}
+	})
+
+	t.Run("bare ls at the workspace root lists top-level groups", func(t *testing.T) {
+		stdout, stderr, code := runGitty(t, ws, nil, "ls", "--anon")
+		if code != 0 {
+			t.Fatalf("exit = %d:\n%s\n%s", code, stdout, stderr)
+		}
+		for _, want := range []string{"group acme ", "group other "} {
+			if !strings.Contains(stdout, want) {
+				t.Errorf("missing %q:\n%s", want, stdout)
+			}
+		}
+	})
+
+	t.Run("slash is the instance root", func(t *testing.T) {
+		stdout, _, code := runGitty(t, ws, nil, "ls", "/", "--anon")
+		if code != 0 || !strings.Contains(stdout, "group other ") {
+			t.Errorf("exit = %d, ls / should list top-level groups:\n%s", code, stdout)
+		}
+	})
+
+	t.Run("dot and relative paths from a managed subgroup", func(t *testing.T) {
+		// Build the managed directory tree so there is a subgroup to run in.
+		if _, stderr, code := runGitty(t, ws, nil, "sync", "--groups", "--nested", "--path=acme", "--anon"); code != 0 {
+			t.Fatalf("groups sync failed:\n%s", stderr)
+		}
+		sub := filepath.Join(ws, "acme", "team")
+
+		// A bare ls there lists that subgroup, with no --path anywhere.
+		stdout, _, code := runGitty(t, sub, nil, "ls", "--anon")
+		if code != 0 || !strings.Contains(stdout, "project acme/team/beta new") {
+			t.Errorf("bare ls in a subgroup: exit = %d:\n%s", code, stdout)
+		}
+
+		// "." is the same thing.
+		dotOut, _, code := runGitty(t, sub, nil, "ls", ".", "--anon")
+		if code != 0 || dotOut != stdout {
+			t.Errorf("'ls .' should match a bare ls:\n%s\nvs\n%s", dotOut, stdout)
+		}
+
+		// ".." walks up to the parent group.
+		upOut, _, code := runGitty(t, sub, nil, "ls", "..", "--anon")
+		if code != 0 || !strings.Contains(upOut, "group acme projects=") {
+			t.Errorf("'ls ..' should list the parent group: exit = %d:\n%s", code, upOut)
+		}
+
+		// An absolute path ignores the current context entirely.
+		absOut, _, code := runGitty(t, sub, nil, "ls", "/acme", "--anon")
+		if code != 0 || !strings.Contains(absOut, "project acme/alpha new") {
+			t.Errorf("'ls /acme' should resolve from the instance root:\n%s", absOut)
+		}
+	})
+
+	t.Run("argument and --path together conflict", func(t *testing.T) {
+		_, stderr, code := runGitty(t, ws, nil, "ls", "acme", "--path=acme", "--anon")
+		if code != 2 || !strings.Contains(stderr, "not both") {
+			t.Errorf("exit = %d, want 2 with a conflict message:\n%s", code, stderr)
+		}
+	})
+
+	t.Run("piped output is greppable and uncolored", func(t *testing.T) {
+		// runGitty captures through a pipe, so auto-detection must pick the
+		// event format with no ANSI escapes.
+		stdout, _, code := runGitty(t, ws, nil, "ls", "acme", "--anon")
+		if code != 0 {
+			t.Fatalf("exit = %d", code)
+		}
+		if strings.Contains(stdout, "\x1b[") {
+			t.Errorf("piped ls must not emit ANSI escapes:\n%q", stdout)
+		}
+		assertGreppableStdout(t, stdout)
+	})
+}
+
 func TestE2ELs(t *testing.T) {
 	skipIfShort(t)
 
@@ -1274,7 +1393,12 @@ func TestE2ELs(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("ls --format=tree exit = %d:\n%s", code, stdout)
 	}
-	for _, want := range []string{"acme (1 project)\n", "  = alpha\n", "  team (1 project)\n", "    = beta\n"} {
+	for _, want := range []string{
+		"acme/ (1 project)",
+		"├── team/ (1 project)",
+		"│   └── beta  present",
+		"└── alpha  present",
+	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("tree output missing %q:\n%s", want, stdout)
 		}

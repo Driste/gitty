@@ -159,18 +159,35 @@ summary repos=2 dirty=0 ahead=0 behind=1 errors=0
 tracking ref, so ahead/behind are unknowable rather than zero — do not read
 `0/0` as "in sync" when that marker is present.
 
-### `gitty ls` — preview a group's contents
+### `gitty ls` — browse groups and projects
 
-Lists remote groups/projects under a target and whether each project is
-already checked out. Contacts the API; never runs git or writes to disk.
+Lists remote groups/projects under a target and whether each project is already
+checked out. Contacts the API; never runs git or writes to disk.
+
+The target is a POSITIONAL argument resolved like a shell path against the
+workspace directory you are in (`--path` still works but cannot be combined
+with it):
+
+| Argument      | Meaning |
+| :------------ | :------ |
+| *(none)* or `.` | The current context: the workspace's `root_path`, or the instance's top-level groups at the workspace root. |
+| `/`           | Always the instance's top-level groups. |
+| `a/b`         | Relative to the current context. |
+| `/a/b`        | Absolute, from the instance root. |
+| `..`          | The parent group; clamped at the instance root. |
 
 | Flag       | Type    | Default | Description |
 | :--------- | :------ | :------ | :---------- |
-| `--path`   | string  | `""`    | Group path to list. Required unless run from a managed subgroup directory. |
 | `--token`  | string  | `""`    | Access token; falls back to env vars. Required unless `--anon`. |
 | `--anon`   | boolean | `false` | List public resources without a token. |
 | `--nested` | boolean | `false` | Recurse into subgroups. Per-group counts are only complete in this mode. |
-| `--format` | string  | `text`  | `text` (event lines), `tree` (indented), or `json`. Prefer `json` when parsing. |
+| `--format` | string  | `auto`  | `auto`, `tree`, `text`, or `json`. |
+| `--color`  | string  | `auto`  | `auto`, `always`, or `never`. `NO_COLOR` is honoured. |
+
+Output adapts to the destination, like `ls(1)`: a colored tree on a terminal,
+and the greppable one-event-per-line `text` format when piped or redirected.
+**When parsing, pass `--format=json` explicitly** rather than relying on
+detection. The text form is:
 
 ```
 group tenant/images projects=2
@@ -179,9 +196,7 @@ project tenant/images/lib new
 summary groups=1 projects=2 new=1 present=1
 ```
 
-Use `ls` to answer "what would a sync clone, and how much?" without touching
-the filesystem; use `sync --dry-run` when you want the plan in sync's own
-event vocabulary.
+Flags may appear before or after the positional argument.
 
 ### `gitty agent schema` — emit a machine-readable tool schema
 

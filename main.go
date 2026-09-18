@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
@@ -53,11 +54,12 @@ func main() {
 	statusAcceptHostKeys := statusCmd.Bool("accept-new-host-keys", false, "With --fetch over SSH, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new)")
 
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
-	lsPath := lsCmd.String("path", "", "GitLab Group Path (e.g., tenant/images)")
+	lsPath := lsCmd.String("path", "", "GitLab group path (deprecated: pass it as a positional argument)")
 	lsToken := lsCmd.String("token", "", "GitLab Access Token (falls back to env vars)")
 	lsAnon := lsCmd.Bool("anon", false, "List public resources anonymously (no token required)")
 	lsNested := lsCmd.Bool("nested", false, "Include nested subgroups/projects recursively")
-	lsFormat := lsCmd.String("format", "text", "Output format: text, tree, or json")
+	lsFormat := lsCmd.String("format", "auto", "Output format: auto, tree, text, or json")
+	lsColor := lsCmd.String("color", "auto", "Colorize output: auto, always, or never")
 
 	switch os.Args[1] {
 	case "init":
@@ -120,14 +122,27 @@ func main() {
 		stop()
 		exitOnError(err)
 	case "ls":
-		lsCmd.Parse(os.Args[2:])
+		// Flags may sit on either side of the positional group argument.
+		lsFlagArgs, lsPositional := splitFlagArgs(lsCmd, os.Args[2:])
+		lsCmd.Parse(lsFlagArgs)
+		lsTarget := *lsPath
+		if len(lsPositional) > 0 {
+			if lsTarget != "" {
+				exitOnError(usageErrf("pass the group either as an argument or with --path, not both"))
+			}
+			lsTarget = lsPositional[0]
+		}
+		if len(lsPositional) > 1 {
+			exitOnError(usageErrf("ls takes at most one group argument, got %d", len(lsPositional)))
+		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		err := runLs(ctx, lsOptions{
-			Path:   *lsPath,
+			Target: lsTarget,
 			Token:  *lsToken,
 			Anon:   *lsAnon,
 			Nested: *lsNested,
 			Format: *lsFormat,
+			Color:  *lsColor,
 		})
 		stop()
 		exitOnError(err)
@@ -150,6 +165,49 @@ func exitOnError(err error) {
 	}
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	os.Exit(exitCode(err))
+}
+
+// boolFlag matches the flag package's interface for flags that take no
+// separate value argument.
+type boolFlag interface{ IsBoolFlag() bool }
+
+// splitFlagArgs separates flags from positional arguments so that flags may
+// appear on either side of the positional one — `gitty ls acme --nested` as
+// well as `gitty ls --nested acme`. The flag package stops parsing at the
+// first non-flag argument, unlike ls(1) and most modern CLIs. Everything after
+// a bare "--" is positional.
+func splitFlagArgs(fs *flag.FlagSet, args []string) (flagArgs, positional []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			return flagArgs, positional
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			positional = append(positional, arg)
+			continue
+		}
+
+		flagArgs = append(flagArgs, arg)
+		name := strings.TrimLeft(arg, "-")
+		if strings.Contains(name, "=") {
+			continue // value is attached: --flag=value
+		}
+		known := fs.Lookup(name)
+		if known == nil {
+			continue // unknown flag: let Parse produce the error
+		}
+		if bf, ok := known.Value.(boolFlag); ok && bf.IsBoolFlag() {
+			continue // booleans never consume the next argument
+		}
+		// --flag value: the next argument belongs to this flag.
+		if i+1 < len(args) {
+			i++
+			flagArgs = append(flagArgs, args[i])
+		}
+	}
+	return flagArgs, positional
 }
 
 // printUsage writes usage to stderr: it is only ever printed on error paths
