@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -20,6 +21,52 @@ type Config struct {
 	URL      string `toml:"url"`
 	HTTP     bool   `toml:"http"`
 	RootPath string `toml:"root_path"`
+
+	// RespectGitConfig honours the local git configuration's
+	// url.<base>.insteadOf rewrites instead of pinning every clone and fetch
+	// to the URL gitty selected. Off by default, because the most common such
+	// rule silently turns an HTTP clone into an SSH one; on for setups that
+	// deliberately rewrite the instance's advertised URL to a reachable one.
+	RespectGitConfig bool `toml:"respect_git_config,omitempty"`
+
+	// CloneHosts names extra hosts whose repositories this workspace may
+	// clone, fetch, and send its token to, beyond the instance's own host.
+	// Needed when the API advertises clone URLs on a different host than the
+	// one gitty talks to (a split API/git deployment, or a mirror).
+	CloneHosts []string `toml:"clone_hosts,omitempty"`
+}
+
+// ApplyGitOverrides layers a command's per-run flags onto the workspace
+// config. The flags can only widen what the stored config already allows:
+// --respect-git-config turns rewriting on, --allow-clone-host adds hosts.
+// Making them additive keeps a one-off run from silently contradicting the
+// workspace's own settings.
+func (c *Config) ApplyGitOverrides(respectGitConfig bool, cloneHosts []string) {
+	if respectGitConfig {
+		c.RespectGitConfig = true
+	}
+	c.CloneHosts = append(c.CloneHosts, cloneHosts...)
+}
+
+// AllowsHost reports whether a clone or origin URL's host is one this
+// workspace may contact: the configured instance's host, or one the user
+// listed in clone_hosts. An empty host on either side is an error, which
+// callers treat as "not allowed".
+func (c *Config) AllowsHost(rawURL string) (bool, error) {
+	host := extractHost(rawURL)
+	instance := extractHost(c.URL)
+	if host == "" || instance == "" {
+		return false, fmt.Errorf("could not determine host (config %q, remote %q)", c.URL, redactURL(rawURL))
+	}
+	if host == instance {
+		return true, nil
+	}
+	for _, allowed := range c.CloneHosts {
+		if extractHost(allowed) == host {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // LoadLocalConfig only looks in the IMMEDIATE current directory for .gitty/config

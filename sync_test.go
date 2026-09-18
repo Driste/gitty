@@ -144,31 +144,77 @@ func TestExtractHost(t *testing.T) {
 	}
 }
 
-func TestHostsMatch(t *testing.T) {
+func TestConfigAllowsHost(t *testing.T) {
 	tests := []struct {
-		name      string
-		configURL string
-		cloneURL  string
-		want      bool
-		wantErr   bool
+		name       string
+		configURL  string
+		cloneHosts []string
+		remoteURL  string
+		want       bool
+		wantErr    bool
 	}{
-		{name: "matching https", configURL: "https://gitlab.com", cloneURL: "https://gitlab.com/acme/repo.git", want: true},
-		{name: "matching ssh", configURL: "https://gitlab.com", cloneURL: "git@gitlab.com:acme/repo.git", want: true},
-		{name: "mismatched host is rejected", configURL: "https://gitlab.com", cloneURL: "https://evil.example.com/acme/repo.git", want: false},
-		{name: "unparseable clone host errors", configURL: "https://gitlab.com", cloneURL: "", want: false, wantErr: true},
+		{name: "matching https", configURL: "https://gitlab.com", remoteURL: "https://gitlab.com/acme/repo.git", want: true},
+		{name: "matching ssh", configURL: "https://gitlab.com", remoteURL: "git@gitlab.com:acme/repo.git", want: true},
+		{name: "mismatched host is rejected", configURL: "https://gitlab.com", remoteURL: "https://evil.example.com/acme/repo.git", want: false},
+		{name: "unparseable clone host errors", configURL: "https://gitlab.com", remoteURL: "", want: false, wantErr: true},
+		{
+			name:       "allowed clone host is accepted",
+			configURL:  "https://gitlab.example.com",
+			cloneHosts: []string{"git.internal"},
+			remoteURL:  "https://git.internal/acme/repo.git",
+			want:       true,
+		},
+		{
+			name:       "allowed clone host may be given as a URL",
+			configURL:  "https://gitlab.example.com",
+			cloneHosts: []string{"https://git.internal/"},
+			remoteURL:  "git@git.internal:acme/repo.git",
+			want:       true,
+		},
+		{
+			name:       "a host outside the allow list is still rejected",
+			configURL:  "https://gitlab.example.com",
+			cloneHosts: []string{"git.internal"},
+			remoteURL:  "https://evil.example.com/acme/repo.git",
+			want:       false,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := hostsMatch(tc.configURL, tc.cloneURL)
+			cfg := &Config{URL: tc.configURL, CloneHosts: tc.cloneHosts}
+			got, err := cfg.AllowsHost(tc.remoteURL)
 			if tc.wantErr && err == nil {
-				t.Errorf("hostsMatch(%q, %q) expected an error, got nil", tc.configURL, tc.cloneURL)
+				t.Errorf("AllowsHost(%q) expected an error, got nil", tc.remoteURL)
 			}
 			if !tc.wantErr && err != nil {
-				t.Errorf("hostsMatch(%q, %q) unexpected error: %v", tc.configURL, tc.cloneURL, err)
+				t.Errorf("AllowsHost(%q) unexpected error: %v", tc.remoteURL, err)
 			}
 			if got != tc.want {
-				t.Errorf("hostsMatch(%q, %q) = %v, want %v", tc.configURL, tc.cloneURL, got, tc.want)
+				t.Errorf("AllowsHost(%q) = %v, want %v", tc.remoteURL, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsSSHURL(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want bool
+	}{
+		{raw: "https://gitlab.com/acme/repo.git", want: false},
+		{raw: "http://gitlab.com/acme/repo.git", want: false},
+		{raw: "https://gitlab.example.com:8443/acme/repo.git", want: false},
+		{raw: "ssh://git@gitlab.com/acme/repo.git", want: true},
+		{raw: "git@gitlab.com:acme/repo.git", want: true},
+		{raw: "gitlab.com:acme/repo.git", want: true},
+		{raw: "", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.raw, func(t *testing.T) {
+			if got := isSSHURL(tc.raw); got != tc.want {
+				t.Errorf("isSSHURL(%q) = %v, want %v", tc.raw, got, tc.want)
 			}
 		})
 	}
@@ -917,7 +963,7 @@ func TestSyncReposParallelCountsAndEvents(t *testing.T) {
 func TestJobsValidation(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := runInit("https://gitlab.com", true, false, false, ""); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com", HTTP: true}); err != nil {
 		t.Fatal(err)
 	}
 

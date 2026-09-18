@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "2.2.0"
+const AgentSchemaVersion = "2.3.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -104,6 +104,15 @@ func buildAgentSchema() AgentSchema {
 							Type:        "boolean",
 							Description: "Check the token against the instance and report the authenticated user, the token's scopes, and any scope this workspace needs but the token lacks (notably read_repository for HTTP cloning). Advisory only: it never fails init. Set false for offline setup.",
 							Default:     true,
+						},
+						"allow-clone-host": {
+							Type:        "string",
+							Description: "An additional host whose repositories may be cloned and sent this workspace's token, beyond the instance's own host. Needed when the API advertises clone URLs on a different host. Repeatable, and also accepts a comma-separated list.",
+						},
+						"respect-git-config": {
+							Type:        "boolean",
+							Description: "Honour url.<base>.insteadOf rewrites from the local git config instead of pinning the URL gitty selected. Set this when the instance advertises clone URLs on a host reachable only through such a rewrite. The rewritten URL is still host-checked before any credential is sent.",
+							Default:     false,
 						},
 					},
 				},
@@ -172,6 +181,15 @@ func buildAgentSchema() AgentSchema {
 							Description: "Print what would happen without creating directories or executing git commands.",
 							Default:     false,
 						},
+						"allow-clone-host": {
+							Type:        "string",
+							Description: "An additional host whose repositories may be cloned and sent this workspace's token, beyond the instance's own host. Needed when the API advertises clone URLs on a different host. Repeatable, and also accepts a comma-separated list.",
+						},
+						"respect-git-config": {
+							Type:        "boolean",
+							Description: "Honour url.<base>.insteadOf rewrites from the local git config instead of pinning the URL gitty selected. Set this when the instance advertises clone URLs on a host reachable only through such a rewrite. The rewritten URL is still host-checked before any credential is sent.",
+							Default:     false,
+						},
 					},
 					Required: []string{"path"},
 				},
@@ -214,6 +232,15 @@ func buildAgentSchema() AgentSchema {
 						"verbose": {
 							Type:        "boolean",
 							Description: "Print each git invocation and its output to stderr, with URLs redacted.",
+							Default:     false,
+						},
+						"allow-clone-host": {
+							Type:        "string",
+							Description: "An additional host whose repositories may be cloned and sent this workspace's token, beyond the instance's own host. Needed when the API advertises clone URLs on a different host. Repeatable, and also accepts a comma-separated list.",
+						},
+						"respect-git-config": {
+							Type:        "boolean",
+							Description: "Honour url.<base>.insteadOf rewrites from the local git config instead of pinning the URL gitty selected. Set this when the instance advertises clone URLs on a host reachable only through such a rewrite. The rewritten URL is still host-checked before any credential is sent.",
 							Default:     false,
 						},
 					},

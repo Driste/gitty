@@ -31,6 +31,9 @@ func main() {
 	initForce := initCmd.Bool("force", false, "Overwrite an existing .gitty/config")
 	initToken := initCmd.String("token", "", "GitLab Access Token to verify (falls back to env vars)")
 	initVerify := initCmd.Bool("verify", true, "Check the token against the instance and report its scopes")
+	var initCloneHosts stringList
+	initCmd.Var(&initCloneHosts, "allow-clone-host", "Additional host whose repositories this workspace may clone and send its token to (repeatable, or comma-separated)")
+	initRespectGit := initCmd.Bool("respect-git-config", false, "Honour url.<base>.insteadOf rewrites from your git config instead of pinning the URL gitty selected")
 
 	syncCmd := flag.NewFlagSet("sync", flag.ExitOnError)
 	syncPath := syncCmd.String("path", "", "GitLab Group Path (e.g., tenant/images) (required)")
@@ -44,6 +47,9 @@ func main() {
 	syncRecloneBroken := syncCmd.Bool("reclone-broken", false, "Move aside non-repo directories that block a clone (renamed, never deleted) and re-clone")
 	syncJobs := syncCmd.Int("jobs", 4, "Number of concurrent repo clone/pull operations (1-16)")
 	syncAcceptHostKeys := syncCmd.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
+	var syncCloneHosts stringList
+	syncCmd.Var(&syncCloneHosts, "allow-clone-host", "Additional host whose repositories may be cloned and sent this workspace's token (repeatable, or comma-separated)")
+	syncRespectGit := syncCmd.Bool("respect-git-config", false, "Honour url.<base>.insteadOf rewrites from your git config instead of pinning the URL gitty selected")
 
 	statusCmd := flag.NewFlagSet("status", flag.ExitOnError)
 	statusToken := statusCmd.String("token", "", "GitLab Access Token (only needed with --fetch)")
@@ -52,6 +58,9 @@ func main() {
 	statusVerbose := statusCmd.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
 	statusJobs := statusCmd.Int("jobs", 4, "Number of concurrent repositories to inspect (1-16)")
 	statusAcceptHostKeys := statusCmd.Bool("accept-new-host-keys", false, "With --fetch over SSH, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new)")
+	var statusCloneHosts stringList
+	statusCmd.Var(&statusCloneHosts, "allow-clone-host", "With --fetch, an additional host that may be contacted with this workspace's token (repeatable, or comma-separated)")
+	statusRespectGit := statusCmd.Bool("respect-git-config", false, "Honour url.<base>.insteadOf rewrites from your git config instead of pinning the URL gitty selected")
 
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
 	lsPath := lsCmd.String("path", "", "GitLab group path (deprecated: pass it as a positional argument)")
@@ -87,7 +96,15 @@ func main() {
 		if *initSSH && *initHTTP {
 			exitOnError(usageErrf("--ssh and --http are mutually exclusive"))
 		}
-		exitOnError(runInit(resolvedURL, !*initSSH, *initForce, *initVerify, *initToken))
+		exitOnError(runInit(initOptions{
+			URL:              resolvedURL,
+			HTTP:             !*initSSH,
+			Force:            *initForce,
+			Verify:           *initVerify,
+			Token:            *initToken,
+			RespectGitConfig: *initRespectGit,
+			CloneHosts:       initCloneHosts,
+		}))
 	case "sync":
 		syncCmd.Parse(os.Args[2:])
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -104,6 +121,8 @@ func main() {
 			Jobs:          *syncJobs,
 
 			AcceptNewHostKeys: *syncAcceptHostKeys,
+			RespectGitConfig:  *syncRespectGit,
+			AllowCloneHosts:   syncCloneHosts,
 		})
 		stop()
 		exitOnError(err)
@@ -118,6 +137,8 @@ func main() {
 			Jobs:    *statusJobs,
 
 			AcceptNewHostKeys: *statusAcceptHostKeys,
+			RespectGitConfig:  *statusRespectGit,
+			AllowCloneHosts:   statusCloneHosts,
 		})
 		stop()
 		exitOnError(err)
@@ -165,6 +186,22 @@ func exitOnError(err error) {
 	}
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	os.Exit(exitCode(err))
+}
+
+// stringList is a repeatable string flag. Values also accept a comma-separated
+// list, so --allow-clone-host=a,b and --allow-clone-host=a --allow-clone-host=b
+// are equivalent.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			*l = append(*l, part)
+		}
+	}
+	return nil
 }
 
 // boolFlag matches the flag package's interface for flags that take no

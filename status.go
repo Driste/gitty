@@ -18,6 +18,11 @@ type statusOptions struct {
 	Verbose           bool
 	AcceptNewHostKeys bool
 	Jobs              int
+
+	// RespectGitConfig and AllowCloneHosts widen the workspace config for
+	// this run only; see Config.ApplyGitOverrides.
+	RespectGitConfig bool
+	AllowCloneHosts  []string
 }
 
 // repoStatus is one checkout's branch and freshness, as reported by
@@ -93,6 +98,8 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 	if err != nil {
 		return usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
 	}
+
+	cfg.ApplyGitOverrides(opts.RespectGitConfig, opts.AllowCloneHosts)
 
 	cred, err := resolveCredentialFor(opts.Token, opts.Anon)
 	if err != nil {
