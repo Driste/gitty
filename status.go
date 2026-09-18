@@ -94,7 +94,10 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		return usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
 	}
 
-	cred := resolveCredential(opts.Token)
+	cred, err := resolveCredentialFor(opts.Token, opts.Anon)
+	if err != nil {
+		return err
+	}
 	if opts.Fetch && cred.token == "" && !opts.Anon {
 		return usageErrf("--fetch needs a token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var); use --anon to fetch public repositories without one")
 	}

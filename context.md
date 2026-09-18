@@ -60,9 +60,13 @@ tag (e.g. `v1.0.0`), a source build prints `dev` plus the commit it came from
   explicitly in `.gitty/config`, so an existing workspace keeps its transport.
 - **Token resolution order** for `sync`: `--token` flag → `GITLAB_TOKEN` env →
   `CI_JOB_TOKEN` env. A token is required unless `--anon` is passed (public
-  resources only). In HTTP(S) mode the token also authenticates git itself,
-  handed over via an internal askpass re-exec — never on the command line and
-  never written to disk.
+  resources only). `--anon` ignores ambient env tokens rather than silently
+  using them, and conflicts with an explicit `--token`.
+- **Token scopes**: in HTTP(S) mode the token also authenticates git itself,
+  handed to git via an internal askpass re-exec — never on the command line,
+  never written to disk. It therefore needs `read_repository` in addition to
+  `api`/`read_api`: an API-only token lists groups fine but cannot clone.
+  gitty detects that failure and prints a hint naming the scope.
 - **Exit codes**: `0` success, `1` completed with per-item failures, `2` usage
   or configuration error (do not retry unchanged), `130` interrupted.
 
@@ -93,7 +97,7 @@ ones.
 | :----------------- | :------ | :------ | :---------- |
 | `--path`           | string  | `""`    | GitLab group/subgroup path, e.g. `tenant/images`. Required unless run from a managed subgroup directory that already has its own config. |
 | `--token`          | string  | `""`    | GitLab access token. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. Required unless `--anon`. |
-| `--anon`           | boolean | `false` | Sync public groups/repositories anonymously, without a token. |
+| `--anon`           | boolean | `false` | Sync public groups/repositories anonymously. Ambient `GITLAB_TOKEN` / `CI_JOB_TOKEN` are ignored; conflicts with `--token`. |
 | `--groups`         | boolean | `false` | Create the subgroup directory structure locally (each with its own config). |
 | `--repos`          | boolean | `false` | Clone/pull repositories. Defaults to `true` when neither `--groups` nor `--repos` is passed. |
 | `--nested`         | boolean | `false` | Recurse into nested subgroups/projects instead of only the immediate group. |

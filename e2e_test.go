@@ -125,10 +125,13 @@ type fakeGitLab struct {
 	gitRoot string
 
 	// requireToken, when non-empty, makes API calls 401 unless the
-	// PRIVATE-TOKEN header matches. pageSize, when > 0, paginates project
-	// listings to exercise the client's pagination loop.
-	requireToken string
-	pageSize     int
+	// PRIVATE-TOKEN header matches. rejectAnyToken instead rejects every
+	// request that carries a token at all, so a test can prove a run really
+	// was anonymous. pageSize, when > 0, paginates project listings to
+	// exercise the client's pagination loop.
+	requireToken   string
+	rejectAnyToken bool
+	pageSize       int
 
 	// gitDelayNs slows every /git/ request so tests can catch a sync mid-git
 	// (SIGINT, concurrency); atomic because tests adjust it while the server
@@ -206,6 +209,10 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 	}
 	if f.requireToken != "" && r.Header.Get("PRIVATE-TOKEN") != f.requireToken {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "401 Unauthorized"})
+		return
+	}
+	if f.rejectAnyToken && r.Header.Get("PRIVATE-TOKEN") != "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "401 Unauthorized"})
 		return
 	}
@@ -412,6 +419,105 @@ func TestE2EInitWritesConfig(t *testing.T) {
 	if cfg.URL != "https://gitlab.example.com" || !cfg.HTTP || cfg.RootPath != "" {
 		t.Errorf("unexpected config: %+v", cfg)
 	}
+}
+
+// TestE2EAnonIgnoresAmbientToken is the regression guard for "auth issues when
+// GITLAB_TOKEN is set": --anon means anonymous, so a stale, expired or
+// wrongly-scoped token left in the environment must not be picked up and turn
+// an explicitly anonymous run into a 401.
+func TestE2EAnonIgnoresAmbientToken(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/publicrepo", map[string]string{"p.txt": "p"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(150, "acme/publicrepo")}
+	// The server rejects any token it is sent; anonymous requests are fine.
+	f.rejectAnyToken = true
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws,
+		[]string{"GITLAB_TOKEN=glpat-stale-and-wrong"},
+		"sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("--anon exit = %d, want 0 — the ambient token must be ignored:\n%s\n%s",
+			code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/publicrepo\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+
+	f.mu.Lock()
+	seen := f.lastToken
+	f.mu.Unlock()
+	if seen != "" {
+		t.Errorf("server saw token %q during an --anon run, want none", seen)
+	}
+}
+
+func TestE2EAnonAndTokenConflict(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	ws := initWorkspace(t, f)
+	_, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--token=x")
+	if code != 2 || !strings.Contains(stderr, "mutually exclusive") {
+		t.Errorf("exit = %d, want 2 with a conflict message:\n%s", code, stderr)
+	}
+}
+
+// The token can reach git from the environment, not just from --token.
+func TestE2EHTTPAuthFromEnvToken(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-env-clone-token"
+	f := newFakeGitLab(t)
+	f.gitAuthUser, f.gitAuthPass = "oauth2", token
+	f.requireToken = token
+	f.addRepo(t, "acme/envrepo", map[string]string{"e.txt": "e"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(151, "acme/envrepo")}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token}, "sync", "--path=acme")
+	if code != 0 {
+		t.Fatalf("clone with GITLAB_TOKEN exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	f.mu.Lock()
+	gitAuth := f.lastGitAuth
+	f.mu.Unlock()
+	if gitAuth != "oauth2:"+token {
+		t.Errorf("git server saw auth %q, want oauth2:%s", gitAuth, token)
+	}
+	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
+}
+
+// A token that authenticates the API but cannot clone is the most likely
+// failure now that gitty clones over HTTP(S); the error must say so.
+func TestE2EScopeHintOnCloneAuthFailure(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-api-only"
+	f := newFakeGitLab(t)
+	f.requireToken = token         // the API accepts it
+	f.gitAuthUser = "oauth2"       // but git demands a different secret,
+	f.gitAuthPass = "other-secret" // standing in for a missing repo scope
+	f.addRepo(t, "acme/scoped", map[string]string{"s.txt": "s"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(152, "acme/scoped")}
+
+	ws := initWorkspace(t, f)
+	stdout, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token}, "sync", "--path=acme")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "error acme/scoped git clone failed") {
+		t.Errorf("missing clone failure event:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "read_repository") {
+		t.Errorf("expected a token-scope hint on stderr:\n%s", stderr)
+	}
+	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
 }
 
 func TestE2EInitTransportDefaults(t *testing.T) {

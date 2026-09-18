@@ -34,7 +34,10 @@ func setupWorkspace(pathFlag, tokenFlag string, anon bool) (*syncer, string, err
 		return nil, "", usageErrf("target group path is empty; provide --path or run from a managed subgroup directory")
 	}
 
-	cred := resolveCredential(tokenFlag)
+	cred, err := resolveCredentialFor(tokenFlag, anon)
+	if err != nil {
+		return nil, "", err
+	}
 	if cred.token == "" && !anon {
 		return nil, "", usageErrf("a token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required; use --anon to access public resources without a token")
 	}
