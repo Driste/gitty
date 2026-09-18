@@ -12,17 +12,55 @@ import (
 	"gitlab.com/gitlab-org/api/client-go"
 )
 
-// setupWorkspace loads the workspace config, resolves the effective target
-// group (root_path joined with an optional --path), resolves credentials, and
-// builds a syncer wired to the real GitLab client and git runner. It is shared
-// by every command that talks to the GitLab API.
-func setupWorkspace(pathFlag, tokenFlag string, anon bool) (*syncer, string, error) {
+// newWorkspaceSyncer loads the workspace config and resolves credentials,
+// returning a syncer wired to the real GitLab client and git runner. It does
+// not resolve a target group: commands that take one (sync) add it via
+// setupWorkspace, while ls resolves its own argument shell-style.
+func newWorkspaceSyncer(tokenFlag string, anon bool) (*syncer, error) {
 	cfg, err := LoadLocalConfig()
 	if err != nil {
-		return nil, "", usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
+		return nil, usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
 	}
 
-	target := cfg.RootPath
+	cred, err := resolveCredentialFor(tokenFlag, anon)
+	if err != nil {
+		return nil, err
+	}
+	if cred.token == "" && !anon {
+		return nil, usageErrf("a token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required; use --anon to access public resources without a token")
+	}
+
+	client, err := gitlab.NewClient(cred.token, gitlab.WithBaseURL(cfg.URL))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GitLab client: %w", err)
+	}
+
+	exePath, err := askpassPath(cfg, cred)
+	if err != nil {
+		return nil, err
+	}
+
+	return &syncer{
+		cfg:     cfg,
+		src:     gitlabClientSource{client: client, authenticated: cred.token != ""},
+		git:     execGit,
+		jobs:    1,
+		cred:    cred,
+		exePath: exePath,
+		out:     os.Stdout,
+		errOut:  os.Stderr,
+	}, nil
+}
+
+// setupWorkspace is newWorkspaceSyncer plus the target group a sync needs:
+// the workspace's root_path, joined with an optional --path.
+func setupWorkspace(pathFlag, tokenFlag string, anon bool) (*syncer, string, error) {
+	s, err := newWorkspaceSyncer(tokenFlag, anon)
+	if err != nil {
+		return nil, "", err
+	}
+
+	target := s.cfg.RootPath
 	if pathFlag != "" {
 		if target != "" {
 			target = target + "/" + pathFlag
@@ -33,35 +71,7 @@ func setupWorkspace(pathFlag, tokenFlag string, anon bool) (*syncer, string, err
 	if target == "" {
 		return nil, "", usageErrf("target group path is empty; provide --path or run from a managed subgroup directory")
 	}
-
-	cred, err := resolveCredentialFor(tokenFlag, anon)
-	if err != nil {
-		return nil, "", err
-	}
-	if cred.token == "" && !anon {
-		return nil, "", usageErrf("a token (via --token flag, GITLAB_TOKEN, or CI_JOB_TOKEN env var) is required; use --anon to access public resources without a token")
-	}
-
-	client, err := gitlab.NewClient(cred.token, gitlab.WithBaseURL(cfg.URL))
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to create GitLab client: %w", err)
-	}
-
-	exePath, err := askpassPath(cfg, cred)
-	if err != nil {
-		return nil, "", err
-	}
-
-	return &syncer{
-		cfg:     cfg,
-		src:     gitlabClientSource{client: client},
-		git:     execGit,
-		jobs:    1,
-		cred:    cred,
-		exePath: exePath,
-		out:     os.Stdout,
-		errOut:  os.Stderr,
-	}, target, nil
+	return s, target, nil
 }
 
 // askpassPath resolves this binary's path for the git askpass re-exec, but

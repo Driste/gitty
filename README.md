@@ -353,37 +353,60 @@ unknowable rather than zero.
 
 ---
 
-## Previewing a group (`gitty ls`)
+## Browsing (`gitty ls`)
 
-Lists the remote groups and projects under a target, with a project count per
-group, marking each project `new` (a sync would clone it) or `present`
-(already checked out). It never invokes git and never writes to the workspace —
-use it to see what a sync *would* bring down, and how much.
+Lists the remote groups and projects under a target, nesting subgroups and
+marking each project `present` (already checked out) or `new` (a sync would
+clone it). It never invokes git and never writes to the workspace.
+
+`ls` takes its target as a positional argument and resolves it the way a shell
+resolves a directory, against the workspace directory you are standing in:
 
 ```bash
-gitty ls --path="tenant/images" --nested
-gitty ls --path="tenant/images" --nested --format=tree
-gitty ls --path="tenant/images" --nested --format=json
+gitty ls                      # the current context; at the workspace root, the top-level groups
+gitty ls .                    # the same
+gitty ls /                    # always the instance's top-level groups
+gitty ls tenant/images        # relative to the current context
+gitty ls /tenant/images       # absolute, from the instance root
+gitty ls ..                   # the parent group
 ```
 
+Inside a managed subgroup directory (one `sync --groups` created) a bare
+`gitty ls` lists that subgroup — no flags required. Flags may go on either side
+of the argument: `gitty ls acme --nested` works as well as
+`gitty ls --nested acme`.
+
+On a terminal it prints a tree:
+
 ```
-group tenant/images projects=2
-project tenant/images/app present
-project tenant/images/lib new
-summary groups=1 projects=2 new=1 present=1
+wayne-enterprises/
+├── wayne-aerospace/ (1 project)
+│   └── mission-control  new
+├── wayne-industries/ (2 projects)
+│   ├── backend-controller  present
+│   └── microservice  present
+└── wayne-tech/
+
+4 groups, 3 projects: 2 present, 1 to clone
 ```
 
-`--format=tree` renders the same data as an indented namespace tree with `+`
-(would clone) and `=` (present) markers; `--format=json` emits a structured
-document for programmatic use.
+Group names are blue, present projects green, and ones a sync would clone
+yellow. Like `ls(1)`, the output adapts to where it is going: **piped or
+redirected output falls back to the greppable one-event-per-line format with no
+colour**, so scripts keep parsing stable output. Override either with
+`--format` and `--color`; `NO_COLOR` is honoured.
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--path` | `""` | **(Required)** GitLab group or subgroup path, unless run from a managed subgroup directory. |
+| *(positional)* | current context | Group to list. `.`, `/`, `..`, relative and absolute paths all work. |
 | `--token` | `""` | GitLab access token. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. Required unless `--anon`. |
 | `--anon` | `false` | List public groups and projects anonymously. |
 | `--nested` | `false` | Recurse into nested subgroups. Per-group project counts are only complete in this mode. |
-| `--format` | `text` | `text` (greppable event lines), `tree` (indented tree), or `json`. |
+| `--format` | `auto` | `auto` (tree on a terminal, `text` when piped), `tree`, `text`, or `json`. |
+| `--color` | `auto` | `auto` (only on a terminal), `always`, or `never`. |
+
+`--path` still works in place of the positional argument, but the two cannot be
+combined.
 
 ---
 

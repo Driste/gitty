@@ -28,6 +28,9 @@ type gitlabSource interface {
 	// Projects returns the projects directly in target, or all projects
 	// including those in subgroups when nested is true.
 	Projects(target string, nested bool) ([]*gitlab.Project, error)
+	// TopLevelGroups returns the instance's top-level groups — the namespaces
+	// visible to the caller, with no parent.
+	TopLevelGroups() ([]*gitlab.Group, error)
 }
 
 // gitRunner executes a git command in dir with extra environment entries and
@@ -830,6 +833,9 @@ func hostsMatch(configURL, cloneURL string) (bool, error) {
 // handling pagination for each listing.
 type gitlabClientSource struct {
 	client *gitlab.Client
+	// authenticated records whether a token was supplied, which decides
+	// whether a top-level listing can be scoped to the caller's memberships.
+	authenticated bool
 }
 
 func (s gitlabClientSource) Subgroups(target string, nested bool) ([]*gitlab.Group, error) {
@@ -871,6 +877,38 @@ func (s gitlabClientSource) Subgroups(target string, nested bool) ([]*gitlab.Gro
 func (s gitlabClientSource) Group(target string) (*gitlab.Group, error) {
 	g, _, err := s.client.Groups.GetGroup(target, nil)
 	return g, err
+}
+
+// maxTopLevelPages bounds the top-level group listing. An unauthenticated
+// listing on a large instance would otherwise walk every public group on it.
+const maxTopLevelPages = 10
+
+func (s gitlabClientSource) TopLevelGroups() ([]*gitlab.Group, error) {
+	var all []*gitlab.Group
+	topLevel := true
+	opts := &gitlab.ListGroupsOptions{
+		TopLevelOnly: &topLevel,
+		ListOptions:  gitlab.ListOptions{PerPage: 100, Page: 1},
+	}
+	// With credentials, restrict the listing to namespaces the caller is
+	// actually a member of — "my groups" is the useful answer, and an
+	// unrestricted listing returns every group visible on the instance.
+	if s.authenticated {
+		level := gitlab.GuestPermissions
+		opts.MinAccessLevel = &level
+	}
+	for page := 0; page < maxTopLevelPages; page++ {
+		groups, resp, err := s.client.Groups.ListGroups(opts)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, groups...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return all, nil
 }
 
 func (s gitlabClientSource) Projects(target string, nested bool) ([]*gitlab.Project, error) {
