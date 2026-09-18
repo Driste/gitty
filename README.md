@@ -138,7 +138,7 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | `--nested` | `false` | Include nested subgroups and projects recursively. |
 | `--dry-run`| `false` | Print planned actions (`plan clone <path>` etc.) without creating directories or executing git commands. Dry-run output is diffable against a real run's actions and produces the identical `summary` line. |
 | `--jobs` | `4` | Number of concurrent repo clone/pull operations (1-16). `--jobs=1` restores fully serial behavior. |
-| `--verbose` | `false` | Print each git invocation and its output to stderr, with URL credentials redacted. |
+| `--verbose` | `false` | Print gitty's version, each git invocation and its output, and — after every clone or pull — the origin URL git itself resolved from inside the checkout, so you can see whether a `url.<base>.insteadOf` rule took effect. URL credentials are redacted. |
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
 | `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
 | `--allow-clone-host` | `""` | Record an extra host this run expects to clone from, silencing the note about it. Repeatable, or comma-separated. Adds to whatever `init` stored. |
@@ -160,6 +160,19 @@ reach from where gitty runs, and you map it back to the internal one:
 ```
 
 gitty follows it. No flag, no workspace setting.
+
+To watch it happen, run with `--verbose`: after each clone or pull gitty asks
+git — from inside that checkout, where all of your configuration is in effect
+— what the origin resolves to, and prints it:
+
+```
+acme/app: origin https://git.internal/acme/app.git (rewritten by git config from https://gitlab.external.example.com/acme/app.git)
+```
+
+If that line shows the URL you expected, your config is being used. If it shows
+the unrewritten URL, git itself did not apply the rule from that directory —
+which is a question about the rule (its `includeIf` condition, its prefix, the
+`HOME` gitty was started with), not about gitty.
 
 **Conditional includes work too.** If that rule lives in a file pulled in by an
 `includeIf`:
