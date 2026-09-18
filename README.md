@@ -129,7 +129,7 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | :--- | :--- | :--- |
 | `--path` | `""` | **(Required)** The GitLab group or subgroup path (e.g., `tenant/images`). |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
-| `--anon` | `false` | Sync public groups and repositories anonymously, without a token. Only public resources are visible in this mode. |
+| `--anon` | `false` | Sync public groups and repositories anonymously. Any `GITLAB_TOKEN` / `CI_JOB_TOKEN` in the environment is ignored, so a stale token cannot turn an anonymous run into a 401. Conflicts with `--token`. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
 | `--repos` | `false` | Only fetch and clone/pull repositories. *(Note: If neither `--groups` nor `--repos` is passed, it defaults to `--repos`)*. |
 | `--nested` | `false` | Include nested subgroups and projects recursively. |
@@ -207,6 +207,21 @@ summary cloned=3 pulled=12 skipped=0 errors=1   # always the last line
 Exit codes: `0` success · `1` completed with per-item failures · `2` usage or
 configuration error · `130` interrupted (Ctrl-C; git is signalled cleanly and
 a re-run recovers the workspace).
+
+### Token scopes
+
+Because gitty clones over HTTP(S), the token does two jobs: it reads the API
+*and* authenticates git. A token with only `api` or `read_api` can list groups
+but **cannot clone** — it needs **`read_repository`** as well. That combination
+fails in a confusing way (the listing works, every clone 401s), so gitty
+detects it and says so:
+
+```
+hint: gitty clones over HTTP(S) and authenticated git with the GITLAB_TOKEN
+token. That token needs the read_repository scope — 'api' or 'read_api' alone
+lets it list groups but not clone. Re-run 'gitty init --force --ssh' to clone
+with SSH keys instead.
+```
 
 ### Authentication for HTTP clones
 

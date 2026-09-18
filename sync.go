@@ -176,6 +176,38 @@ func (s *syncer) reportGitFailure(path string, args []string, out []byte, err er
 		}
 	}
 	fmt.Fprintf(s.errOut, "--- end %s ---\n", path)
+	if hint := s.authFailureHint(out); hint != "" {
+		fmt.Fprintln(s.errOut, hint)
+	}
+}
+
+// authFailureHint returns guidance when git's output looks like an HTTP
+// authentication or authorization failure. Since gitty clones over HTTP(S),
+// the usual cause is a token that can reach the API but not the repositories:
+// GitLab's `api` and `read_api` scopes do not grant git access, which
+// `read_repository` does. That is easy to misread as "my token is wrong" when
+// the same token works fine for listing groups.
+func (s *syncer) authFailureHint(out []byte) string {
+	if !s.cfg.HTTP || s.cred.token == "" {
+		return ""
+	}
+	lower := strings.ToLower(string(out))
+	for _, marker := range []string{
+		"authentication failed",
+		"http basic: access denied",
+		"401 unauthorized",
+		"403 forbidden",
+		"could not read username",
+	} {
+		if strings.Contains(lower, marker) {
+			return fmt.Sprintf(
+				"hint: gitty clones over HTTP(S) and authenticated git with the %s token. "+
+					"That token needs the read_repository scope — 'api' or 'read_api' alone "+
+					"lets it list groups but not clone. Re-run 'gitty init --force --ssh' to "+
+					"clone with SSH keys instead.", s.cred.source)
+		}
+	}
+	return ""
 }
 
 // syncOptions bundles the sync command's flags.
@@ -538,6 +570,22 @@ func resolveCredential(flagToken string) credential {
 		return credential{token: t, username: "gitlab-ci-token", source: "CI_JOB_TOKEN"}
 	}
 	return credential{}
+}
+
+// resolveCredentialFor applies the same order, except that --anon means
+// anonymous: an ambient GITLAB_TOKEN or CI_JOB_TOKEN in the environment is
+// ignored rather than silently used. Without this, a stale, expired or
+// wrongly-scoped token left in the shell turns an explicitly anonymous run
+// into a 401. Combining --anon with an explicit --token is contradictory and
+// is reported as a usage error.
+func resolveCredentialFor(flagToken string, anon bool) (credential, error) {
+	if !anon {
+		return resolveCredential(flagToken), nil
+	}
+	if flagToken != "" {
+		return credential{}, usageErrf("--anon and --token are mutually exclusive")
+	}
+	return credential{}, nil
 }
 
 // resolveToken returns just the token from the fixed resolution order.
