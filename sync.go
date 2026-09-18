@@ -264,6 +264,9 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.jobs = opts.Jobs
 	s.cfg.AllowCloneHosts(opts.AllowCloneHosts)
 
+	if s.verbose {
+		s.diagf("gitty %s", versionString())
+	}
 	if s.verbose && s.credentialEnv() != nil {
 		s.diagf("HTTP auth: injecting %s credential (username %s) via askpass", s.cred.source, s.cred.username)
 	}
@@ -481,6 +484,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		}
 		if err := s.runGit(ctx, p.PathWithNamespace, repoDest, env, args...); err == nil {
 			s.event("pull", p.PathWithNamespace)
+			s.reportResolvedOrigin(ctx, p.PathWithNamespace, repoDest, cloneURL)
 		}
 		return
 	}
@@ -530,7 +534,28 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 	env = append(env, s.sshEnvFor(effective)...)
 	if err := s.runGit(ctx, p.PathWithNamespace, ".", env, args...); err == nil {
 		s.event(kind, p.PathWithNamespace)
+		s.reportResolvedOrigin(ctx, p.PathWithNamespace, repoDest, cloneURL)
 	}
+}
+
+// reportResolvedOrigin says, under --verbose, which URL git actually used for
+// a checkout's origin — resolved by git itself, from inside the repository,
+// where every part of the user's configuration is in effect. That is the
+// ground truth no pre-clone guess can be, and the quickest way to confirm
+// whether a url.<base>.insteadOf rule took effect on a given repository.
+func (s *syncer) reportResolvedOrigin(ctx context.Context, path, dir, advertised string) {
+	if !s.verbose {
+		return
+	}
+	resolved := s.effectiveURL(ctx, dir, "origin")
+	if resolved == "origin" {
+		return // the probe failed; nothing trustworthy to report
+	}
+	if advertised != "" && resolved != advertised {
+		s.diagf("%s: origin %s (rewritten by git config from %s)", path, redactURL(resolved), redactURL(advertised))
+		return
+	}
+	s.diagf("%s: origin %s", path, redactURL(resolved))
 }
 
 // execGit runs a git command with the user's environment (SSH_AUTH_SOCK,
@@ -646,9 +671,9 @@ func (s *syncer) noteForeignHost(what, rawURL, effective string) {
 		return
 	}
 	s.hintOnce.Do(func() {
-		s.diagf("note: %s %s is not on the configured instance %s; git decides the final URL (url.insteadOf rules apply) and any token travels with it",
+		s.diagf("note: %s %s is not on the configured instance %s; git decides where that really goes (your url.insteadOf rules apply, including ones in conditional includes that are only visible from inside a repository) and any token travels with it",
 			what, redactURL(effective), s.cfg.URL)
-		s.diagf("hint: if that is expected, list the host with --allow-clone-host=<host> to silence this note")
+		s.diagf("hint: --verbose shows the URL git actually resolved for each repository; if this host is expected, list it with --allow-clone-host=<host> to silence this note")
 	})
 }
 

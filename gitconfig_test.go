@@ -19,6 +19,7 @@ type configAwareGit struct {
 	calls   [][]string
 	envs    [][]string
 	origin  string
+	cloned  string // URL of the last recorded clone, which "origin" then names
 	rewrite func(string) string
 }
 
@@ -26,17 +27,29 @@ func (g *configAwareGit) run(ctx context.Context, dir string, extraEnv []string,
 	g.mu.Lock()
 	g.calls = append(g.calls, append([]string{dir}, args...))
 	g.envs = append(g.envs, extraEnv)
-	origin, rewrite := g.origin, g.rewrite
+	if sub := gitSubArgs(append([]string{dir}, args...)); len(sub) >= 2 && sub[0] == "clone" {
+		g.cloned = sub[1]
+	}
+	origin, cloned, rewrite := g.origin, g.cloned, g.rewrite
 	g.mu.Unlock()
 
 	switch {
 	case len(args) == 3 && args[0] == "config" && args[2] == "remote.origin.url":
 		return []byte(origin + "\n"), nil
 	case len(args) == 3 && args[0] == "ls-remote" && args[1] == "--get-url":
-		if rewrite == nil {
-			return []byte(args[2] + "\n"), nil
+		// Like git: a remote name resolves to its configured URL first, and
+		// the rewrite rules apply to the result.
+		u := args[2]
+		if u == "origin" {
+			u = origin
+			if u == "" {
+				u = cloned
+			}
 		}
-		return []byte(rewrite(args[2]) + "\n"), nil
+		if rewrite != nil {
+			u = rewrite(u)
+		}
+		return []byte(u + "\n"), nil
 	}
 	return nil, nil
 }
@@ -317,4 +330,71 @@ func TestAllowCloneHostsIsAdditive(t *testing.T) {
 	if len(cfg.CloneHosts) != 2 {
 		t.Errorf("clone_hosts should be additive, got %v", cfg.CloneHosts)
 	}
+}
+
+// Under --verbose gitty reports the origin URL git itself resolved from inside
+// the checkout — the one place every part of the user's configuration is in
+// effect — so whether a rewrite took effect is visible per repository.
+func TestVerboseReportsResolvedOrigin(t *testing.T) {
+	t.Run("clone", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+
+		git := &configAwareGit{
+			rewrite: func(u string) string {
+				return strings.Replace(u, "https://gitlab.example.com/", "https://git.internal/", 1)
+			},
+		}
+		s, _, stderr := newTestSyncer(
+			&Config{URL: "https://gitlab.example.com", HTTP: true},
+			oneProject("https://gitlab.example.com/acme/repo.git"),
+			git.run,
+		)
+		s.jobs = 1
+		s.verbose = true
+		s.syncRepos(context.Background(), "acme")
+
+		want := "acme/repo: origin https://git.internal/acme/repo.git (rewritten by git config from https://gitlab.example.com/acme/repo.git)"
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing resolved-origin line %q in:\n%s", want, stderr.String())
+		}
+	})
+
+	t.Run("pull", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		mkRepo(t, "acme/repo")
+
+		git := &configAwareGit{origin: "https://gitlab.example.com/acme/repo.git"}
+		s, _, stderr := newTestSyncer(
+			&Config{URL: "https://gitlab.example.com", HTTP: true},
+			oneProject("https://gitlab.example.com/acme/repo.git"),
+			git.run,
+		)
+		s.jobs = 1
+		s.verbose = true
+		s.syncRepos(context.Background(), "acme")
+
+		if !strings.Contains(stderr.String(), "acme/repo: origin https://gitlab.example.com/acme/repo.git\n") {
+			t.Errorf("missing resolved-origin line in:\n%s", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "rewritten by git config") {
+			t.Errorf("no rewrite happened, but one was reported:\n%s", stderr.String())
+		}
+	})
+
+	t.Run("silent without verbose", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+
+		git := &configAwareGit{}
+		s, _, stderr := newTestSyncer(
+			&Config{URL: "https://gitlab.example.com", HTTP: true},
+			oneProject("https://gitlab.example.com/acme/repo.git"),
+			git.run,
+		)
+		s.jobs = 1
+		s.syncRepos(context.Background(), "acme")
+
+		if strings.Contains(stderr.String(), "origin https://") {
+			t.Errorf("resolved origin should only be reported under --verbose:\n%s", stderr.String())
+		}
+	})
 }

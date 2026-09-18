@@ -134,6 +134,9 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		out:               os.Stdout,
 		errOut:            os.Stderr,
 	}
+	if opts.Verbose {
+		s.diagf("gitty %s", versionString())
+	}
 
 	wd, err := os.Getwd()
 	if err != nil {
