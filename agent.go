@@ -107,7 +107,7 @@ func buildAgentSchema() AgentSchema {
 						},
 						"allow-clone-host": {
 							Type:        "string",
-							Description: "An additional host whose repositories may be cloned and sent this workspace's token, beyond the instance's own host. Needed when the API itself advertises clone URLs on a different host; a host reached via a url.<base>.insteadOf rewrite in the local git config needs no flag, because gitty always follows those rewrites. Repeatable, and also accepts a comma-separated list.",
+							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
 						},
 					},
 				},
@@ -178,7 +178,7 @@ func buildAgentSchema() AgentSchema {
 						},
 						"allow-clone-host": {
 							Type:        "string",
-							Description: "An additional host whose repositories may be cloned and sent this workspace's token, beyond the instance's own host. Needed when the API itself advertises clone URLs on a different host; a host reached via a url.<base>.insteadOf rewrite in the local git config needs no flag, because gitty always follows those rewrites. Repeatable, and also accepts a comma-separated list.",
+							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
 						},
 					},
 					Required: []string{"path"},
@@ -226,7 +226,7 @@ func buildAgentSchema() AgentSchema {
 						},
 						"allow-clone-host": {
 							Type:        "string",
-							Description: "An additional host whose repositories may be cloned and sent this workspace's token, beyond the instance's own host. Needed when the API itself advertises clone URLs on a different host; a host reached via a url.<base>.insteadOf rewrite in the local git config needs no flag, because gitty always follows those rewrites. Repeatable, and also accepts a comma-separated list.",
+							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
 						},
 					},
 				},

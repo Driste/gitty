@@ -125,9 +125,9 @@ func TestCloneIsNeverPinned(t *testing.T) {
 	}
 }
 
-// The rewrite is the user's own configuration, so where it points is their
-// decision — including a host the workspace never heard of.
-func TestRewriteAuthorizesAnyHost(t *testing.T) {
+// Where a URL ends up is the local git config's decision, including a host
+// the workspace never heard of.
+func TestRewriteDestinationIsFollowed(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	git := &configAwareGit{
@@ -151,26 +151,26 @@ func TestRewriteAuthorizesAnyHost(t *testing.T) {
 	}
 }
 
-// What the API advertises is still checked, because that destination is
-// remote-controlled rather than something the user configured locally.
-func TestUnrewrittenCloneHostIsChecked(t *testing.T) {
+// An unexpected host is reported but never blocks git. gitty cannot resolve a
+// `[includeIf "gitdir:..."]` rewrite from outside the repository, so a refusal
+// based on its own guess would break exactly the setups those rewrites serve.
+func TestUnexpectedCloneHostIsNotedNotBlocked(t *testing.T) {
 	tests := []struct {
 		name       string
 		cloneHosts []string
-		wantClone  bool
+		wantNote   bool
 	}{
-		{name: "rejected without an allow list", wantClone: false},
-		{name: "accepted once allowed", cloneHosts: []string{"git.internal"}, wantClone: true},
-		{name: "a different allowed host does not help", cloneHosts: []string{"other.internal"}, wantClone: false},
+		{name: "unlisted host is noted", wantNote: true},
+		{name: "listed host is silent", cloneHosts: []string{"git.internal"}, wantNote: false},
+		{name: "a different listed host still notes", cloneHosts: []string{"other.internal"}, wantNote: true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Chdir(t.TempDir())
 
-			// No rewrite: the API's own answer is the destination.
 			git := &configAwareGit{}
-			s, stdout, _ := newTestSyncer(
+			s, stdout, stderr := newTestSyncer(
 				&Config{URL: "https://gitlab.example.com", HTTP: true, CloneHosts: tc.cloneHosts},
 				oneProject("https://git.internal/acme/repo.git"),
 				git.run,
@@ -179,11 +179,15 @@ func TestUnrewrittenCloneHostIsChecked(t *testing.T) {
 			s.syncRepos(context.Background(), "acme")
 
 			assertEventLines(t, stdout)
-			if cloned := git.sawNetworkCall(); cloned != tc.wantClone {
-				t.Errorf("clone attempted = %v, want %v (stdout: %q)", cloned, tc.wantClone, stdout.String())
+			if !git.sawNetworkCall() {
+				t.Errorf("the clone must always be attempted, stdout: %q", stdout.String())
 			}
-			if !tc.wantClone && !strings.Contains(stdout.String(), "error acme/repo clone URL host") {
-				t.Errorf("expected a clone URL host error event, got %q", stdout.String())
+			if s.counts.errors != 0 {
+				t.Errorf("errors = %d, want 0", s.counts.errors)
+			}
+			noted := strings.Contains(stderr.String(), "--allow-clone-host")
+			if noted != tc.wantNote {
+				t.Errorf("noted = %v, want %v (stderr: %q)", noted, tc.wantNote, stderr.String())
 			}
 		})
 	}
@@ -213,8 +217,8 @@ func TestHostMismatchHintIsPrintedOnce(t *testing.T) {
 	if n := strings.Count(stderr.String(), "--allow-clone-host"); n != 1 {
 		t.Errorf("hint printed %d times, want exactly 1:\n%s", n, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "insteadOf") {
-		t.Errorf("hint should mention the git-config route, got %q", stderr.String())
+	if !strings.Contains(stderr.String(), "url.insteadOf") {
+		t.Errorf("note should say git has the final word, got %q", stderr.String())
 	}
 }
 

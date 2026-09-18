@@ -469,16 +469,16 @@ func TestSyncReposCountsGitFailures(t *testing.T) {
 	}
 }
 
-func TestSyncReposRejectsForeignHost(t *testing.T) {
+func TestSyncReposNotesForeignHost(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	rec := &recordingGit{}
-	s, stdout, _ := newTestSyncer(
+	s, stdout, stderr := newTestSyncer(
 		&Config{URL: "https://gitlab.com", HTTP: true},
 		fakeSource{
 			projects: map[string][]*gitlab.Project{
 				"acme": {
-					{PathWithNamespace: "acme/repo", HTTPURLToRepo: "https://evil.example.com/acme/repo.git"},
+					{PathWithNamespace: "acme/repo", HTTPURLToRepo: "https://other.example.com/acme/repo.git"},
 				},
 			},
 		},
@@ -486,14 +486,21 @@ func TestSyncReposRejectsForeignHost(t *testing.T) {
 	)
 
 	s.syncRepos(context.Background(), "acme")
-	if s.counts.errors != 1 {
-		t.Errorf("errors = %d, want 1 (foreign host rejected)", s.counts.errors)
+
+	// gitty reports the unexpected host but does not override git: where a URL
+	// ends up is the local git configuration's decision, and gitty cannot see
+	// a gitdir-conditional rewrite from outside the repository anyway.
+	if s.counts.errors != 0 {
+		t.Errorf("errors = %d, want 0 (a foreign host is a note, not a refusal)", s.counts.errors)
 	}
-	if !strings.Contains(stdout.String(), "error acme/repo clone URL host does not match") {
-		t.Errorf("missing host-mismatch error event:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "clone acme/repo") {
+		t.Errorf("expected the clone to proceed:\n%s", stdout.String())
 	}
-	if rec.callCount() != 0 {
-		t.Errorf("git should not run for a foreign host, got calls: %v", rec.calls)
+	if !strings.Contains(stderr.String(), "other.example.com") {
+		t.Errorf("expected a note naming the host:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--allow-clone-host") {
+		t.Errorf("note should say how to silence it:\n%s", stderr.String())
 	}
 }
 
