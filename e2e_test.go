@@ -148,6 +148,12 @@ type fakeGitLab struct {
 	gitAuthUser string
 	gitAuthPass string
 
+	// authUser and authScopes back the /user and
+	// /personal_access_tokens/self endpoints used by init's token check.
+	// authScopes nil means the instance does not support introspection.
+	authUser   string
+	authScopes []string
+
 	groups      map[string]apiGroup
 	subgroups   map[string][]apiGroup
 	descendants map[string][]apiGroup
@@ -214,6 +220,28 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if f.rejectAnyToken && r.Header.Get("PRIVATE-TOKEN") != "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "401 Unauthorized"})
+		return
+	}
+
+	// Endpoints backing `gitty init`'s token check.
+	if r.URL.Path == "/api/v4/user" {
+		if f.authUser == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "401 Unauthorized"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"username": f.authUser})
+		return
+	}
+	if r.URL.Path == "/api/v4/personal_access_tokens/self" {
+		if f.authScopes == nil {
+			// Stand in for an instance too old to support introspection.
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "404 Not Found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": 1, "name": "test", "scopes": f.authScopes,
+			"active": true, "revoked": false,
+		})
 		return
 	}
 
@@ -518,6 +546,123 @@ func TestE2EScopeHintOnCloneAuthFailure(t *testing.T) {
 		t.Errorf("expected a token-scope hint on stderr:\n%s", stderr)
 	}
 	assertNoTokenAnywhere(t, token, ws, stdout, stderr)
+}
+
+// TestE2EInitVerifiesToken covers the token check `gitty init` runs so that a
+// missing, rejected or under-scoped token is reported up front rather than as
+// a confusing 401 part-way through a sync.
+func TestE2EInitVerifiesToken(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-init-check"
+
+	newServer := func(t *testing.T, scopes []string) *fakeGitLab {
+		f := newFakeGitLab(t)
+		f.requireToken = token
+		f.authUser = "alice"
+		f.authScopes = scopes
+		return f
+	}
+
+	t.Run("no token at all", func(t *testing.T) {
+		f := newFakeGitLab(t)
+		ws := t.TempDir()
+		stdout, stderr, code := runGitty(t, ws, nil, "init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0 (the check is advisory):\n%s\n%s", code, stdout, stderr)
+		}
+		for _, want := range []string{"No GitLab token found", "export GITLAB_TOKEN=", "--anon"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("stderr missing %q:\n%s", want, stderr)
+			}
+		}
+	})
+
+	t.Run("rejected token", func(t *testing.T) {
+		f := newServer(t, []string{"api"})
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=wrong-token"},
+			"init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0", code)
+		}
+		if !strings.Contains(stderr, "REJECTED") {
+			t.Errorf("stderr should report the rejection:\n%s", stderr)
+		}
+	})
+
+	t.Run("api-only token warns about cloning", func(t *testing.T) {
+		f := newServer(t, []string{"read_api"})
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0:\n%s", code, stderr)
+		}
+		for _, want := range []string{"@alice", "Scopes: read_api", "WARNING", "read_repository"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("stderr missing %q:\n%s", want, stderr)
+			}
+		}
+	})
+
+	t.Run("sufficient token is reported clean", func(t *testing.T) {
+		f := newServer(t, []string{"read_api", "read_repository"})
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0:\n%s", code, stderr)
+		}
+		if !strings.Contains(stderr, "@alice") {
+			t.Errorf("stderr should name the authenticated user:\n%s", stderr)
+		}
+		if strings.Contains(stderr, "WARNING") {
+			t.Errorf("a sufficient token should raise no warning:\n%s", stderr)
+		}
+	})
+
+	t.Run("instance without introspection says scopes are unknown", func(t *testing.T) {
+		f := newServer(t, nil) // /personal_access_tokens/self returns 404
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url="+f.srv.URL)
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0:\n%s", code, stderr)
+		}
+		if !strings.Contains(stderr, "did not report the token's scopes") {
+			t.Errorf("stderr should say scopes are unknown:\n%s", stderr)
+		}
+	})
+
+	t.Run("--verify=false skips the check entirely", func(t *testing.T) {
+		f := newServer(t, []string{"read_api"})
+		ws := t.TempDir()
+		_, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url="+f.srv.URL, "--verify=false")
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0:\n%s", code, stderr)
+		}
+		if strings.Contains(stderr, "Scopes:") || strings.Contains(stderr, "No GitLab token") {
+			t.Errorf("--verify=false should not run the check:\n%s", stderr)
+		}
+	})
+
+	t.Run("an unreachable instance does not fail init", func(t *testing.T) {
+		ws := t.TempDir()
+		stdout, stderr, code := runGitty(t, ws, []string{"GITLAB_TOKEN=" + token},
+			"init", "--url=http://127.0.0.1:1") // nothing listening
+		if code != 0 {
+			t.Fatalf("init exit = %d, want 0 — an offline init must still work:\n%s\n%s",
+				code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "Initialized gitty root") {
+			t.Errorf("the workspace should still be created:\n%s", stdout)
+		}
+		if strings.Contains(stderr, "REJECTED") {
+			t.Errorf("an unreachable instance must not be reported as a bad token:\n%s", stderr)
+		}
+	})
 }
 
 func TestE2EInitTransportDefaults(t *testing.T) {

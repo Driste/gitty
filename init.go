@@ -21,7 +21,7 @@ func validateInstanceURL(raw string) error {
 	return nil
 }
 
-func runInit(rawURL string, useHTTP, force bool) error {
+func runInit(rawURL string, useHTTP, force, verify bool, tokenFlag string) error {
 	if err := validateInstanceURL(rawURL); err != nil {
 		return err
 	}
@@ -60,5 +60,15 @@ func runInit(rawURL string, useHTTP, force bool) error {
 	fmt.Printf("Initialized gitty root at %s\n", wd)
 	fmt.Printf("Cloning over %s\n", transport)
 	fmt.Println("You can now run 'gitty sync --path=<path>' to pull down repositories.")
+
+	// Check the credential now, while there is somewhere to put the answer.
+	// Finding out that a token is missing, expired or missing a scope here is
+	// far cheaper than discovering it part-way through a sync. Advisory only:
+	// the workspace exists either way, and it comes last so the guidance is
+	// the final thing on screen.
+	if verify {
+		fmt.Fprintln(os.Stderr)
+		checkAuthForInit(os.Stderr, cfg, tokenFlag)
+	}
 	return nil
 }

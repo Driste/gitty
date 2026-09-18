@@ -202,9 +202,10 @@ func (s *syncer) authFailureHint(out []byte) string {
 		if strings.Contains(lower, marker) {
 			return fmt.Sprintf(
 				"hint: gitty clones over HTTP(S) and authenticated git with the %s token. "+
-					"That token needs the read_repository scope — 'api' or 'read_api' alone "+
-					"lets it list groups but not clone. Re-run 'gitty init --force --ssh' to "+
-					"clone with SSH keys instead.", s.cred.source)
+					"That token needs the %s scope (or %s) — %s alone lets it list groups "+
+					"but not clone. Re-run 'gitty init' to check the token's scopes, or "+
+					"'gitty init --force --ssh' to clone with SSH keys instead.",
+				s.cred.source, scopeReadRepo, scopeAPI, scopeReadAPI)
 		}
 	}
 	return ""

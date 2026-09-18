@@ -58,7 +58,7 @@ func TestRunSyncErrorsWithoutConfig(t *testing.T) {
 func TestRunSyncErrorsWithoutTokenOrAnon(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := runInit("https://gitlab.com", true, false); err != nil {
+	if err := runInit("https://gitlab.com", true, false, false, ""); err != nil {
 		t.Fatalf("runInit: %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestRunInitWritesConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	if err := runInit("https://gitlab.custom.io", true, false); err != nil {
+	if err := runInit("https://gitlab.custom.io", true, false, false, ""); err != nil {
 		t.Fatalf("runInit: %v", err)
 	}
 

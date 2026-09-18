@@ -82,11 +82,19 @@ Writes `.gitty/config` in the current directory. Run once in the root folder.
 | `--ssh`   | boolean | `false`                 | Clone over SSH (`git@...`) with local SSH keys. |
 | `--http`  | boolean | `true`                  | Clone over HTTP(S). The default; accepted for compatibility, conflicts with `--ssh`. |
 | `--force` | boolean | `false`                 | Overwrite an existing `.gitty/config`; without it, re-init refuses (exit 2). |
+| `--token` | string  | `""`                    | Token to verify; falls back to env vars. Never stored. |
+| `--verify`| boolean | `true`                  | Check the token against the instance and report its scopes. Advisory: never fails init. |
 
 ```bash
 cd ~/my-workspace
 gitty init --url="https://gitlab.mycompany.com"
 ```
+
+`init` verifies the resolved token: it reports the authenticated user, the
+token's scopes where the instance supports introspection, and warns when a
+scope needed by this workspace is missing (notably `read_repository` for an
+HTTP workspace). Missing, rejected and unreachable are reported distinctly.
+The check never fails init; `--verify=false` skips it.
 
 ### `gitty sync` — clone/pull a group
 

@@ -908,7 +908,7 @@ func TestSyncReposParallelCountsAndEvents(t *testing.T) {
 func TestJobsValidation(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := runInit("https://gitlab.com", true, false); err != nil {
+	if err := runInit("https://gitlab.com", true, false, false, ""); err != nil {
 		t.Fatal(err)
 	}
 

@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "2.0.0"
+const AgentSchemaVersion = "2.1.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -95,6 +95,15 @@ func buildAgentSchema() AgentSchema {
 							Type:        "boolean",
 							Description: "Overwrite an existing .gitty/config. Without this, init refuses to clobber an initialized workspace.",
 							Default:     false,
+						},
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token to verify. Falls back to GITLAB_TOKEN or CI_JOB_TOKEN. Used only for the verification check; it is never stored in the workspace.",
+						},
+						"verify": {
+							Type:        "boolean",
+							Description: "Check the token against the instance and report the authenticated user, the token's scopes, and any scope this workspace needs but the token lacks (notably read_repository for HTTP cloning). Advisory only: it never fails init. Set false for offline setup.",
+							Default:     true,
 						},
 					},
 				},
