@@ -73,6 +73,7 @@ func gittyEnv(extraEnv []string) []string {
 // stderr, and tests assert against the correct stream.
 func runGitty(t *testing.T, dir string, extraEnv []string, args ...string) (string, string, int) {
 	t.Helper()
+	publishFixtures()
 	cmd := exec.Command(gittyBin, args...)
 	cmd.Dir = dir
 	cmd.Env = gittyEnv(extraEnv)
@@ -88,6 +89,14 @@ func runGitty(t *testing.T, dir string, extraEnv []string, args ...string) (stri
 		return stdout.String(), stderr.String(), ee.ExitCode()
 	}
 	return stdout.String(), stderr.String(), 0
+}
+
+// publishFixtures makes every fixture written so far visible to the fake
+// server's handlers. Call it immediately before anything that makes the
+// server serve a request.
+func publishFixtures() {
+	fixtureGate.Lock()
+	fixtureGate.Unlock() //nolint:staticcheck // the edge is the point, not the critical section
 }
 
 // gitRun executes git with a fixed identity for repo fixtures.
@@ -179,7 +188,19 @@ func newFakeGitLab(t *testing.T) *fakeGitLab {
 	return f
 }
 
+// fixtureGate orders the fixture fields a test sets on its own goroutine
+// against the fake server's handler goroutines. httptest starts serving inside
+// newFakeGitLab, before the test has filled in its groups, projects and auth
+// settings, so without an explicit edge those writes race every handler read.
+// Handlers take the read side — concurrency tests still need to overlap — and
+// launching the binary takes the write side once, which publishes everything
+// the test set up beforehand.
+var fixtureGate sync.RWMutex
+
 func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fixtureGate.RLock()
+	defer fixtureGate.RUnlock()
+
 	if strings.HasPrefix(r.URL.Path, "/git/") {
 		f.gitHits.Add(1)
 		cur := f.gitInflight.Add(1)
@@ -400,6 +421,7 @@ func (f *fakeGitLab) pushUpdate(t *testing.T, work, name, file, content string) 
 // mid-run. The returned buffers fill as the process writes.
 func startGitty(t *testing.T, dir string, extraEnv []string, args ...string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
+	publishFixtures()
 	cmd := exec.Command(gittyBin, args...)
 	cmd.Dir = dir
 	cmd.Env = gittyEnv(extraEnv)
@@ -1975,5 +1997,165 @@ func TestE2EDivergedCheckoutFailsPull(t *testing.T) {
 	// The local commit must survive: --ff-only never merges or overwrites.
 	if got := readFileT(t, filepath.Join(local, "README.md")); got != "v2-local" {
 		t.Errorf("local README = %q, want v2-local preserved", got)
+	}
+}
+
+// TestE2ERespectGitConfigHonoursInsteadOf is the other half of
+// TestE2EInsteadOfDoesNotHijackHTTPClone: some instances advertise clone URLs
+// on a canonical host that the client cannot reach, and the user bridges that
+// with a url.<base>.insteadOf rule in their git config. Pinning the URL breaks
+// exactly that setup, so --respect-git-config turns the pin off and validates
+// the rewritten URL instead.
+func TestE2ERespectGitConfigHonoursInsteadOf(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	work := f.addRepo(t, "acme/rewritten", map[string]string{"r.txt": "r"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	// The API advertises a canonical host that does not resolve; only the
+	// user's rewrite makes it reachable.
+	const canonical = "https://gitlab.canonical.invalid"
+	f.projects["acme"] = []apiProject{{
+		ID:                150,
+		PathWithNamespace: "acme/rewritten",
+		HTTPURLToRepo:     canonical + "/git/acme/rewritten.git",
+		SSHURLToRepo:      "git@gitlab.canonical.invalid:acme/rewritten.git",
+	}}
+
+	home := t.TempDir()
+	gitconfig := "[url \"" + f.srv.URL + "/\"]\n\tinsteadOf = " + canonical + "/\n"
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(gitconfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "XDG_CONFIG_HOME="}
+
+	ws := initWorkspace(t, f)
+
+	// By default gitty pins the advertised URL, so the mismatch is reported
+	// rather than silently cloned from somewhere else — and the diagnostic
+	// has to point at the way out.
+	stdout, stderr, code := runGitty(t, ws, env, "sync", "--path=acme", "--anon")
+	if code != 1 {
+		t.Fatalf("default sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "error acme/rewritten clone URL host does not match the configured instance\n") {
+		t.Errorf("missing host mismatch event:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "--respect-git-config") {
+		t.Errorf("diagnostic should suggest --respect-git-config:\n%s", stderr)
+	}
+
+	// With the flag, the user's rewrite applies and the clone succeeds.
+	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon", "--respect-git-config")
+	if code != 0 {
+		t.Fatalf("sync --respect-git-config exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/rewritten\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "rewritten", "r.txt")); got != "r" {
+		t.Errorf("cloned file = %q, want r", got)
+	}
+
+	// The pull path honours the rewrite too: git stores the unrewritten URL
+	// as origin, so a re-sync has to resolve it the same way.
+	f.pushUpdate(t, work, "acme/rewritten", "r.txt", "r2")
+	stdout, stderr, code = runGitty(t, ws, env, "sync", "--path=acme", "--anon", "--respect-git-config")
+	if code != 0 {
+		t.Fatalf("re-sync exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "pull acme/rewritten\n") {
+		t.Errorf("missing pull event:\n%s", stdout)
+	}
+
+	// Persisting it in the workspace config must work the same as the flag.
+	ws2 := t.TempDir()
+	if _, _, code := runGitty(t, ws2, env, "init", "--url="+f.srv.URL, "--respect-git-config", "--verify=false"); code != 0 {
+		t.Fatalf("init --respect-git-config exit = %d", code)
+	}
+	stdout, stderr, code = runGitty(t, ws2, env, "sync", "--path=acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync from a respecting workspace exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/rewritten\n") {
+		t.Errorf("missing clone event from the persisted config:\n%s", stdout)
+	}
+}
+
+// TestE2EAllowCloneHost covers the split deployment: the API lives on one host
+// and advertises clone URLs on another. gitty refuses by default — that check
+// is what stops a hostile API response redirecting a clone — and the user
+// names the extra host to opt in.
+func TestE2EAllowCloneHost(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/split", map[string]string{"s.txt": "s"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+
+	// The same test server reached under a different name, so the clone can
+	// really succeed once the host is allowed.
+	gitHost := strings.Replace(f.srv.URL, "127.0.0.1", "localhost", 1)
+	f.projects["acme"] = []apiProject{{
+		ID:                160,
+		PathWithNamespace: "acme/split",
+		HTTPURLToRepo:     gitHost + "/git/acme/split.git",
+		SSHURLToRepo:      "git@example.invalid:acme/split.git",
+	}}
+
+	ws := initWorkspace(t, f)
+
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon")
+	if code != 1 {
+		t.Fatalf("default sync exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "error acme/split clone URL host does not match the configured instance\n") {
+		t.Errorf("missing host mismatch event:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "--allow-clone-host") {
+		t.Errorf("diagnostic should suggest --allow-clone-host:\n%s", stderr)
+	}
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--allow-clone-host=localhost")
+	if code != 0 {
+		t.Fatalf("sync --allow-clone-host exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/split\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "split", "s.txt")); got != "s" {
+		t.Errorf("cloned file = %q, want s", got)
+	}
+
+	// An allow list that does not cover the host is no help.
+	ws2 := t.TempDir()
+	if _, _, code := runGitty(t, ws2, nil, "init", "--url="+f.srv.URL, "--allow-clone-host=elsewhere.invalid", "--verify=false"); code != 0 {
+		t.Fatalf("init --allow-clone-host exit = %d", code)
+	}
+	stdout, _, code = runGitty(t, ws2, nil, "sync", "--path=acme", "--anon")
+	if code != 1 || !strings.Contains(stdout, "error acme/split clone URL host") {
+		t.Errorf("unrelated allowed host should not permit the clone (exit %d):\n%s", code, stdout)
+	}
+
+	// Subgroup workspaces inherit the setting, so syncing from inside one
+	// behaves like syncing from the root.
+	f.subgroups["acme"] = []apiGroup{{ID: 2, FullPath: "acme/team"}}
+	f.groups["acme/team"] = apiGroup{ID: 2, FullPath: "acme/team"}
+	f.projects["acme/team"] = []apiProject{{
+		ID:                161,
+		PathWithNamespace: "acme/team/nested",
+		HTTPURLToRepo:     gitHost + "/git/acme/team/nested.git",
+	}}
+	f.addRepo(t, "acme/team/nested", map[string]string{"n.txt": "n"})
+
+	if _, _, code := runGitty(t, ws, nil, "sync", "--path=acme", "--groups", "--anon", "--allow-clone-host=localhost"); code != 0 {
+		t.Fatalf("group sync exit = %d", code)
+	}
+	stdout, stderr, code = runGitty(t, filepath.Join(ws, "acme", "team"), nil, "sync", "--anon")
+	if code != 0 {
+		t.Fatalf("sync from the subgroup exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/team/nested\n") {
+		t.Errorf("subgroup workspace did not inherit clone_hosts:\n%s\n%s", stdout, stderr)
 	}
 }

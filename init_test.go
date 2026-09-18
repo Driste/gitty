@@ -25,7 +25,7 @@ func TestRunInitDefaultsToHTTP(t *testing.T) {
 
 	// runInit's useHTTP argument is what main derives from --ssh; the default
 	// invocation (no --ssh) must produce an HTTP workspace.
-	if err := runInit("https://gitlab.com", true, false, false, ""); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com", HTTP: true}); err != nil {
 		t.Fatalf("runInit: %v", err)
 	}
 	cfg, err := LoadLocalConfig()
@@ -41,7 +41,7 @@ func TestRunInitSSHIsRecordedExplicitly(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	if err := runInit("https://gitlab.com", false, false, false, ""); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com"}); err != nil {
 		t.Fatalf("runInit: %v", err)
 	}
 	cfg, err := LoadLocalConfig()
@@ -165,11 +165,11 @@ func TestValidateInstanceURL(t *testing.T) {
 func TestRunInitRefusesClobber(t *testing.T) {
 	t.Chdir(t.TempDir())
 
-	if err := runInit("https://first.example.com", true, false, false, ""); err != nil {
+	if err := runInit(initOptions{URL: "https://first.example.com", HTTP: true}); err != nil {
 		t.Fatalf("first init: %v", err)
 	}
 
-	err := runInit("https://second.example.com", false, false, false, "")
+	err := runInit(initOptions{URL: "https://second.example.com"})
 	if err == nil {
 		t.Fatal("second init without --force should fail")
 	}
@@ -190,10 +190,10 @@ func TestRunInitRefusesClobber(t *testing.T) {
 func TestRunInitForceOverwrites(t *testing.T) {
 	t.Chdir(t.TempDir())
 
-	if err := runInit("https://first.example.com", true, false, false, ""); err != nil {
+	if err := runInit(initOptions{URL: "https://first.example.com", HTTP: true}); err != nil {
 		t.Fatalf("first init: %v", err)
 	}
-	if err := runInit("https://second.example.com", false, true, false, ""); err != nil {
+	if err := runInit(initOptions{URL: "https://second.example.com", Force: true}); err != nil {
 		t.Fatalf("forced init: %v", err)
 	}
 
@@ -218,10 +218,10 @@ func TestRunInitOverwritesCorruptConfigOnlyWithForce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runInit("https://gitlab.com", false, false, false, ""); err == nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com"}); err == nil {
 		t.Fatal("init over corrupt config without --force should fail")
 	}
-	if err := runInit("https://gitlab.com", false, true, false, ""); err != nil {
+	if err := runInit(initOptions{URL: "https://gitlab.com", Force: true}); err != nil {
 		t.Fatalf("forced init over corrupt config: %v", err)
 	}
 }

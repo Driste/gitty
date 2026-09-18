@@ -94,6 +94,8 @@ gitty init [flags]
 | `--force` | `false` | Overwrite an existing `.gitty/config`. Without it, `init` refuses to clobber an initialized workspace (which would reset its `root_path`). |
 | `--token` | `""` | Token to verify (falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`). Only used for the check below; it is never stored. |
 | `--verify` | `true` | Check the token against the instance and report its scopes. `--verify=false` skips it (offline installs, CI ordering). |
+| `--allow-clone-host` | `""` | An extra host whose repositories this workspace may clone and send its token to, beyond the instance's own. Repeatable, or comma-separated. |
+| `--respect-git-config` | `false` | Honour `url.<base>.insteadOf` rewrites from your git config instead of pinning the URL gitty selected. |
 
 **gitty clones over HTTP(S) by default.** The token gitty already needs for the
 GitLab API authenticates the clones too, so a fresh workspace works on a CI
@@ -140,6 +142,8 @@ gitty sync --path="your/gitlab/group/path" [flags]
 | `--verbose` | `false` | Print each git invocation and its output to stderr, with URL credentials redacted. |
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
 | `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
+| `--allow-clone-host` | `""` | An extra host whose repositories may be cloned and sent this workspace's token. Repeatable, or comma-separated. Adds to whatever `init` stored. |
+| `--respect-git-config` | `false` | Honour `url.<base>.insteadOf` rewrites from your git config for this run. Adds to whatever `init` stored; it cannot turn a stored setting off. |
 
 ### Transport is exactly what you configured
 
@@ -153,17 +157,64 @@ common global setting, and it would otherwise turn an HTTP workspace into SSH
 clones — the injected HTTPS credentials would stop applying, ssh would ask for
 host-key confirmation, and a CI runner with no SSH key would simply fail. It
 also means the clone-URL host check is meaningful: the URL gitty validates is
-the URL git
-contacts. When gitty overrides such a rule it says so on stderr:
+the URL git contacts. When gitty overrides such a rule it says so on stderr:
 
 ```
 note: local git config rewrites https://gitlab.com/ to git@gitlab.com:
 (url.insteadOf); gitty is overriding that so the URL it selected is the URL
-git uses
+git uses (pass --respect-git-config to honour it instead)
 ```
 
 If you want SSH clones, ask for them directly with `gitty init --ssh` (add
 `--force` to convert an existing workspace) rather than relying on a rewrite.
+
+### When your git config *is* the point (`--respect-git-config`)
+
+The pin is the right default, but some setups depend on the rewrite. If your
+instance advertises clone URLs on a canonical host you cannot reach — a VPN
+name, an internal mirror, an SSH-only egress path — and you bridge that with a
+URL block in your `~/.gitconfig`:
+
+```ini
+[url "https://git.internal/"]
+	insteadOf = https://gitlab.example.com/
+```
+
+then pinning defeats exactly the rule you need, and the clone fails with:
+
+```
+error acme/app clone URL host does not match the configured instance
+```
+
+Pass `--respect-git-config` (or store it with `gitty init --respect-git-config`)
+and gitty stops pinning: git applies your rewrites for clones, pulls and
+fetches just as it would for a `git clone` you typed yourself.
+
+gitty still checks where the credentials are going, but now it checks the
+**rewritten** URL — resolved with `git ls-remote --get-url`, which applies your
+rules without touching the network. So a rewrite that lands back on your
+instance just works, while a stray rule pointing somewhere unexpected is still
+refused before a token is sent.
+
+### Clone URLs on another host (`--allow-clone-host`)
+
+By default the only host gitty will clone from — and send your token to — is
+the instance's own. That check is what stops a compromised or misconfigured
+API response redirecting a clone elsewhere.
+
+Split deployments legitimately break it: the API answers on one host and
+advertises repositories on another. Name the extra host to opt in:
+
+```bash
+gitty sync --path="tenant/images" --allow-clone-host=git.internal
+
+# or store it in the workspace, once:
+gitty init --url="https://gitlab.example.com" --allow-clone-host=git.internal
+```
+
+The flag is repeatable and also accepts a comma-separated list. Stored hosts
+are inherited by the managed subgroup directories `--groups` creates, so
+syncing from inside one behaves the same as syncing from the workspace root.
 
 ### SSH host keys
 
@@ -350,6 +401,9 @@ unknowable rather than zero.
 | `--anon` | `false` | With `--fetch`, contact public repositories without a token. |
 | `--jobs` | `4` | Repositories inspected concurrently (1-16). |
 | `--verbose` | `false` | Print each git invocation to stderr (URLs redacted). |
+| `--accept-new-host-keys` | `false` | With `--fetch` over SSH, record unknown host keys without prompting. |
+| `--allow-clone-host` | `""` | With `--fetch`, an extra host that may be contacted with this workspace's token. Repeatable. |
+| `--respect-git-config` | `false` | With `--fetch`, honour `url.<base>.insteadOf` rewrites from your git config. |
 
 ---
 

@@ -73,6 +73,10 @@ type syncer struct {
 	out    io.Writer
 	errOut io.Writer
 
+	// hintOnce keeps the "how to allow this host" guidance to a single line
+	// per run instead of repeating it for every rejected repository.
+	hintOnce sync.Once
+
 	mu     sync.Mutex
 	counts syncCounts
 }
@@ -227,6 +231,11 @@ type syncOptions struct {
 	RecloneBroken     bool
 	AcceptNewHostKeys bool
 	Jobs              int
+
+	// RespectGitConfig and AllowCloneHosts widen the workspace config for
+	// this run only; see Config.ApplyGitOverrides.
+	RespectGitConfig bool
+	AllowCloneHosts  []string
 }
 
 // maxJobs bounds --jobs: beyond ~16 concurrent clones the bottleneck is the
@@ -254,6 +263,7 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.recloneBroken = opts.RecloneBroken
 	s.acceptNewHostKeys = opts.AcceptNewHostKeys
 	s.jobs = opts.Jobs
+	s.cfg.ApplyGitOverrides(opts.RespectGitConfig, opts.AllowCloneHosts)
 
 	if s.verbose && s.credentialEnv() != nil {
 		s.diagf("HTTP auth: injecting %s credential (username %s) via askpass", s.cred.source, s.cred.username)
@@ -336,10 +346,15 @@ func (s *syncer) syncGroups(ctx context.Context, target string) {
 			continue
 		}
 
+		// Every field but root_path is inherited, so syncing from inside a
+		// managed subgroup directory behaves exactly like syncing from the
+		// workspace root.
 		subCfg := &Config{
-			URL:      s.cfg.URL,
-			HTTP:     s.cfg.HTTP,
-			RootPath: g.FullPath,
+			URL:              s.cfg.URL,
+			HTTP:             s.cfg.HTTP,
+			RootPath:         g.FullPath,
+			RespectGitConfig: s.cfg.RespectGitConfig,
+			CloneHosts:       append([]string(nil), s.cfg.CloneHosts...),
 		}
 		if err := SaveConfigTo(groupDest, subCfg); err != nil {
 			s.event("error", g.FullPath, "saving config failed")
@@ -480,12 +495,11 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		return
 	}
 
-	// Clone (or reclone): verify the clone URL points at the configured
-	// instance before handing it to git, so a compromised or misconfigured
-	// API response cannot redirect the clone to an attacker-controlled host.
-	if ok, err := hostsMatch(s.cfg.URL, cloneURL); err != nil || !ok {
-		s.event("error", p.PathWithNamespace, "clone URL host does not match the configured instance")
-		s.diagf("%s: clone URL %q does not match instance %q", p.PathWithNamespace, redactURL(cloneURL), s.cfg.URL)
+	// Clone (or reclone): verify the URL git will contact points at a host
+	// this workspace trusts, so a compromised or misconfigured API response
+	// cannot redirect the clone to an attacker-controlled host.
+	effective := s.effectiveURL(ctx, ".", cloneURL)
+	if !s.checkRemoteHost(p.PathWithNamespace, "clone URL", cloneURL, effective) {
 		return
 	}
 
@@ -520,10 +534,12 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 	if env != nil {
 		args = append([]string{"-c", "credential.helper="}, args...)
 	}
-	env = append(env, s.sshEnv()...)
-	// Pin the transport: the URL gitty selected and host-checked must be the
-	// URL git actually contacts, whatever insteadOf rules are configured.
-	args = append(insteadOfOverride(cloneURL), args...)
+	env = append(env, s.sshEnvFor(effective)...)
+	// By default pin the transport, so the URL gitty selected and host-checked
+	// is the URL git actually contacts whatever insteadOf rules are
+	// configured. Under --respect-git-config this adds nothing and the user's
+	// rewrites apply — it is the rewritten URL that was host-checked above.
+	args = append(s.urlPin(cloneURL), args...)
 	if err := s.runGit(ctx, p.PathWithNamespace, ".", env, args...); err == nil {
 		s.event(kind, p.PathWithNamespace)
 	}
@@ -618,9 +634,72 @@ func insteadOfOverride(rawURL string) []string {
 	return []string{"-c", "url." + rawURL + ".insteadOf=" + rawURL}
 }
 
+// urlPin is insteadOfOverride, unless this workspace has opted into honouring
+// the local git configuration — in which case gitty adds nothing and lets the
+// user's url.<base>.insteadOf rules rewrite the URL as they normally would.
+func (s *syncer) urlPin(rawURL string) []string {
+	if s.cfg.RespectGitConfig {
+		return nil
+	}
+	return insteadOfOverride(rawURL)
+}
+
+// effectiveURL returns the URL git will actually contact for rawURL once the
+// local git configuration's url.<base>.insteadOf rules have been applied.
+// "git ls-remote --get-url" performs exactly that resolution, and does so
+// without touching the network.
+//
+// When gitty is pinning the URL instead (the default), or the probe fails,
+// rawURL is what git will use and is returned unchanged.
+func (s *syncer) effectiveURL(ctx context.Context, dir, rawURL string) string {
+	if !s.cfg.RespectGitConfig || rawURL == "" {
+		return rawURL
+	}
+	out, err := s.git(ctx, dir, nil, "ls-remote", "--get-url", rawURL)
+	if err != nil {
+		return rawURL
+	}
+	if got := strings.TrimSpace(string(out)); got != "" {
+		return got
+	}
+	return rawURL
+}
+
+// checkRemoteHost validates the host git will really contact, where rawURL is
+// the URL gitty selected and effective is what it resolves to. The check
+// guards the token: a compromised or misconfigured API response must not be
+// able to redirect a clone — and the credentials that go with it — to a host
+// the user never named. Rewrites from the user's own git config are their
+// explicit intent, so when those are honoured it is the rewritten URL that
+// gets validated.
+//
+// false means the caller must not run the command; an error event and a
+// diagnostic have already been emitted.
+func (s *syncer) checkRemoteHost(path, what, rawURL, effective string) bool {
+	ok, err := s.cfg.AllowsHost(effective)
+	if ok && err == nil {
+		return true
+	}
+	s.event("error", path, what+" host does not match the configured instance")
+	s.diagf("%s: %s %q does not match instance %q", path, what, redactURL(effective), s.cfg.URL)
+	if effective != rawURL {
+		s.diagf("%s: local git config rewrote %s to that URL", path, redactURL(rawURL))
+	}
+	s.hostHint()
+	return false
+}
+
+// hostHint prints the way out of a host mismatch, once per run rather than
+// once per repository.
+func (s *syncer) hostHint() {
+	s.hintOnce.Do(func() {
+		s.diagf("hint: if that host is expected, add it with --allow-clone-host=<host>; if your git config rewrites it (url.<base>.insteadOf), re-run with --respect-git-config so gitty uses those rules")
+	})
+}
+
 // warnIfURLRewritten notes once, on stderr, that the local git configuration
-// would redirect the configured instance to another transport, and that gitty
-// is overriding it for this run. "git ls-remote --get-url" resolves insteadOf
+// would redirect the configured instance to another transport, and says which
+// way gitty is resolving that. "git ls-remote --get-url" resolves insteadOf
 // without contacting the network.
 func (s *syncer) warnIfURLRewritten(ctx context.Context) {
 	probe := strings.TrimSuffix(s.cfg.URL, "/") + "/"
@@ -632,7 +711,12 @@ func (s *syncer) warnIfURLRewritten(ctx context.Context) {
 	if got == "" || got == probe {
 		return
 	}
-	s.diagf("note: local git config rewrites %s to %s (url.insteadOf); gitty is overriding that so the URL it selected is the URL git uses",
+	if s.cfg.RespectGitConfig {
+		s.diagf("note: local git config rewrites %s to %s (url.insteadOf); gitty is honouring that (--respect-git-config)",
+			probe, redactURL(got))
+		return
+	}
+	s.diagf("note: local git config rewrites %s to %s (url.insteadOf); gitty is overriding that so the URL it selected is the URL git uses (pass --respect-git-config to honour it instead)",
 		probe, redactURL(got))
 }
 
@@ -659,31 +743,42 @@ func (s *syncer) authForCheckout(ctx context.Context, path, dir string, args ...
 	}
 	origin := strings.TrimSpace(string(originOut))
 
+	// Resolve what git will really contact. Under --respect-git-config this
+	// applies the checkout's own insteadOf rules; otherwise it is the origin
+	// verbatim, which the pin below then guarantees.
+	effective := s.effectiveURL(ctx, dir, origin)
+
 	if env != nil {
-		if ok, err := hostsMatch(s.cfg.URL, origin); err != nil || !ok {
-			s.event("error", path, "origin host does not match the configured instance")
-			s.diagf("%s: origin %q does not match instance %q; not sending credentials", path, redactURL(origin), s.cfg.URL)
+		if !s.checkRemoteHost(path, "origin", origin, effective) {
 			return nil, nil, false
 		}
 		args = append([]string{"-c", "credential.helper="}, args...)
-	} else {
-		// Nothing to protect (SSH mode, or anonymous HTTP), but ssh may still
-		// need steering.
-		env = s.sshEnv()
 	}
+	// ssh may still need steering: always in SSH mode, and over HTTP when the
+	// user's git config rewrites this remote to an SSH URL.
+	env = append(env, s.sshEnvFor(effective)...)
 
-	return env, append(insteadOfOverride(origin), args...), true
+	return env, append(s.urlPin(origin), args...), true
 }
 
 // sshEnv returns the extra environment that steers ssh for SSH-mode clones,
 // pulls, and fetches. It is empty unless gitty has something to say: over HTTP
 // ssh is not involved at all, and without --accept-new-host-keys gitty leaves
 // ssh's host-key policy exactly as the user configured it.
+func (s *syncer) sshEnv() []string { return s.sshEnvFor("") }
+
+// sshEnvFor is sshEnv for a remote whose effective URL is known. Over HTTP,
+// ssh is normally not involved — but a workspace honouring the local git
+// config may have its HTTP URL rewritten to an SSH one, in which case ssh is
+// in the path after all and still needs steering.
 //
 // A GIT_SSH_COMMAND the user already set is preserved and extended, so a
 // custom ssh binary or existing options keep working.
-func (s *syncer) sshEnv() []string {
-	if s.cfg.HTTP || !s.acceptNewHostKeys {
+func (s *syncer) sshEnvFor(effectiveURL string) []string {
+	if !s.acceptNewHostKeys {
+		return nil
+	}
+	if s.cfg.HTTP && !isSSHURL(effectiveURL) {
 		return nil
 	}
 	base := strings.TrimSpace(os.Getenv("GIT_SSH_COMMAND"))
@@ -703,8 +798,29 @@ func (s *syncer) sshEnv() []string {
 // repository for the same fingerprint — and the concurrent appends to
 // known_hosts can lose each other's writes. Syncing one repository first lets
 // that happen exactly once.
+//
+// A workspace honouring the local git config counts as SSH-capable even over
+// HTTP: an insteadOf rule may rewrite the clone URLs to SSH, and whether it
+// does is not known until the projects have been listed. Warming up costs one
+// serialized repository, which is far cheaper than getting this wrong.
 func (s *syncer) needsHostKeyWarmup() bool {
-	return !s.cfg.HTTP && !s.dryRun && s.jobs > 1
+	if s.dryRun || s.jobs <= 1 {
+		return false
+	}
+	return !s.cfg.HTTP || s.cfg.RespectGitConfig
+}
+
+// isSSHURL reports whether a git remote URL uses an SSH transport, in either
+// the ssh:// form or the scp-like [user@]host:path form.
+func isSSHURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.Contains(raw, "://") {
+		return strings.HasPrefix(raw, "ssh://") || strings.HasPrefix(raw, "git+ssh://")
+	}
+	return strings.Contains(raw, ":")
 }
 
 // credentialEnv builds the extra environment for a git invocation that may
@@ -815,18 +931,6 @@ func extractHost(raw string) string {
 		return ""
 	}
 	return strings.ToLower(u.Hostname())
-}
-
-// hostsMatch reports whether a clone URL targets the same host as the
-// configured GitLab instance. It returns an error when either host cannot be
-// determined, which callers treat as a mismatch.
-func hostsMatch(configURL, cloneURL string) (bool, error) {
-	ch := extractHost(configURL)
-	rh := extractHost(cloneURL)
-	if ch == "" || rh == "" {
-		return false, fmt.Errorf("could not determine host (config %q, clone %q)", configURL, cloneURL)
-	}
-	return ch == rh, nil
 }
 
 // gitlabClientSource adapts a *gitlab.Client to the gitlabSource interface,

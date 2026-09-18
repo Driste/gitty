@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // validateInstanceURL checks that a GitLab base URL is usable before it is
@@ -21,9 +22,25 @@ func validateInstanceURL(raw string) error {
 	return nil
 }
 
-func runInit(rawURL string, useHTTP, force, verify bool, tokenFlag string) error {
-	if err := validateInstanceURL(rawURL); err != nil {
+// initOptions bundles the init command's flags.
+type initOptions struct {
+	URL              string
+	HTTP             bool
+	Force            bool
+	Verify           bool
+	Token            string
+	RespectGitConfig bool
+	CloneHosts       []string
+}
+
+func runInit(opts initOptions) error {
+	if err := validateInstanceURL(opts.URL); err != nil {
 		return err
+	}
+	for _, h := range opts.CloneHosts {
+		if extractHost(h) == "" {
+			return usageErrf("invalid --allow-clone-host %q: expected a hostname like git.example.com", h)
+		}
 	}
 
 	wd, err := os.Getwd()
@@ -35,7 +52,7 @@ func runInit(rawURL string, useHTTP, force, verify bool, tokenFlag string) error
 	// root_path, which silently re-anchors a managed subgroup directory to the
 	// workspace root and makes the next sync re-clone the entire namespace.
 	confPath := filepath.Join(wd, ConfigDir, ConfigName)
-	if _, statErr := os.Stat(confPath); statErr == nil && !force {
+	if _, statErr := os.Stat(confPath); statErr == nil && !opts.Force {
 		if existing, loadErr := LoadLocalConfig(); loadErr == nil {
 			fmt.Fprintf(os.Stderr, "existing config: url=%s http=%t root_path=%q\n",
 				existing.URL, existing.HTTP, existing.RootPath)
@@ -44,9 +61,11 @@ func runInit(rawURL string, useHTTP, force, verify bool, tokenFlag string) error
 	}
 
 	cfg := &Config{
-		URL:      rawURL,
-		HTTP:     useHTTP,
-		RootPath: "", // The base of your workspace
+		URL:              opts.URL,
+		HTTP:             opts.HTTP,
+		RootPath:         "", // The base of your workspace
+		RespectGitConfig: opts.RespectGitConfig,
+		CloneHosts:       opts.CloneHosts,
 	}
 
 	if err := SaveConfigTo(wd, cfg); err != nil {
@@ -54,11 +73,17 @@ func runInit(rawURL string, useHTTP, force, verify bool, tokenFlag string) error
 	}
 
 	transport := "HTTP(S), authenticated with your token"
-	if !useHTTP {
+	if !opts.HTTP {
 		transport = "SSH, using your local SSH keys"
 	}
 	fmt.Printf("Initialized gitty root at %s\n", wd)
 	fmt.Printf("Cloning over %s\n", transport)
+	if cfg.RespectGitConfig {
+		fmt.Println("Honouring url.<base>.insteadOf rewrites from your git config")
+	}
+	if len(cfg.CloneHosts) > 0 {
+		fmt.Printf("Also cloning from: %s\n", strings.Join(cfg.CloneHosts, ", "))
+	}
 	fmt.Println("You can now run 'gitty sync --path=<path>' to pull down repositories.")
 
 	// Check the credential now, while there is somewhere to put the answer.
@@ -66,9 +91,9 @@ func runInit(rawURL string, useHTTP, force, verify bool, tokenFlag string) error
 	// far cheaper than discovering it part-way through a sync. Advisory only:
 	// the workspace exists either way, and it comes last so the guidance is
 	// the final thing on screen.
-	if verify {
+	if opts.Verify {
 		fmt.Fprintln(os.Stderr)
-		checkAuthForInit(os.Stderr, cfg, tokenFlag)
+		checkAuthForInit(os.Stderr, cfg, opts.Token)
 	}
 	return nil
 }
