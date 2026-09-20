@@ -607,6 +607,7 @@ func (s *syncer) bringUp(ctx context.Context, p *gitlab.Project, dest, url strin
 	}
 	env = append(env, s.sshEnvFor(effective)...)
 	if err := s.runGit(ctx, path, dest, env, fetch...); err != nil {
+		s.explainFetchFailure(ctx, path, dest, url, effective)
 		return err
 	}
 
@@ -635,6 +636,38 @@ func (s *syncer) bringUp(ctx context.Context, p *gitlab.Project, dest, url strin
 	// checkout of a branch that only exists at origin creates the local
 	// tracking branch, exactly as clone would have.
 	return s.runGit(ctx, path, dest, nil, "checkout", "-q", branch)
+}
+
+// explainFetchFailure follows a failed bring-up fetch with the facts that
+// decide whether the user's URL rewrites applied: the URL origin was given,
+// the URL git resolved it to from inside the repository, and every
+// url.<base>.insteadOf rule git can see from there, with the file each came
+// from. Read from inside dest, this is the configuration that governed the
+// fetch — conditional includes and all — so an absent or non-matching rule
+// here is the whole explanation, and a present one that did not apply points
+// at its prefix.
+func (s *syncer) explainFetchFailure(ctx context.Context, path, dest, url, effective string) {
+	if effective != url {
+		s.diagf("%s: origin %s, which git resolved to %s", path, redactURL(url), redactURL(effective))
+	} else {
+		s.diagf("%s: origin %s, which no url.insteadOf rule rewrote", path, redactURL(url))
+	}
+	out, _ := s.git(ctx, dest, nil, "config", "--show-origin", "--get-regexp", `^url\..*\.insteadof$`)
+	rules := strings.TrimSpace(string(out))
+	if rules == "" {
+		s.diagf("%s: git sees no url.<base>.insteadOf rules inside %s (HOME=%s); a rule in an includeIf section whose condition does not match this repository is not loaded",
+			path, dest, os.Getenv("HOME"))
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintf(s.errOut, "--- url.insteadOf rules git sees inside %s ---\n", dest)
+	for _, line := range strings.Split(rules, "\n") {
+		// "file:<path>\t<key> <value>": redact token by token, since the
+		// value may carry credentials but the line as a whole is not a URL.
+		fmt.Fprintln(s.errOut, strings.Join(redactArgs(strings.Fields(line)), " "))
+	}
+	fmt.Fprintf(s.errOut, "--- end %s ---\n", path)
 }
 
 // isUnborn reports whether a repository has no commits on any branch: the
