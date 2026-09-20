@@ -127,12 +127,11 @@ func TestLegacyWorkspaceTransportIsHonored(t *testing.T) {
 			s.jobs = 1
 			s.syncRepos(context.Background(), "acme")
 
-			if rec.callCount() != 1 {
-				t.Fatalf("expected one clone, got %v", rec.calls)
+			if net := rec.networkCalls(); len(net) != 1 || gitSubArgs(net[0])[0] != "fetch" {
+				t.Fatalf("expected one fetch, got %v", rec.calls)
 			}
-			sub := gitSubArgs(rec.calls[0])
-			if len(sub) < 2 || sub[0] != "clone" || sub[1] != tc.wantURL {
-				t.Errorf("cloned %v, want clone of %q", rec.calls[0], tc.wantURL)
+			if got := rec.remoteAddURL(); got != tc.wantURL {
+				t.Errorf("origin URL = %q, want %q", got, tc.wantURL)
 			}
 		})
 	}

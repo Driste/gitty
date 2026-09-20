@@ -127,6 +127,7 @@ type apiProject struct {
 	PathWithNamespace string `json:"path_with_namespace"`
 	HTTPURLToRepo     string `json:"http_url_to_repo"`
 	SSHURLToRepo      string `json:"ssh_url_to_repo"`
+	DefaultBranch     string `json:"default_branch,omitempty"`
 }
 
 type fakeGitLab struct {
@@ -372,6 +373,7 @@ func (f *fakeGitLab) project(id int, pathNS string) apiProject {
 		PathWithNamespace: pathNS,
 		HTTPURLToRepo:     f.srv.URL + "/git/" + pathNS + ".git",
 		SSHURLToRepo:      "git@example.invalid:" + pathNS + ".git",
+		DefaultBranch:     "main",
 	}
 }
 
@@ -568,7 +570,7 @@ func TestE2EScopeHintOnCloneAuthFailure(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "error acme/scoped git clone failed") {
+	if !strings.Contains(stdout, "error acme/scoped git fetch failed") {
 		t.Errorf("missing clone failure event:\n%s", stdout)
 	}
 	if !strings.Contains(stderr, "read_repository") {
@@ -1459,7 +1461,7 @@ func TestE2EVerbose(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("verbose sync exit = %d:\n%s\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, "exec git ") || !strings.Contains(stderr, " clone ") {
+	if !strings.Contains(stderr, "exec git ") || !strings.Contains(stderr, " fetch ") {
 		t.Errorf("verbose exec line missing from stderr:\n%s", stderr)
 	}
 	if strings.Contains(stdout, "exec git") {
@@ -1876,7 +1878,7 @@ func TestE2EBadTokenFailsFast(t *testing.T) {
 	if code != 1 {
 		t.Errorf("bad-token sync exit = %d, want 1:\n%s", code, stdout)
 	}
-	if !strings.Contains(stdout, "error acme/lockedrepo git clone failed") {
+	if !strings.Contains(stdout, "error acme/lockedrepo git fetch failed") {
 		t.Errorf("expected clone failure event:\n%s", stdout)
 	}
 }
@@ -2021,7 +2023,7 @@ func TestE2EInsteadOfRewritesAreFollowed(t *testing.T) {
 		t.Fatalf("init exit = %d", code)
 	}
 	stdout, stderr, code = runGitty(t, ws2, nil, "sync", "--path=acme", "--anon")
-	if code != 1 || !strings.Contains(stdout, "error acme/rewritten git clone failed\n") {
+	if code != 1 || !strings.Contains(stdout, "error acme/rewritten git fetch failed\n") {
 		t.Errorf("the unrewritten canonical host should fail in git (exit %d):\n%s\n%s", code, stdout, stderr)
 	}
 	if !strings.Contains(stderr, "gitlab.canonical.invalid") {

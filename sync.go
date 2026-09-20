@@ -265,7 +265,14 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.cfg.AllowCloneHosts(opts.AllowCloneHosts)
 
 	if s.verbose {
-		s.diagf("gitty %s", versionString())
+		// Enough to tell which binary, which git and whose configuration a
+		// run used — the three things a "gitty ignores my gitconfig" report
+		// needs settled first.
+		gitVersion := "git (version unknown)"
+		if out, err := s.git(ctx, ".", nil, "--version"); err == nil {
+			gitVersion = strings.TrimSpace(string(out))
+		}
+		s.diagf("gitty %s, %s, HOME=%s", versionString(), gitVersion, os.Getenv("HOME"))
 	}
 	if s.verbose && s.credentialEnv() != nil {
 		s.diagf("HTTP auth: injecting %s credential (username %s) via askpass", s.cred.source, s.cred.username)
@@ -471,13 +478,22 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 	state := classifyDest(repoDest)
 
 	if state == destRepo {
-		// Existing checkout: fast-forward it. --ff-only refuses to create a
-		// merge commit, so a diverged or dirty checkout fails loudly instead
-		// of leaving the repo in a surprising state.
 		if s.dryRun {
 			s.event("pull", p.PathWithNamespace)
 			return
 		}
+		// A repository with no commits yet is one whose bring-up was cut
+		// short (or whose remote is empty): finish it rather than pull it.
+		if isUnborn(repoDest) {
+			if s.bringUp(ctx, p, repoDest, cloneURL, false) == nil {
+				s.event("pull", p.PathWithNamespace)
+				s.reportResolvedOrigin(ctx, p.PathWithNamespace, repoDest, cloneURL)
+			}
+			return
+		}
+		// Existing checkout: fast-forward it. --ff-only refuses to create a
+		// merge commit, so a diverged or dirty checkout fails loudly instead
+		// of leaving the repo in a surprising state.
 		env, args, ok := s.authForCheckout(ctx, p.PathWithNamespace, repoDest, "pull", "--ff-only")
 		if !ok {
 			return
@@ -494,12 +510,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		return
 	}
 
-	// Clone (or reclone). gitty hands git the URL the API advertised and lets
-	// git's own configuration decide where that points; the probe below only
-	// steers ssh and reports an unexpected host, it never blocks the clone.
-	effective := s.effectiveURL(ctx, ".", cloneURL)
-	s.noteForeignHost("clone URL", cloneURL, effective)
-
+	// Clone (or reclone).
 	kind := "clone"
 	if state == destBroken {
 		kind = "reclone"
@@ -526,16 +537,121 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		s.diagf("creating %s: %v", parentDir, err)
 		return
 	}
-	env := s.credentialEnv()
-	args := []string{"clone", cloneURL, repoDest}
-	if env != nil {
-		args = append([]string{"-c", "credential.helper="}, args...)
-	}
-	env = append(env, s.sshEnvFor(effective)...)
-	if err := s.runGit(ctx, p.PathWithNamespace, ".", env, args...); err == nil {
+	if err := s.bringUp(ctx, p, repoDest, cloneURL, true); err == nil {
 		s.event(kind, p.PathWithNamespace)
 		s.reportResolvedOrigin(ctx, p.PathWithNamespace, repoDest, cloneURL)
 	}
+}
+
+// bringUp brings a repository into being the way `git clone` does — init,
+// configure origin, fetch, check out the default branch — but in that order,
+// so that the one step which touches the network runs inside a fully-formed
+// repository with its remote already configured.
+//
+// That ordering is the point. git evaluates conditional includes —
+// `[includeIf "gitdir:..."]`, `[includeIf "hasconfig:remote.*.url:..."]` —
+// against the repository it is operating on, and `git clone` reads the user's
+// configuration before the repository it is creating exists. Whether a
+// url.<base>.insteadOf rule living in such an include reaches the clone's
+// fetch is then a matter of git's version and internals. Fetching from inside
+// the repository removes the question: the user's configuration applies to
+// gitty's fetch exactly as it applies to a `git fetch` they run in that
+// checkout themselves. It also means the URL gitty reports and steers ssh by
+// is the one git resolved, not a guess made from the workspace root.
+//
+// fresh says whether dest is being created by this call. A fresh repository
+// that fails part-way is removed again, as `git clone` removes its
+// destination; one that was already there (an unborn repository from an
+// earlier interrupted run, or an empty remote) is left for the next run to
+// resume, which is what a killed `git clone` leaves behind too.
+func (s *syncer) bringUp(ctx context.Context, p *gitlab.Project, dest, url string, fresh bool) (err error) {
+	path := p.PathWithNamespace
+	if fresh {
+		if err := s.runGit(ctx, path, ".", nil, "init", "-q", dest); err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil && ctx.Err() == nil {
+				// Failed rather than interrupted: leave nothing half-made.
+				// An interrupt keeps the partial repository so the next run
+				// resumes it without repeating the fetch's work.
+				os.RemoveAll(dest)
+			}
+		}()
+	}
+
+	// Point origin at the advertised URL. On a resume it may already be
+	// there, possibly stale if the project moved.
+	if current, cerr := s.originOf(ctx, dest); cerr != nil || current == "" {
+		if err := s.runGit(ctx, path, dest, nil, "remote", "add", "origin", url); err != nil {
+			return err
+		}
+	} else if current != url {
+		if err := s.runGit(ctx, path, dest, nil, "remote", "set-url", "origin", url); err != nil {
+			return err
+		}
+	}
+
+	// From inside the repository git resolves the URL with the user's full
+	// configuration in effect, so this is exact — the basis for the ssh
+	// steering and the foreign-host note.
+	effective := s.effectiveURL(ctx, dest, "origin")
+	if effective == "origin" {
+		effective = url
+	}
+	s.noteForeignHost("clone URL", url, effective)
+	env := s.credentialEnv()
+	fetch := []string{"fetch", "--tags", "origin"}
+	if env != nil {
+		fetch = append([]string{"-c", "credential.helper="}, fetch...)
+	}
+	env = append(env, s.sshEnvFor(effective)...)
+	if err := s.runGit(ctx, path, dest, env, fetch...); err != nil {
+		return err
+	}
+
+	// Check out the default branch. GitLab reports it; when it does not (an
+	// older instance, or a project with no commits) ask the remote, which
+	// costs one more round trip and fails cleanly on an empty repository —
+	// which then stays unborn, as `git clone` leaves it.
+	branch := p.DefaultBranch
+	if branch == "" {
+		if err := s.runGit(ctx, path, dest, env, "remote", "set-head", "origin", "--auto"); err != nil {
+			return nil
+		}
+		out, err := s.git(ctx, dest, nil, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+		if err != nil {
+			return nil
+		}
+		branch = strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/")
+		if branch == "" {
+			return nil
+		}
+	} else {
+		// Mirror what clone records, so `git remote show origin` and
+		// origin/HEAD behave the same in a gitty checkout.
+		_ = s.runGit(ctx, path, dest, nil, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/"+branch)
+	}
+	// checkout of a branch that only exists at origin creates the local
+	// tracking branch, exactly as clone would have.
+	return s.runGit(ctx, path, dest, nil, "checkout", "-q", branch)
+}
+
+// isUnborn reports whether a repository has no commits on any branch: the
+// state `git init` leaves, and the state a bring-up interrupted before its
+// checkout leaves. Refs are kept either as loose files under refs/heads or
+// packed into packed-refs; a repository with neither has never had a commit
+// checked in.
+func isUnborn(dest string) bool {
+	gitDir := filepath.Join(dest, ".git")
+	if _, err := os.Stat(filepath.Join(gitDir, "packed-refs")); err == nil {
+		return false
+	}
+	entries, err := os.ReadDir(filepath.Join(gitDir, "refs", "heads"))
+	if err != nil {
+		return false // not a shape we understand; treat as a normal checkout
+	}
+	return len(entries) == 0
 }
 
 // reportResolvedOrigin says, under --verbose, which URL git actually used for

@@ -19,7 +19,7 @@ type configAwareGit struct {
 	calls   [][]string
 	envs    [][]string
 	origin  string
-	cloned  string // URL of the last recorded clone, which "origin" then names
+	cloned  string // URL origin was last pointed at, which "origin" then names
 	rewrite func(string) string
 }
 
@@ -27,8 +27,8 @@ func (g *configAwareGit) run(ctx context.Context, dir string, extraEnv []string,
 	g.mu.Lock()
 	g.calls = append(g.calls, append([]string{dir}, args...))
 	g.envs = append(g.envs, extraEnv)
-	if sub := gitSubArgs(append([]string{dir}, args...)); len(sub) >= 2 && sub[0] == "clone" {
-		g.cloned = sub[1]
+	if sub := gitSubArgs(append([]string{dir}, args...)); len(sub) == 4 && sub[0] == "remote" && (sub[1] == "add" || sub[1] == "set-url") {
+		g.cloned = sub[3]
 	}
 	origin, cloned, rewrite := g.origin, g.cloned, g.rewrite
 	g.mu.Unlock()
@@ -61,14 +61,9 @@ func (g *configAwareGit) network(t *testing.T) ([]string, []string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for i, c := range g.calls {
-		sub := gitSubArgs(c)
-		if len(sub) == 0 {
-			continue
+		if isNetworkGit(gitSubArgs(c)) {
+			return c, g.envs[i]
 		}
-		if sub[0] == "config" || sub[0] == "ls-remote" {
-			continue
-		}
-		return c, g.envs[i]
 	}
 	t.Fatalf("no network git invocation recorded, calls: %v", g.calls)
 	return nil, nil
@@ -78,7 +73,7 @@ func (g *configAwareGit) sawNetworkCall() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, c := range g.calls {
-		if sub := gitSubArgs(c); len(sub) > 0 && sub[0] != "config" && sub[0] != "ls-remote" {
+		if isNetworkGit(gitSubArgs(c)) {
 			return true
 		}
 	}
@@ -98,8 +93,15 @@ func hasPin(call []string) bool {
 
 func oneProject(httpURL string) fakeSource {
 	return fakeSource{projects: map[string][]*gitlab.Project{
-		"acme": {{PathWithNamespace: "acme/repo", HTTPURLToRepo: httpURL}},
+		"acme": {{PathWithNamespace: "acme/repo", HTTPURLToRepo: httpURL, DefaultBranch: "main"}},
 	}}
+}
+
+// originURL returns the URL origin was pointed at during a bring-up.
+func (g *configAwareGit) originURL() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.cloned
 }
 
 // gitty hands git the advertised URL and adds nothing that would stop the
@@ -126,9 +128,11 @@ func TestCloneIsNeverPinned(t *testing.T) {
 	if hasPin(call) {
 		t.Errorf("gitty must not pin the URL, got %v", call)
 	}
-	sub := gitSubArgs(call)
-	if len(sub) < 2 || sub[0] != "clone" || sub[1] != "https://gitlab.example.com/acme/repo.git" {
-		t.Errorf("clone should be handed the advertised URL for git to rewrite, got %v", sub)
+	if sub := gitSubArgs(call); len(sub) == 0 || sub[0] != "fetch" || call[0] != "acme/repo" {
+		t.Errorf("the network step should be a fetch inside the new repository, got %v", call)
+	}
+	if got := git.originURL(); got != "https://gitlab.example.com/acme/repo.git" {
+		t.Errorf("origin should be the advertised URL for git to rewrite, got %q", got)
 	}
 	if !strings.Contains(stdout.String(), "clone acme/repo\n") {
 		t.Errorf("expected a clone event, got %q", stdout.String())

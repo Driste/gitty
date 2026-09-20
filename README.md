@@ -174,25 +174,42 @@ the unrewritten URL, git itself did not apply the rule from that directory —
 which is a question about the rule (its `includeIf` condition, its prefix, the
 `HOME` gitty was started with), not about gitty.
 
-**Conditional includes work too.** If that rule lives in a file pulled in by an
-`includeIf`:
+**Conditional includes work too — by construction.** If that rule lives in a
+file pulled in by an `includeIf`:
 
 ```ini
 [includeIf "gitdir:~/work/"]
 	path = ~/work/.gitconfig
 ```
 
-git evaluates a `gitdir:` condition against the repository it is operating on,
-so the rule is invisible from anywhere that is *not* that repository — the
-workspace root included. A clone still picks it up, because git creates the
-repository first and only then fetches. This is precisely why gitty does not
-try to work out the final URL in advance and act on it: any such prediction is
-blind to your conditional includes, while git itself is not.
+git evaluates a `gitdir:` (or `hasconfig:remote.*.url:`) condition against
+the repository it is operating on. `git clone` reads your configuration before
+the repository it is creating exists, so whether a rule in such an include
+reaches the clone's fetch depends on git's version and internals.
 
-gitty does still ask git where a URL resolves to (`git ls-remote --get-url`,
-which touches no network), but only to steer ssh and to print something useful
-— a rewrite that lands on an SSH URL still gets `--accept-new-host-keys` and
-the host-key warmup. When a rewrite redirects the instance itself, it says so:
+gitty sidesteps the question. It never runs `git clone`. A new repository is
+brought up the way git itself would, but with every network operation inside
+an already-formed repository:
+
+```
+git init -q <dest>
+git -C <dest> remote add origin <advertised url>
+git -C <dest> fetch --tags origin          # your config applies here, in full
+git -C <dest> checkout -q <default branch>
+```
+
+By the time git contacts the remote, the repository exists, `origin` is
+configured, and every conditional include that would apply to a `git fetch`
+you ran in that checkout yourself applies to gitty's too. The result is
+indistinguishable from a clone (same tracking branch, `origin/HEAD`, tags), a
+failed bring-up is removed like a failed clone, and an interrupted one is
+resumed by the next run.
+
+Because the fetch runs inside the repository, gitty can also ask git for the
+resolved URL there and get an exact answer — that is what steers ssh (a rewrite
+that lands on an SSH URL still gets `--accept-new-host-keys` and the host-key
+warmup) and what the note about unexpected hosts is based on. When a rewrite
+redirects the instance itself, it says so:
 
 ```
 note: local git config rewrites https://gitlab.com/ to git@gitlab.com:
