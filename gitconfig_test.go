@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,6 +22,9 @@ type configAwareGit struct {
 	origin  string
 	cloned  string // URL origin was last pointed at, which "origin" then names
 	rewrite func(string) string
+
+	failFetch bool   // make the network step fail
+	rules     string // what "config --get-regexp url.*insteadof" reports
 }
 
 func (g *configAwareGit) run(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
@@ -36,6 +40,18 @@ func (g *configAwareGit) run(ctx context.Context, dir string, extraEnv []string,
 	switch {
 	case len(args) == 3 && args[0] == "config" && args[2] == "remote.origin.url":
 		return []byte(origin + "\n"), nil
+	case len(args) >= 3 && args[0] == "config" && args[1] == "--show-origin":
+		g.mu.Lock()
+		rules := g.rules
+		g.mu.Unlock()
+		return []byte(rules), nil
+	case len(args) > 0 && args[0] == "fetch", len(args) > 2 && args[0] == "-c" && args[2] == "fetch":
+		g.mu.Lock()
+		fail := g.failFetch
+		g.mu.Unlock()
+		if fail {
+			return []byte("fatal: unable to access 'https://gitlab.internal/acme/repo.git/': Could not resolve host\n"), fmt.Errorf("exit status 128")
+		}
 	case len(args) == 3 && args[0] == "ls-remote" && args[1] == "--get-url":
 		// Like git: a remote name resolves to its configured URL first, and
 		// the rewrite rules apply to the result.
@@ -399,6 +415,51 @@ func TestVerboseReportsResolvedOrigin(t *testing.T) {
 
 		if strings.Contains(stderr.String(), "origin https://") {
 			t.Errorf("resolved origin should only be reported under --verbose:\n%s", stderr.String())
+		}
+	})
+}
+
+// A failed bring-up fetch is followed by the configuration facts that decide
+// whether a rewrite applied, read from inside the repository.
+func TestFetchFailureExplainsRewriteRules(t *testing.T) {
+	t.Run("no rules visible", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		git := &configAwareGit{}
+		git.failFetch = true
+		s, _, stderr := newTestSyncer(
+			&Config{URL: "https://gitlab.example.com", HTTP: true},
+			oneProject("https://gitlab.internal/acme/repo.git"),
+			git.run,
+		)
+		s.jobs = 1
+		s.syncRepos(context.Background(), "acme")
+		got := stderr.String()
+		for _, want := range []string{
+			"origin https://gitlab.internal/acme/repo.git, which no url.insteadOf rule rewrote",
+			"git sees no url.<base>.insteadOf rules inside",
+			"includeIf",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("missing %q in:\n%s", want, got)
+			}
+		}
+	})
+
+	t.Run("rules listed with their files", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		git := &configAwareGit{}
+		git.failFetch = true
+		git.rules = "file:/home/u/.gitconfig\turl.https://gitlab.example.com/.insteadof https://other.internal/\n"
+		s, _, stderr := newTestSyncer(
+			&Config{URL: "https://gitlab.example.com", HTTP: true},
+			oneProject("https://gitlab.internal/acme/repo.git"),
+			git.run,
+		)
+		s.jobs = 1
+		s.syncRepos(context.Background(), "acme")
+		got := stderr.String()
+		if !strings.Contains(got, "url.insteadOf rules git sees inside") || !strings.Contains(got, "file:/home/u/.gitconfig") {
+			t.Errorf("rules block missing in:\n%s", got)
 		}
 	})
 }
