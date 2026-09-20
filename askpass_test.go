@@ -115,15 +115,18 @@ func TestInjectedCloneInvocation(t *testing.T) {
 	s.exePath = "/bin/gitty"
 
 	s.syncRepos(context.Background(), "acme")
-	if rec.callCount() != 1 {
-		t.Fatalf("git calls: %v", rec.calls)
+	net := rec.networkCalls()
+	if len(net) != 1 {
+		t.Fatalf("network git calls: %v (all: %v)", net, rec.calls)
 	}
-	got := rec.calls[0] // dir + args
-	// The clone carries the one option pair gitty prepends — the credential
-	// helper reset — followed by the clone itself.
-	if sub := gitSubArgs(got); len(sub) != 3 || sub[0] != "clone" ||
-		sub[1] != "https://gitlab.com/acme/repo.git" || sub[2] != "acme/repo" {
-		t.Errorf("injected clone subcommand = %v, want clone of the https URL", got)
+	got := net[0] // dir + args
+	// The fetch runs inside the new repository and carries the one option
+	// pair gitty prepends — the credential helper reset.
+	if sub := gitSubArgs(got); len(sub) != 3 || sub[0] != "fetch" || got[0] != "acme/repo" {
+		t.Errorf("injected fetch = %v, want a fetch inside acme/repo", got)
+	}
+	if u := rec.remoteAddURL(); u != "https://gitlab.com/acme/repo.git" {
+		t.Errorf("origin URL = %q, want the https URL", u)
 	}
 	joinedArgs := strings.Join(got, " ")
 	if !strings.Contains(joinedArgs, "-c credential.helper=") {
@@ -142,7 +145,7 @@ func TestInjectedCloneInvocation(t *testing.T) {
 	if strings.Contains(stdout.String(), "glpat-sekret") {
 		t.Errorf("token leaked to stdout:\n%s", stdout.String())
 	}
-	env := rec.lastEnv()
+	env := rec.envOf("fetch")
 	if !strings.Contains(strings.Join(env, "\n"), "GITTY_ASKPASS_TOKEN=glpat-sekret") {
 		t.Errorf("expected token in child env handoff, got %v", env)
 	}

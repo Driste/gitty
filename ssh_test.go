@@ -108,10 +108,15 @@ type concurrencyProbe struct {
 }
 
 func (p *concurrencyProbe) run(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
-	// The insteadOf probe is a local config read, not a connection; answering
-	// it unchanged keeps the overlap counts about real git operations.
+	// Only commands that open a connection count: the insteadOf probe is a
+	// local config read, and a bring-up's init/remote/checkout steps are
+	// local too. Keeping the overlap counts about real connections is what
+	// the host-key contention these tests guard against is about.
 	if len(args) == 3 && args[0] == "ls-remote" && args[1] == "--get-url" {
 		return []byte(args[2] + "\n"), nil
+	}
+	if !isNetworkGit(gitSubArgs(append([]string{dir}, args...))) {
+		return nil, nil
 	}
 
 	p.mu.Lock()
@@ -143,6 +148,7 @@ func sshProjects(n int) []*gitlab.Project {
 		ps = append(ps, &gitlab.Project{
 			PathWithNamespace: "acme/" + name,
 			SSHURLToRepo:      "git@gitlab.com:acme/" + name + ".git",
+			DefaultBranch:     "main",
 		})
 	}
 	return ps
@@ -194,6 +200,7 @@ func TestHTTPCloneNeedsNoWarmup(t *testing.T) {
 		ps = append(ps, &gitlab.Project{
 			PathWithNamespace: "acme/" + name,
 			HTTPURLToRepo:     "https://gitlab.com/acme/" + name + ".git",
+			DefaultBranch:     "main",
 		})
 	}
 

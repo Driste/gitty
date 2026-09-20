@@ -259,6 +259,13 @@ func (f fakeSource) Projects(target string, nested bool) ([]*gitlab.Project, err
 	if f.projErr != nil {
 		return nil, f.projErr
 	}
+	// Real projects report their default branch; fixtures that leave it out
+	// get the common one, so a bring-up does not have to ask the remote.
+	for _, p := range f.projects[target] {
+		if p.DefaultBranch == "" {
+			p.DefaultBranch = "main"
+		}
+	}
 	return f.projects[target], nil
 }
 
@@ -291,10 +298,64 @@ func (r *recordingGit) run(ctx context.Context, dir string, extraEnv []string, a
 	return nil, nil
 }
 
+// isNetworkGit reports whether a recorded git subcommand contacts a remote.
+// Bringing a repository up is several local steps (init, remote add,
+// symbolic-ref, checkout) around one fetch; tests reason about the fetch.
+func isNetworkGit(sub []string) bool {
+	if len(sub) == 0 {
+		return false
+	}
+	switch sub[0] {
+	case "fetch", "pull", "clone":
+		return true
+	case "remote":
+		return len(sub) > 1 && sub[1] == "set-head"
+	}
+	return false
+}
+
+// networkCalls returns the recorded invocations that contact a remote.
+func (r *recordingGit) networkCalls() [][]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out [][]string
+	for _, c := range r.calls {
+		if isNetworkGit(gitSubArgs(c)) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// remoteAddURL returns the URL origin was pointed at, or "".
+func (r *recordingGit) remoteAddURL() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.calls {
+		if sub := gitSubArgs(c); len(sub) == 4 && sub[0] == "remote" && (sub[1] == "add" || sub[1] == "set-url") {
+			return sub[3]
+		}
+	}
+	return ""
+}
+
 func (r *recordingGit) callCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.calls)
+}
+
+// envOf returns the extra environment of the first recorded invocation of
+// the given subcommand, or nil.
+func (r *recordingGit) envOf(subcommand string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, c := range r.calls {
+		if sub := gitSubArgs(c); len(sub) > 0 && sub[0] == subcommand {
+			return r.envs[i]
+		}
+	}
+	return nil
 }
 
 func (r *recordingGit) lastEnv() []string {
@@ -385,12 +446,14 @@ func TestSyncReposClonesNewProjects(t *testing.T) {
 	if !strings.Contains(stdout.String(), "clone acme/repo\n") {
 		t.Errorf("missing clone event:\n%s", stdout.String())
 	}
-	if rec.callCount() != 1 {
-		t.Fatalf("expected 1 git call, got %d: %v", rec.callCount(), rec.calls)
+	// Bring-up: one fetch, inside the new repository, after origin was
+	// pointed at the advertised URL.
+	net := rec.networkCalls()
+	if len(net) != 1 || gitSubArgs(net[0])[0] != "fetch" || net[0][0] != "acme/repo" {
+		t.Fatalf("expected one fetch inside acme/repo, got %v (all calls: %v)", net, rec.calls)
 	}
-	got := gitSubArgs(rec.calls[0])
-	if len(got) != 3 || got[0] != "clone" || got[1] != "https://gitlab.com/acme/repo.git" || got[2] != "acme/repo" {
-		t.Errorf("unexpected clone invocation: %v", rec.calls[0])
+	if got := rec.remoteAddURL(); got != "https://gitlab.com/acme/repo.git" {
+		t.Errorf("origin URL = %q, want the advertised https URL", got)
 	}
 	assertEventLines(t, stdout)
 }
@@ -443,7 +506,7 @@ func TestSyncReposPullsExistingProjects(t *testing.T) {
 func TestSyncReposCountsGitFailures(t *testing.T) {
 	t.Chdir(t.TempDir())
 
-	rec := &recordingGit{failOn: func(dir string, args []string) bool { return true }}
+	rec := &recordingGit{failOn: func(dir string, args []string) bool { return isNetworkGit(gitSubArgs(append([]string{dir}, args...))) }}
 	s, stdout, stderr := newTestSyncer(
 		&Config{URL: "https://gitlab.com", HTTP: true},
 		fakeSource{
@@ -458,14 +521,18 @@ func TestSyncReposCountsGitFailures(t *testing.T) {
 
 	s.syncRepos(context.Background(), "acme")
 	if s.counts.errors != 1 {
-		t.Errorf("errors = %d, want 1 (git clone failed)", s.counts.errors)
+		t.Errorf("errors = %d, want 1 (git fetch failed)", s.counts.errors)
 	}
-	if !strings.Contains(stdout.String(), "error acme/repo git clone failed\n") {
+	if !strings.Contains(stdout.String(), "error acme/repo git fetch failed\n") {
 		t.Errorf("missing error event:\n%s", stdout.String())
 	}
 	// The captured git output must land on stderr as an attributed block.
-	if !strings.Contains(stderr.String(), "clone https://gitlab.com/acme/repo.git") || !strings.Contains(stderr.String(), "simulated git output") {
+	if !strings.Contains(stderr.String(), "fetch --tags origin") || !strings.Contains(stderr.String(), "simulated git output") {
 		t.Errorf("missing attributed git failure block on stderr:\n%s", stderr.String())
+	}
+	// A bring-up that failed is removed again, as a failed git clone is.
+	if _, err := os.Stat(filepath.Join("acme", "repo")); !os.IsNotExist(err) {
+		t.Errorf("failed bring-up should leave no directory behind (stat err: %v)", err)
 	}
 }
 
@@ -708,7 +775,7 @@ func TestVerboseExecLinesGoToStderr(t *testing.T) {
 	s.verbose = true
 
 	s.syncRepos(context.Background(), "acme")
-	if !strings.Contains(stderr.String(), "exec git ") || !strings.Contains(stderr.String(), " clone ") {
+	if !strings.Contains(stderr.String(), "exec git ") || !strings.Contains(stderr.String(), " fetch ") {
 		t.Errorf("verbose exec line missing from stderr:\n%s", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "exec git") {
@@ -855,8 +922,8 @@ func TestSyncOneRepoBrokenCheckout(t *testing.T) {
 		if !strings.Contains(stdout.String(), "reclone acme/repo\n") {
 			t.Errorf("missing reclone event:\n%s", stdout.String())
 		}
-		if rec.callCount() != 1 || gitSubArgs(rec.calls[0])[0] != "clone" {
-			t.Errorf("expected one clone call, got: %v", rec.calls)
+		if net := rec.networkCalls(); len(net) != 1 || gitSubArgs(net[0])[0] != "fetch" {
+			t.Errorf("expected one fetch for the reclone, got: %v", rec.calls)
 		}
 		// The junk must be preserved in the aside dir, not deleted.
 		if _, err := os.Stat(filepath.Join("acme", "repo.gitty-broken-1", "junk.txt")); err != nil {
@@ -899,8 +966,8 @@ func TestSyncOneRepoBrokenCheckout(t *testing.T) {
 		if !strings.Contains(stdout.String(), "clone acme/repo\n") {
 			t.Errorf("empty dir should be recovered via clone:\n%s", stdout.String())
 		}
-		if rec.callCount() != 1 || gitSubArgs(rec.calls[0])[0] != "clone" {
-			t.Errorf("expected one clone call, got: %v", rec.calls)
+		if net := rec.networkCalls(); len(net) != 1 || gitSubArgs(net[0])[0] != "fetch" {
+			t.Errorf("expected one fetch for the clone, got: %v", rec.calls)
 		}
 	})
 }
@@ -930,8 +997,19 @@ func TestSyncReposStopsOnCancelledContext(t *testing.T) {
 	)
 
 	s.syncRepos(ctx, "acme")
-	if rec.callCount() != 1 {
-		t.Errorf("expected the loop to stop after cancellation: %d git calls", rec.callCount())
+	// The repository already being brought up runs its steps to completion
+	// (the fake never fails), but no further repository may be started.
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, c := range rec.calls {
+		for _, a := range c {
+			if strings.Contains(a, "acme/two") || strings.Contains(a, "acme/three") {
+				t.Fatalf("a repository was started after cancellation: %v", rec.calls)
+			}
+		}
+	}
+	if len(rec.calls) == 0 {
+		t.Fatal("expected the first repository to have been started")
 	}
 }
 
@@ -964,8 +1042,10 @@ func TestSyncReposParallelCountsAndEvents(t *testing.T) {
 	if s.counts.cloned != 18 || s.counts.errors != 2 {
 		t.Errorf("counts = %+v, want cloned=18 errors=2", s.counts)
 	}
-	if rec.callCount() != 20 {
-		t.Errorf("git calls = %d, want 20", rec.callCount())
+	// The two failing repositories fail at their first (local) step and never
+	// reach the network; the other 18 fetch exactly once.
+	if n := len(rec.networkCalls()); n != 18 {
+		t.Errorf("network git calls = %d, want 18", n)
 	}
 	// Every stdout line must be a complete, well-formed event — torn or
 	// interleaved lines fail the grammar check.
@@ -1002,4 +1082,86 @@ func TestEventLineFormat(t *testing.T) {
 		t.Errorf("event output:\n%q\nwant:\n%q", stdout.String(), want)
 	}
 	assertEventLines(t, stdout)
+}
+
+// A repository whose bring-up was cut short — initialised, origin configured,
+// perhaps even fetched, but never checked out — is finished on the next run
+// rather than pulled, and re-pointed if the project's URL changed meanwhile.
+func TestUnbornRepositoryIsResumed(t *testing.T) {
+	t.Chdir(t.TempDir())
+	dest := filepath.Join("acme", "repo")
+	// What `git init` leaves behind: a HEAD, an empty refs/heads, no
+	// packed-refs.
+	for _, d := range []string{"refs/heads", "refs/tags", "objects"} {
+		if err := os.MkdirAll(filepath.Join(dest, ".git", d), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dest, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !isUnborn(dest) {
+		t.Fatal("fixture should classify as unborn")
+	}
+
+	rec := &recordingGit{}
+	s, stdout, _ := newTestSyncer(
+		&Config{URL: "https://gitlab.com", HTTP: true},
+		fakeSource{projects: map[string][]*gitlab.Project{
+			"acme": {{PathWithNamespace: "acme/repo", HTTPURLToRepo: "https://gitlab.com/acme/repo.git"}},
+		}},
+		rec.run,
+	)
+	s.syncRepos(context.Background(), "acme")
+
+	if !strings.Contains(stdout.String(), "pull acme/repo\n") {
+		t.Errorf("a resumed bring-up reports as a pull:\n%s", stdout.String())
+	}
+	for _, c := range rec.calls {
+		if sub := gitSubArgs(c); len(sub) > 0 && (sub[0] == "init" || sub[0] == "pull") {
+			t.Errorf("resume must neither re-init nor pull an unborn repository: %v", c)
+		}
+	}
+	if net := rec.networkCalls(); len(net) != 1 || gitSubArgs(net[0])[0] != "fetch" {
+		t.Errorf("expected exactly one fetch, got %v", rec.calls)
+	}
+	if u := rec.remoteAddURL(); u != "https://gitlab.com/acme/repo.git" {
+		t.Errorf("origin should be (re)pointed at the advertised URL, got %q", u)
+	}
+	if _, err := os.Stat(dest); err != nil {
+		t.Errorf("a resumed repository must never be removed: %v", err)
+	}
+}
+
+func TestIsUnborn(t *testing.T) {
+	t.Chdir(t.TempDir())
+	mk := func(name string, packed bool, heads ...string) string {
+		dir := filepath.Join(name, ".git")
+		if err := os.MkdirAll(filepath.Join(dir, "refs", "heads"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range heads {
+			if err := os.WriteFile(filepath.Join(dir, "refs", "heads", h), []byte("0000\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if packed {
+			if err := os.WriteFile(filepath.Join(dir, "packed-refs"), []byte("# pack-refs\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return name
+	}
+	if !isUnborn(mk("fresh", false)) {
+		t.Error("no refs at all: want unborn")
+	}
+	if isUnborn(mk("loose", false, "main")) {
+		t.Error("loose branch ref: want born")
+	}
+	if isUnborn(mk("packed", true)) {
+		t.Error("packed refs only (after gc): want born")
+	}
+	if isUnborn("does-not-exist") {
+		t.Error("not a repository: must not be reported unborn")
+	}
 }
