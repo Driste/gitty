@@ -22,15 +22,15 @@ import (
 type gitlabSource interface {
 	// Subgroups returns the immediate subgroups of target, or every descendant
 	// group when nested is true.
-	Subgroups(target string, nested bool) ([]*gitlab.Group, error)
+	Subgroups(ctx context.Context, target string, nested bool) ([]*gitlab.Group, error)
 	// Group returns the group identified by target.
-	Group(target string) (*gitlab.Group, error)
+	Group(ctx context.Context, target string) (*gitlab.Group, error)
 	// Projects returns the projects directly in target, or all projects
 	// including those in subgroups when nested is true.
-	Projects(target string, nested bool) ([]*gitlab.Project, error)
+	Projects(ctx context.Context, target string, nested bool) ([]*gitlab.Project, error)
 	// TopLevelGroups returns the instance's top-level groups — the namespaces
 	// visible to the caller, with no parent.
-	TopLevelGroups() ([]*gitlab.Group, error)
+	TopLevelGroups(ctx context.Context) ([]*gitlab.Group, error)
 }
 
 // gitRunner executes a git command in dir with extra environment entries and
@@ -320,14 +320,13 @@ func (s *syncer) syncGroups(ctx context.Context, target string) {
 	s.diagf("--- Syncing Groups ---")
 	s.diagf("Fetching subgroups for: '%s' (Nested: %t)...", target, s.nested)
 
-	allGroups, err := s.src.Subgroups(target, s.nested)
+	allGroups, root, err := s.groupsOf(ctx, target)
 	if err != nil {
 		s.event("error", target, "listing subgroups failed")
 		s.diagf("listing subgroups for %s: %v", target, err)
 		return
 	}
-
-	if root, err := s.src.Group(target); err == nil && root != nil {
+	if root != nil {
 		allGroups = append([]*gitlab.Group{root}, allGroups...)
 	}
 
@@ -378,7 +377,7 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	s.diagf("--- Syncing Repositories ---")
 	s.diagf("Fetching projects for: '%s' (Nested: %t)...", target, s.nested)
 
-	allProjects, err := s.src.Projects(target, s.nested)
+	allProjects, err := s.src.Projects(ctx, target, s.nested)
 	if err != nil {
 		s.event("error", target, "listing projects failed")
 		s.diagf("listing projects for %s: %v", target, err)
@@ -1068,6 +1067,100 @@ func extractHost(raw string) string {
 	return strings.ToLower(u.Hostname())
 }
 
+// groupsOf lists a target's subgroups and fetches the target group itself,
+// concurrently: the two are independent round trips. A missing root is not
+// an error — the caller may lack permission to read the group object while
+// still being able to list beneath it.
+func (s *syncer) groupsOf(ctx context.Context, target string) (groups []*gitlab.Group, root *gitlab.Group, err error) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		groups, err = s.src.Subgroups(ctx, target, s.nested)
+	}()
+	go func() {
+		defer wg.Done()
+		root, _ = s.src.Group(ctx, target)
+	}()
+	wg.Wait()
+	return groups, root, err
+}
+
+// listConcurrency bounds how many pages of one listing are fetched at once.
+// GitLab's per-IP limits leave ample room for this, and it turns a listing of
+// N pages into roughly N/8 sequential round trips.
+const listConcurrency = 8
+
+// listPages collects every page of a paginated GitLab listing. It requests the
+// first page, learns the page count from it, and fetches the remaining pages
+// concurrently — the work of a listing is almost entirely round-trip latency,
+// so pages are the unit worth parallelising. Results keep the API's order.
+// When the server does not report a total (GitLab omits it beyond 10,000
+// rows) it follows next-page links one at a time instead. The first error
+// cancels the rest.
+func listPages[T any](ctx context.Context, fetch func(ctx context.Context, page int) ([]T, *gitlab.Response, error)) ([]T, error) {
+	first, resp, err := fetch(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	total := int(resp.TotalPages)
+	if total <= 1 {
+		all := first
+		for page := int(resp.NextPage); page != 0; {
+			items, r, err := fetch(ctx, page)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, items...)
+			page = int(r.NextPage)
+		}
+		return all, nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	pages := make([][]T, total+1)
+	pages[1] = first
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	sem := make(chan struct{}, listConcurrency)
+	for page := 2; page <= total; page++ {
+		wg.Add(1)
+		go func(page int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			items, _, err := fetch(ctx, page)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				return
+			}
+			pages[page] = items
+		}(page)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	var all []T
+	for _, p := range pages {
+		all = append(all, p...)
+	}
+	return all, nil
+}
+
 // gitlabClientSource adapts a *gitlab.Client to the gitlabSource interface,
 // handling pagination for each listing.
 type gitlabClientSource struct {
@@ -1077,44 +1170,27 @@ type gitlabClientSource struct {
 	authenticated bool
 }
 
-func (s gitlabClientSource) Subgroups(target string, nested bool) ([]*gitlab.Group, error) {
-	var all []*gitlab.Group
+func (s gitlabClientSource) Subgroups(ctx context.Context, target string, nested bool) ([]*gitlab.Group, error) {
 	if nested {
-		opts := &gitlab.ListDescendantGroupsOptions{
-			ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1},
-		}
-		for {
-			groups, resp, err := s.client.Groups.ListDescendantGroups(target, opts)
-			if err != nil {
-				return nil, err
-			}
-			all = append(all, groups...)
-			if resp.NextPage == 0 {
-				break
-			}
-			opts.Page = resp.NextPage
-		}
-		return all, nil
+		return listPages(ctx, func(ctx context.Context, page int) ([]*gitlab.Group, *gitlab.Response, error) {
+			return s.client.Groups.ListDescendantGroups(target, &gitlab.ListDescendantGroupsOptions{
+				ListOptions: gitlab.ListOptions{PerPage: 100, Page: int64(page)},
+			}, gitlab.WithContext(ctx))
+		})
 	}
-	opts := &gitlab.ListSubGroupsOptions{
-		ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1},
-	}
-	for {
-		groups, resp, err := s.client.Groups.ListSubGroups(target, opts)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, groups...)
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
-	}
-	return all, nil
+	return listPages(ctx, func(ctx context.Context, page int) ([]*gitlab.Group, *gitlab.Response, error) {
+		return s.client.Groups.ListSubGroups(target, &gitlab.ListSubGroupsOptions{
+			ListOptions: gitlab.ListOptions{PerPage: 100, Page: int64(page)},
+		}, gitlab.WithContext(ctx))
+	})
 }
 
-func (s gitlabClientSource) Group(target string) (*gitlab.Group, error) {
-	g, _, err := s.client.Groups.GetGroup(target, nil)
+func (s gitlabClientSource) Group(ctx context.Context, target string) (*gitlab.Group, error) {
+	// The group object alone: by default GitLab embeds the group's projects
+	// (and shared projects) in this response, which for a large group is
+	// hundreds of kilobytes and seconds of server time, none of it used here.
+	withProjects := false
+	g, _, err := s.client.Groups.GetGroup(target, &gitlab.GetGroupOptions{WithProjects: &withProjects}, gitlab.WithContext(ctx))
 	return g, err
 }
 
@@ -1122,7 +1198,7 @@ func (s gitlabClientSource) Group(target string) (*gitlab.Group, error) {
 // listing on a large instance would otherwise walk every public group on it.
 const maxTopLevelPages = 10
 
-func (s gitlabClientSource) TopLevelGroups() ([]*gitlab.Group, error) {
+func (s gitlabClientSource) TopLevelGroups(ctx context.Context) ([]*gitlab.Group, error) {
 	var all []*gitlab.Group
 	topLevel := true
 	opts := &gitlab.ListGroupsOptions{
@@ -1137,7 +1213,7 @@ func (s gitlabClientSource) TopLevelGroups() ([]*gitlab.Group, error) {
 		opts.MinAccessLevel = &level
 	}
 	for page := 0; page < maxTopLevelPages; page++ {
-		groups, resp, err := s.client.Groups.ListGroups(opts)
+		groups, resp, err := s.client.Groups.ListGroups(opts, gitlab.WithContext(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -1150,25 +1226,16 @@ func (s gitlabClientSource) TopLevelGroups() ([]*gitlab.Group, error) {
 	return all, nil
 }
 
-func (s gitlabClientSource) Projects(target string, nested bool) ([]*gitlab.Project, error) {
-	var all []*gitlab.Project
-	opts := &gitlab.ListGroupProjectsOptions{
-		IncludeSubGroups: &nested,
-		ListOptions: gitlab.ListOptions{
-			PerPage: 100,
-			Page:    1,
-		},
-	}
-	for {
-		projects, resp, err := s.client.Groups.ListGroupProjects(target, opts)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, projects...)
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
-	}
-	return all, nil
+func (s gitlabClientSource) Projects(ctx context.Context, target string, nested bool) ([]*gitlab.Project, error) {
+	// simple=true trims each project to its identifying fields — path, URLs,
+	// default branch — which is all gitty reads, and is a fifth of the bytes
+	// (and a fraction of the server time) of the full representation.
+	simple := true
+	return listPages(ctx, func(ctx context.Context, page int) ([]*gitlab.Project, *gitlab.Response, error) {
+		return s.client.Groups.ListGroupProjects(target, &gitlab.ListGroupProjectsOptions{
+			IncludeSubGroups: &nested,
+			Simple:           &simple,
+			ListOptions:      gitlab.ListOptions{PerPage: 100, Page: int64(page)},
+		}, gitlab.WithContext(ctx))
+	})
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -40,7 +41,7 @@ func lsFixture(t *testing.T) (*syncer, *bytes.Buffer) {
 func TestBuildLsReport(t *testing.T) {
 	s, _ := lsFixture(t)
 
-	report, err := buildLsReport(s, "acme", true)
+	report, err := buildLsReport(context.Background(), s, "acme", true)
 	if err != nil {
 		t.Fatalf("buildLsReport: %v", err)
 	}
@@ -78,7 +79,7 @@ func TestBuildLsReportListsEmptyGroups(t *testing.T) {
 	}
 	s, _, _ := newTestSyncer(&Config{URL: "https://gitlab.com"}, src, (&recordingGit{}).run)
 
-	report, err := buildLsReport(s, "acme", true)
+	report, err := buildLsReport(context.Background(), s, "acme", true)
 	if err != nil {
 		t.Fatalf("buildLsReport: %v", err)
 	}
@@ -94,7 +95,7 @@ func TestBuildLsReportListsEmptyGroups(t *testing.T) {
 
 func TestWriteLsTextIsGreppable(t *testing.T) {
 	s, stdout := lsFixture(t)
-	report, err := buildLsReport(s, "acme", true)
+	report, err := buildLsReport(context.Background(), s, "acme", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +119,7 @@ func TestWriteLsTextIsGreppable(t *testing.T) {
 
 func TestWriteLsTreeNestsAndMarks(t *testing.T) {
 	s, stdout := lsFixture(t)
-	report, err := buildLsReport(s, "acme", true)
+	report, err := buildLsReport(context.Background(), s, "acme", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +146,7 @@ func TestWriteLsTreeNestsAndMarks(t *testing.T) {
 
 func TestWriteLsTreeColors(t *testing.T) {
 	s, stdout := lsFixture(t)
-	report, err := buildLsReport(s, "acme", true)
+	report, err := buildLsReport(context.Background(), s, "acme", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +164,7 @@ func TestWriteLsTreeColors(t *testing.T) {
 
 func TestLsReportJSONRoundtrip(t *testing.T) {
 	s, _ := lsFixture(t)
-	report, err := buildLsReport(s, "acme", true)
+	report, err := buildLsReport(context.Background(), s, "acme", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +236,7 @@ func TestBuildTopLevelReport(t *testing.T) {
 	}}
 	s, _, _ := newTestSyncer(&Config{URL: "https://gitlab.com", HTTP: true}, src, (&recordingGit{}).run)
 
-	report, err := buildTopLevelReport(s)
+	report, err := buildTopLevelReport(context.Background(), s)
 	if err != nil {
 		t.Fatalf("buildTopLevelReport: %v", err)
 	}

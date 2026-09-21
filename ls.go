@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"gitlab.com/gitlab-org/api/client-go"
 )
@@ -94,18 +95,29 @@ func resolveLsTarget(arg, rootPath string) (target string, topLevel bool) {
 
 // buildLsReport assembles the remote inventory, marking each project by
 // whether a usable checkout already exists locally.
-func buildLsReport(s *syncer, target string, nested bool) (lsReport, error) {
-	groups, err := s.src.Subgroups(target, nested)
-	if err != nil {
-		return lsReport{}, fmt.Errorf("listing subgroups for %s: %w", target, err)
+func buildLsReport(ctx context.Context, s *syncer, target string, nested bool) (lsReport, error) {
+	// The three listings are independent round trips; run them together.
+	var (
+		wg       sync.WaitGroup
+		groups   []*gitlab.Group
+		root     *gitlab.Group
+		projects []*gitlab.Project
+		gErr     error
+		pErr     error
+	)
+	wg.Add(3)
+	go func() { defer wg.Done(); groups, gErr = s.src.Subgroups(ctx, target, nested) }()
+	go func() { defer wg.Done(); root, _ = s.src.Group(ctx, target) }()
+	go func() { defer wg.Done(); projects, pErr = s.src.Projects(ctx, target, nested) }()
+	wg.Wait()
+	if gErr != nil {
+		return lsReport{}, fmt.Errorf("listing subgroups for %s: %w", target, gErr)
 	}
-	if root, err := s.src.Group(target); err == nil && root != nil {
+	if pErr != nil {
+		return lsReport{}, fmt.Errorf("listing projects for %s: %w", target, pErr)
+	}
+	if root != nil {
 		groups = append([]*gitlab.Group{root}, groups...)
-	}
-
-	projects, err := s.src.Projects(target, nested)
-	if err != nil {
-		return lsReport{}, fmt.Errorf("listing projects for %s: %w", target, err)
 	}
 	return assembleReport(s, target, nested, groups, projects), nil
 }
@@ -113,8 +125,8 @@ func buildLsReport(s *syncer, target string, nested bool) (lsReport, error) {
 // buildTopLevelReport lists the instance's top-level groups — the equivalent
 // of `ls /`. Their project counts are not fetched: that would be one API call
 // per group, and the useful answer here is which namespaces exist.
-func buildTopLevelReport(s *syncer) (lsReport, error) {
-	groups, err := s.src.TopLevelGroups()
+func buildTopLevelReport(ctx context.Context, s *syncer) (lsReport, error) {
+	groups, err := s.src.TopLevelGroups(ctx)
 	if err != nil {
 		return lsReport{}, fmt.Errorf("listing top-level groups: %w", err)
 	}
@@ -341,9 +353,9 @@ func runLs(ctx context.Context, opts lsOptions) error {
 
 	var report lsReport
 	if topLevel {
-		report, err = buildTopLevelReport(s)
+		report, err = buildTopLevelReport(ctx, s)
 	} else {
-		report, err = buildLsReport(s, target, opts.Nested)
+		report, err = buildLsReport(ctx, s, target, opts.Nested)
 	}
 	if err != nil {
 		return err

@@ -234,28 +234,28 @@ type fakeSource struct {
 	topErr    error
 }
 
-func (f fakeSource) TopLevelGroups() ([]*gitlab.Group, error) {
+func (f fakeSource) TopLevelGroups(ctx context.Context) ([]*gitlab.Group, error) {
 	if f.topErr != nil {
 		return nil, f.topErr
 	}
 	return f.topLevel, nil
 }
 
-func (f fakeSource) Subgroups(target string, nested bool) ([]*gitlab.Group, error) {
+func (f fakeSource) Subgroups(ctx context.Context, target string, nested bool) ([]*gitlab.Group, error) {
 	if f.subErr != nil {
 		return nil, f.subErr
 	}
 	return f.subgroups[target], nil
 }
 
-func (f fakeSource) Group(target string) (*gitlab.Group, error) {
+func (f fakeSource) Group(ctx context.Context, target string) (*gitlab.Group, error) {
 	if g, ok := f.groups[target]; ok {
 		return g, nil
 	}
 	return nil, fmt.Errorf("group %q not found", target)
 }
 
-func (f fakeSource) Projects(target string, nested bool) ([]*gitlab.Project, error) {
+func (f fakeSource) Projects(ctx context.Context, target string, nested bool) ([]*gitlab.Project, error) {
 	if f.projErr != nil {
 		return nil, f.projErr
 	}
@@ -1164,4 +1164,88 @@ func TestIsUnborn(t *testing.T) {
 	if isUnborn("does-not-exist") {
 		t.Error("not a repository: must not be reported unborn")
 	}
+}
+
+// listPages fetches page 1, then the rest concurrently, keeping API order —
+// and follows next-page links serially when the server reports no total.
+func TestListPages(t *testing.T) {
+	type fetchLog struct {
+		mu    sync.Mutex
+		pages []int
+		max   int
+		cur   int
+	}
+	mk := func(total int, reportTotal bool, failPage int) (func(context.Context, int) ([]string, *gitlab.Response, error), *fetchLog) {
+		log := &fetchLog{}
+		return func(ctx context.Context, page int) ([]string, *gitlab.Response, error) {
+			log.mu.Lock()
+			log.pages = append(log.pages, page)
+			log.cur++
+			if log.cur > log.max {
+				log.max = log.cur
+			}
+			log.mu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			log.mu.Lock()
+			log.cur--
+			log.mu.Unlock()
+			if page == failPage {
+				return nil, nil, fmt.Errorf("page %d exploded", page)
+			}
+			resp := &gitlab.Response{}
+			if page < total {
+				resp.NextPage = int64(page + 1)
+			}
+			if reportTotal {
+				resp.TotalPages = int64(total)
+			}
+			return []string{fmt.Sprintf("p%d-a", page), fmt.Sprintf("p%d-b", page)}, resp, nil
+		}, log
+	}
+
+	t.Run("parallel with a total, ordered", func(t *testing.T) {
+		fetch, log := mk(20, true, 0)
+		got, err := listPages(context.Background(), fetch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 40 || got[0] != "p1-a" || got[2] != "p2-a" || got[39] != "p20-b" {
+			t.Errorf("order or count wrong: %v", got)
+		}
+		if log.max < 2 {
+			t.Errorf("pages should be fetched concurrently, max in flight = %d", log.max)
+		}
+		if log.max > listConcurrency {
+			t.Errorf("concurrency %d exceeds bound %d", log.max, listConcurrency)
+		}
+	})
+
+	t.Run("serial fallback without a total", func(t *testing.T) {
+		fetch, log := mk(4, false, 0)
+		got, err := listPages(context.Background(), fetch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 8 || log.max != 1 {
+			t.Errorf("want 8 items fetched serially, got %d items, max in flight %d", len(got), log.max)
+		}
+		if fmt.Sprint(log.pages) != "[1 2 3 4]" {
+			t.Errorf("pages = %v, want [1 2 3 4]", log.pages)
+		}
+	})
+
+	t.Run("single page", func(t *testing.T) {
+		fetch, log := mk(1, true, 0)
+		got, err := listPages(context.Background(), fetch)
+		if err != nil || len(got) != 2 || len(log.pages) != 1 {
+			t.Errorf("got %v, err %v, pages %v", got, err, log.pages)
+		}
+	})
+
+	t.Run("an error surfaces", func(t *testing.T) {
+		fetch, _ := mk(10, true, 7)
+		if _, err := listPages(context.Background(), fetch); err == nil || !strings.Contains(err.Error(), "page 7") {
+			t.Errorf("want the page error, got %v", err)
+		}
+	})
 }
