@@ -104,9 +104,9 @@ func runStatus(ctx context.Context, opts statusOptions) error {
 		return usageErrf("--jobs must be between 1 and %d, got %d", maxJobs, opts.Jobs)
 	}
 
-	cfg, err := LoadLocalConfig()
+	cfg, err := DiscoverWorkspace()
 	if err != nil {
-		return usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
+		return err
 	}
 
 	cfg.AllowCloneHosts(opts.AllowCloneHosts)

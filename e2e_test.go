@@ -2200,3 +2200,75 @@ func TestE2EIncludeIfRewriteIsHonoured(t *testing.T) {
 		t.Errorf("missing status event:\n%s", stdout)
 	}
 }
+
+// TestE2ECommandsWorkFromAnywhere: sync, status and ls find the workspace
+// from any directory inside it and act on that directory's group — no
+// per-group config needed, and a checkout counts as the group containing it.
+func TestE2ECommandsWorkFromAnywhere(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/team/app", map[string]string{"a.txt": "a"})
+	f.addRepo(t, "acme/other/lib", map[string]string{"l.txt": "l"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.groups["acme/team"] = apiGroup{ID: 2, FullPath: "acme/team"}
+	f.groups["acme/other"] = apiGroup{ID: 3, FullPath: "acme/other"}
+	f.subgroups["acme"] = []apiGroup{{ID: 2, FullPath: "acme/team"}, {ID: 3, FullPath: "acme/other"}}
+	f.projects["acme/team"] = []apiProject{f.project(300, "acme/team/app")}
+	f.projects["acme/other"] = []apiProject{f.project(301, "acme/other/lib")}
+
+	ws := initWorkspace(t, f)
+	// A plain directory for the subgroup: no .gitty/config of its own.
+	teamDir := filepath.Join(ws, "acme", "team")
+	if err := os.MkdirAll(teamDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// sync from the subgroup directory, with no --path: that group only.
+	stdout, stderr, code := runGitty(t, teamDir, nil, "sync", "--anon")
+	if code != 0 {
+		t.Fatalf("sync from subgroup dir exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/team/app\n") {
+		t.Errorf("missing clone event:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(teamDir, "app", "a.txt")); got != "a" {
+		t.Errorf("checkout landed in the wrong place or not at all: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "other")); !os.IsNotExist(err) {
+		t.Error("syncing from acme/team must not touch acme/other")
+	}
+
+	// ls from inside the checkout: the containing group is the context.
+	appDir := filepath.Join(teamDir, "app")
+	stdout, stderr, code = runGitty(t, appDir, nil, "ls", "--anon", "--format=text")
+	if code != 0 {
+		t.Fatalf("ls from inside a checkout exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "project acme/team/app present") {
+		t.Errorf("ls should list the containing group's projects as present:\n%s", stdout)
+	}
+	// ls .. from the checkout is the parent of the containing group.
+	stdout, _, code = runGitty(t, appDir, nil, "ls", "..", "--anon", "--format=text")
+	if code != 0 || !strings.Contains(stdout, "acme/other") {
+		t.Errorf("ls .. from a checkout should list acme (exit %d):\n%s", code, stdout)
+	}
+
+	// status from the subgroup directory covers that subtree only.
+	if _, _, code := runGitty(t, ws, nil, "sync", "--path=acme/other", "--anon"); code != 0 {
+		t.Fatalf("sync acme/other exit = %d", code)
+	}
+	stdout, _, code = runGitty(t, teamDir, nil, "status")
+	if code != 0 {
+		t.Fatalf("status from subgroup dir exit = %d:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "status app branch=") || strings.Contains(stdout, "lib") {
+		t.Errorf("status from acme/team should cover only its subtree:\n%s", stdout)
+	}
+
+	// Outside any workspace the error names the problem and exits 2.
+	_, stderr, code = runGitty(t, t.TempDir(), nil, "ls", "--anon")
+	if code != 2 || !strings.Contains(stderr, "no .gitty/config") {
+		t.Errorf("outside a workspace: exit %d, stderr:\n%s", code, stderr)
+	}
+}

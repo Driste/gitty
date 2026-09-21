@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.0.0"
+const AgentSchemaVersion = "3.1.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -119,13 +119,13 @@ func buildAgentSchema() AgentSchema {
 			},
 			{
 				Name:        "sync",
-				Description: "Sync a GitLab group based on the workspace's .gitty/config. Clones repositories that do not exist locally and runs 'git pull' on those that do. Requires a workspace created by 'init'.",
+				Description: "Sync a GitLab group. Clones repositories that do not exist locally and fast-forwards those that do. Works from anywhere inside a workspace created by 'init': the nearest .gitty/config above the current directory is used, and the directory's position below it is the current group.",
 				InputSchema: InputSchema{
 					Type: "object",
 					Properties: map[string]SchemaProp{
 						"path": {
 							Type:        "string",
-							Description: "GitLab group or subgroup path to sync (e.g., 'tenant/images'). Required unless syncing from a managed subgroup directory that already has its own config.",
+							Description: "GitLab group or subgroup path to sync, relative to the current group (e.g., 'tenant/images'). Omitted, the current directory's group is synced — which is the workspace's root group at the workspace root, so there it is required.",
 						},
 						"token": {
 							Type:        "string",
@@ -191,7 +191,7 @@ func buildAgentSchema() AgentSchema {
 			},
 			{
 				Name:        "status",
-				Description: "Report the branch and freshness of every git checkout in the workspace, one 'status <path> branch=... ahead=N behind=N dirty=BOOL' line per repository. Read-only: it never clones, pulls, or modifies the workspace.",
+				Description: "Report the branch and freshness of every git checkout under the current directory's group, one 'status <path> branch=... ahead=N behind=N dirty=BOOL' line per repository. Works from anywhere inside the workspace. Read-only: it never clones, pulls, or modifies the workspace.",
 				InputSchema: InputSchema{
 					Type: "object",
 					Properties: map[string]SchemaProp{
@@ -244,7 +244,7 @@ func buildAgentSchema() AgentSchema {
 					Properties: map[string]SchemaProp{
 						"path": {
 							Type:        "string",
-							Description: "Group to list, resolved like a shell path against the workspace directory the command runs in: omitted or '.' means the current context (the instance's top-level groups at the workspace root), '/' always means the instance's top-level groups, '..' the parent group, and a leading '/' makes it absolute. Passed as a positional argument (--path is also accepted, but not both).",
+							Description: "Group to list, resolved like a shell path against the current directory's group (any directory inside the workspace; a checkout counts as its containing group): omitted or '.' means the current group (the instance's top-level groups at the workspace root), '/' always means the instance's top-level groups, '..' the parent group, and a leading '/' makes it absolute. Passed as a positional argument (--path is also accepted, but not both).",
 						},
 						"token": {
 							Type:        "string",
