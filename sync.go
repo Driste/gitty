@@ -21,13 +21,16 @@ import (
 // aggregating paginated responses into a single slice.
 type gitlabSource interface {
 	// Subgroups returns the immediate subgroups of target, or every descendant
-	// group when nested is true.
-	Subgroups(ctx context.Context, target string, nested bool) ([]*gitlab.Group, error)
+	// group when nested is true. Archived groups are left out unless archived
+	// is set.
+	Subgroups(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Group, error)
 	// Group returns the group identified by target.
 	Group(ctx context.Context, target string) (*gitlab.Group, error)
 	// Projects returns the projects directly in target, or all projects
-	// including those in subgroups when nested is true.
-	Projects(ctx context.Context, target string, nested bool) ([]*gitlab.Project, error)
+	// including those in subgroups when nested is true. Archived projects are
+	// left out unless archived is set, in which case they are included with
+	// Archived set on each.
+	Projects(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Project, error)
 	// TopLevelGroups returns the instance's top-level groups — the namespaces
 	// visible to the caller, with no parent.
 	TopLevelGroups(ctx context.Context) ([]*gitlab.Group, error)
@@ -61,8 +64,13 @@ type syncer struct {
 	verbose       bool
 	recloneBroken bool
 	jobs          int
-	cred          credential
-	exePath       string // this binary, for the askpass re-exec
+
+	// includeArchived lists archived projects and groups too. Off by default:
+	// an archived project is one its owners have retired, and a workspace
+	// mirroring the live namespace should not keep pulling it down.
+	includeArchived bool
+	cred            credential
+	exePath         string // this binary, for the askpass re-exec
 
 	// acceptNewHostKeys maps to ssh's StrictHostKeyChecking=accept-new:
 	// unknown hosts are recorded without prompting, a changed key is still
@@ -230,6 +238,7 @@ type syncOptions struct {
 	Verbose           bool
 	RecloneBroken     bool
 	AcceptNewHostKeys bool
+	IncludeArchived   bool
 	Jobs              int
 
 	// AllowCloneHosts adds trusted clone hosts for this run only; see
@@ -261,6 +270,7 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.verbose = opts.Verbose
 	s.recloneBroken = opts.RecloneBroken
 	s.acceptNewHostKeys = opts.AcceptNewHostKeys
+	s.includeArchived = opts.IncludeArchived
 	s.jobs = opts.Jobs
 	s.cfg.AllowCloneHosts(opts.AllowCloneHosts)
 
@@ -377,7 +387,7 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	s.diagf("--- Syncing Repositories ---")
 	s.diagf("Fetching projects for: '%s' (Nested: %t)...", target, s.nested)
 
-	allProjects, err := s.src.Projects(ctx, target, s.nested)
+	allProjects, err := s.src.Projects(ctx, target, s.nested, s.includeArchived)
 	if err != nil {
 		s.event("error", target, "listing projects failed")
 		s.diagf("listing projects for %s: %v", target, err)
@@ -1076,7 +1086,7 @@ func (s *syncer) groupsOf(ctx context.Context, target string) (groups []*gitlab.
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		groups, err = s.src.Subgroups(ctx, target, s.nested)
+		groups, err = s.src.Subgroups(ctx, target, s.nested, s.includeArchived)
 	}()
 	go func() {
 		defer wg.Done()
@@ -1170,16 +1180,26 @@ type gitlabClientSource struct {
 	authenticated bool
 }
 
-func (s gitlabClientSource) Subgroups(ctx context.Context, target string, nested bool) ([]*gitlab.Group, error) {
+func (s gitlabClientSource) Subgroups(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Group, error) {
+	// archived=false asks the server to leave archived groups out; with
+	// archived requested the parameter is omitted and everything comes back.
+	// (Group archiving is recent in GitLab; older instances ignore the
+	// parameter, which yields the same "everything" answer.)
+	var only *bool
+	if !archived {
+		only = new(bool)
+	}
 	if nested {
 		return listPages(ctx, func(ctx context.Context, page int) ([]*gitlab.Group, *gitlab.Response, error) {
 			return s.client.Groups.ListDescendantGroups(target, &gitlab.ListDescendantGroupsOptions{
+				Archived:    only,
 				ListOptions: gitlab.ListOptions{PerPage: 100, Page: int64(page)},
 			}, gitlab.WithContext(ctx))
 		})
 	}
 	return listPages(ctx, func(ctx context.Context, page int) ([]*gitlab.Group, *gitlab.Response, error) {
 		return s.client.Groups.ListSubGroups(target, &gitlab.ListSubGroupsOptions{
+			Archived:    only,
 			ListOptions: gitlab.ListOptions{PerPage: 100, Page: int64(page)},
 		}, gitlab.WithContext(ctx))
 	})
@@ -1226,16 +1246,45 @@ func (s gitlabClientSource) TopLevelGroups(ctx context.Context) ([]*gitlab.Group
 	return all, nil
 }
 
-func (s gitlabClientSource) Projects(ctx context.Context, target string, nested bool) ([]*gitlab.Project, error) {
-	// simple=true trims each project to its identifying fields — path, URLs,
-	// default branch — which is all gitty reads, and is a fifth of the bytes
-	// (and a fraction of the server time) of the full representation.
-	simple := true
-	return listPages(ctx, func(ctx context.Context, page int) ([]*gitlab.Project, *gitlab.Response, error) {
-		return s.client.Groups.ListGroupProjects(target, &gitlab.ListGroupProjectsOptions{
-			IncludeSubGroups: &nested,
-			Simple:           &simple,
-			ListOptions:      gitlab.ListOptions{PerPage: 100, Page: int64(page)},
-		}, gitlab.WithContext(ctx))
-	})
+func (s gitlabClientSource) Projects(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Project, error) {
+	list := func(ctx context.Context, archivedOnly bool) ([]*gitlab.Project, error) {
+		// simple=true trims each project to its identifying fields — path,
+		// URLs, default branch — which is all gitty reads, and is a fifth of
+		// the bytes (and a fraction of the server time) of the full
+		// representation. It also drops the archived flag, which is why the
+		// archived state is asked for as a server-side filter instead.
+		simple := true
+		return listPages(ctx, func(ctx context.Context, page int) ([]*gitlab.Project, *gitlab.Response, error) {
+			return s.client.Groups.ListGroupProjects(target, &gitlab.ListGroupProjectsOptions{
+				IncludeSubGroups: &nested,
+				Simple:           &simple,
+				Archived:         &archivedOnly,
+				ListOptions:      gitlab.ListOptions{PerPage: 100, Page: int64(page)},
+			}, gitlab.WithContext(ctx))
+		})
+	}
+	if !archived {
+		return list(ctx, false)
+	}
+
+	// Both halves, concurrently, so each project can be marked.
+	var (
+		wg              sync.WaitGroup
+		live, retired   []*gitlab.Project
+		liveErr, retErr error
+	)
+	wg.Add(2)
+	go func() { defer wg.Done(); live, liveErr = list(ctx, false) }()
+	go func() { defer wg.Done(); retired, retErr = list(ctx, true) }()
+	wg.Wait()
+	if liveErr != nil {
+		return nil, liveErr
+	}
+	if retErr != nil {
+		return nil, retErr
+	}
+	for _, p := range retired {
+		p.Archived = true
+	}
+	return append(live, retired...), nil
 }

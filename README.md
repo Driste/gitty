@@ -13,6 +13,7 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **CI/CD Ready**: Clones over HTTP(S) by default, authenticated with the same token gitty already uses for the API — no SSH keys to provision. Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN`, and exits non-zero when any group or repository fails to sync so a broken pipeline stage is never reported green.
 * **Safe Destinations**: Refuses to write outside the workspace (namespace paths containing `..` or absolute paths are skipped) and reports any repository advertised on a host other than the configured GitLab instance.
 * **Works From Anywhere**: `sync`, `status` and `ls` find the workspace from any directory inside it and act on that directory's group — `cd` into a subgroup and `gitty sync` syncs just that subgroup.
+* **Live Namespace Only**: Projects and groups GitLab has archived are left out of `ls` and `sync` unless you ask for them with `--archived`.
 
 ---
 
@@ -125,8 +126,12 @@ This generates a `.gitty/config` file in the current directory. `gitty` will use
 Once your workspace is initialized, you can pull down your groups and repositories.
 
 ```bash
-gitty sync --path="your/gitlab/group/path" [flags]
+gitty sync [group] [flags]
 ```
+
+The group is a positional argument, relative to the directory you run the
+command in (see below); `--path=<group>` is the older spelling and still
+works. Flags may go on either side of it.
 
 ### Run it from anywhere in the workspace
 
@@ -135,20 +140,26 @@ to the nearest `.gitty/config`, and takes the directory's position below that
 config as the current group. Directories are groups; a git checkout is a
 project, and a command run from inside one acts on the group that contains it.
 No per-group config is needed (the ones `sync --groups` writes still work, and
-are simply found first):
+are simply found first). The search is bounded the way git's own repository
+discovery is: it never crosses a filesystem boundary, and a config owned by
+another user is refused rather than used — the config names the instance that
+receives your token, so one planted in a shared parent directory must not be
+picked up on your behalf:
 
 ```bash
-cd ~/ws                      && gitty sync --path=tenant/images   # from the root: --path is required
-cd ~/ws/tenant/images        && gitty sync                        # the current group: tenant/images
-cd ~/ws/tenant/images/app    && gitty sync                        # inside a checkout: still tenant/images
-cd ~/ws/tenant               && gitty sync --path=images          # --path is relative to the current group
-cd ~/ws/tenant/images        && gitty status                      # only this subtree
+cd ~/ws                      && gitty sync tenant/images   # from the root: the group is required
+cd ~/ws/tenant/images        && gitty sync                 # the current group: tenant/images
+cd ~/ws/tenant/images/app    && gitty sync                 # inside a checkout: still tenant/images
+cd ~/ws/tenant               && gitty sync images          # relative to the current group
+cd ~/ws/tenant/images        && gitty status               # only this subtree
 ```
 
 ### Sync Flags
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--path` | `""` | The GitLab group or subgroup path to sync (e.g., `tenant/images`), relative to the current directory's group. Omitted, the current group is synced — so at the workspace root it is required. |
+| `[group]` | | The GitLab group or subgroup to sync (e.g., `tenant/images`), relative to the current directory's group, as a positional argument. Omitted, the current group is synced — so at the workspace root it is required. |
+| `--path` | `""` | The same, as a flag (deprecated; kept for existing scripts). Not together with the positional form. |
+| `--archived` | `false` | Include projects and groups GitLab has archived. Left out by default. |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
 | `--anon` | `false` | Sync public groups and repositories anonymously. Any `GITLAB_TOKEN` / `CI_JOB_TOKEN` in the environment is ignored, so a stale token cannot turn an anonymous run into a 401. Conflicts with `--token`. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
@@ -258,7 +269,7 @@ Split deployments do this legitimately. Record that it is intended and the note
 goes away:
 
 ```bash
-gitty sync --path="tenant/images" --allow-clone-host=git.internal
+gitty sync tenant/images --allow-clone-host=git.internal
 
 # or store it in the workspace, once:
 gitty init --url="https://gitlab.example.com" --allow-clone-host=git.internal
@@ -281,7 +292,7 @@ which produces a storm of repeated prompts for the same fingerprint.
 For unattended runs, where there is no one to answer, use:
 
 ```bash
-gitty sync --path="tenant/images" --accept-new-host-keys
+gitty sync tenant/images --accept-new-host-keys
 ```
 
 That records unknown host keys automatically while still refusing a host key
@@ -363,9 +374,9 @@ invocation). Personal/project access tokens authenticate as `oauth2`; a
 are only ever sent to the host of the configured instance URL.
 
 ### How `--groups` and `--repos` work together:
-* `gitty sync --path="tenant"`: Syncs **only** the immediate repositories inside `tenant`.
-* `gitty sync --path="tenant" --groups`: Creates **only** the empty directory structure for the `tenant` group and its immediate subgroups.
-* `gitty sync --path="tenant" --groups --repos`: Creates the empty directory structure for subgroups, **and** syncs the immediate repositories.
+* `gitty sync tenant`: Syncs **only** the immediate repositories inside `tenant`.
+* `gitty sync tenant --groups`: Creates **only** the empty directory structure for the `tenant` group and its immediate subgroups.
+* `gitty sync tenant --groups --repos`: Creates the empty directory structure for subgroups, **and** syncs the immediate repositories.
 
 ---
 
@@ -376,31 +387,31 @@ Sync all repositories directly inside `tenant/images` (does not pull repos insid
 ```bash
 export GITLAB_TOKEN="glpat-YOUR_PERSONAL_TOKEN"
 
-gitty sync --path="tenant/images"
+gitty sync tenant/images
 ```
 
 ### 2. Full Recursive Sync (Nested)
 Sync **everything** (all repositories in the group and all repositories in every subgroup beneath it).
 ```bash
-gitty sync --path="tenant/images" --nested
+gitty sync tenant/images --nested
 ```
 
 ### 3. Recreate Group Hierarchy
 Only create the folder structure for all subgroups beneath `engineering`, leaving them empty.
 ```bash
-gitty sync --path="engineering" --groups --nested
+gitty sync engineering --groups --nested
 ```
 
 ### 4. Dry Run
 Safely check what repositories would be downloaded recursively before actually doing it.
 ```bash
-gitty sync --path="tenant/images" --nested --dry-run
+gitty sync tenant/images --nested --dry-run
 ```
 
 ### 5. Anonymous Public Sync
 Sync a public group without any token (only public groups and repositories are visible).
 ```bash
-gitty sync --path="gitlab-examples/wayne-enterprises" --nested --anon
+gitty sync gitlab-examples/wayne-enterprises --nested --anon
 ```
 
 ### 6. GitLab CI/CD Pipeline
@@ -419,7 +430,7 @@ clone_all_repos:
   script:
     - go build -o gitty .
     - ./gitty init
-    - ./gitty sync --path="tenant/images" --nested
+    - ./gitty sync tenant/images --nested
 ```
 
 ---
@@ -560,7 +571,7 @@ The output is a single JSON document shaped like an MCP tool list:
 Each tool's `inputSchema` is JSON Schema, and `invocation` tells the agent how
 to map the arguments onto an argv array (e.g. the `sync` tool with
 `{"path": "tenant/images", "nested": true}` becomes
-`gitty sync --path=tenant/images --nested`).
+`gitty sync tenant/images --nested`).
 
 ---
 

@@ -139,18 +139,38 @@ func DiscoverWorkspace() (*Config, error) {
 }
 
 // findConfigDir returns the nearest ancestor of dir (dir included) holding a
-// .gitty/config.
+// .gitty/config — the way git finds a repository from a subdirectory, and
+// with the same two guards git applies:
+//
+// The search does not cross a filesystem boundary. A workspace lives on one
+// filesystem; what is mounted above it is not part of it.
+//
+// A config is accepted only if the user running gitty owns it (root's count
+// as theirs). The workspace config names the GitLab instance gitty talks to
+// and sends its token to, so a config planted by another user in a shared
+// parent directory — /tmp, a shared build root — must never be picked up on
+// their behalf. This is git's safe.directory rule, applied to the one file
+// where it matters here.
 func findConfigDir(dir string) (string, error) {
+	dev := deviceOf(dir)
 	for d := dir; ; {
-		if fi, err := os.Stat(filepath.Join(d, ConfigDir, ConfigName)); err == nil && !fi.IsDir() {
+		if dev != 0 && deviceOf(d) != dev {
+			break
+		}
+		conf := filepath.Join(d, ConfigDir, ConfigName)
+		if fi, err := os.Stat(conf); err == nil && !fi.IsDir() {
+			if !ownedByCurrentUser(conf) {
+				return "", usageErrf("refusing to use %s: it is owned by another user (a workspace config decides which instance receives your token)", conf)
+			}
 			return d, nil
 		}
 		parent := filepath.Dir(d)
 		if parent == d {
-			return "", usageErrf("no .gitty/config found in %s or any parent directory; run 'gitty init' at the workspace root first", dir)
+			break
 		}
 		d = parent
 	}
+	return "", usageErrf("no .gitty/config found in %s or any parent directory on the same filesystem; run 'gitty init' at the workspace root first", dir)
 }
 
 // contextBelow walks from cfgDir down towards wd and returns the deepest
