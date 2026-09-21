@@ -17,9 +17,9 @@ import (
 // not resolve a target group: commands that take one (sync) add it via
 // setupWorkspace, while ls resolves its own argument shell-style.
 func newWorkspaceSyncer(tokenFlag string, anon bool) (*syncer, error) {
-	cfg, err := LoadLocalConfig()
+	cfg, err := DiscoverWorkspace()
 	if err != nil {
-		return nil, usageErrf("no .gitty/config found in this directory; run 'gitty init' first")
+		return nil, err
 	}
 
 	cred, err := resolveCredentialFor(tokenFlag, anon)

@@ -8,10 +8,11 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Workspace Config**: Initialize a workspace with `gitty init` so you don't have to repeatedly pass your GitLab URL or SSH/HTTP preferences.
 * **Granular Syncing**: Choose to sync only repositories, only empty group directory structures, or both.
 * **Recursive or Flat**: Sync only the immediate group, or use the `--nested` flag to recursively pull everything underneath it.
-* **Smart Updates**: Automatically runs `git pull --ff-only` if the local directory exists, or `git clone` if it doesn't. Fast-forward-only pulls avoid surprise merge commits — a diverged or dirty checkout fails loudly and is reported instead of silently merged.
+* **Smart Updates**: Fast-forwards a checkout that already exists and brings up one that doesn't. Fast-forward-only pulls avoid surprise merge commits — a diverged or dirty checkout fails loudly and is reported instead of silently merged.
 * **Dry Runs**: Test your sync commands safely with `--dry-run` to see exactly what folders will be created and which repos will be cloned.
 * **CI/CD Ready**: Clones over HTTP(S) by default, authenticated with the same token gitty already uses for the API — no SSH keys to provision. Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN`, and exits non-zero when any group or repository fails to sync so a broken pipeline stage is never reported green.
-* **Safe Destinations**: Refuses to write outside the workspace (namespace paths containing `..` or absolute paths are skipped) and verifies each clone URL points at the configured GitLab host before running `git clone`.
+* **Safe Destinations**: Refuses to write outside the workspace (namespace paths containing `..` or absolute paths are skipped) and reports any repository advertised on a host other than the configured GitLab instance.
+* **Works From Anywhere**: `sync`, `status` and `ls` find the workspace from any directory inside it and act on that directory's group — `cd` into a subgroup and `gitty sync` syncs just that subgroup.
 
 ---
 
@@ -121,16 +122,33 @@ This generates a `.gitty/config` file in the current directory. `gitty` will use
 
 ## Usage (`gitty sync`)
 
-Once your workspace is initialized, you can pull down your groups and repositories. 
+Once your workspace is initialized, you can pull down your groups and repositories.
 
 ```bash
 gitty sync --path="your/gitlab/group/path" [flags]
 ```
 
+### Run it from anywhere in the workspace
+
+Every command locates the workspace by walking up from the current directory
+to the nearest `.gitty/config`, and takes the directory's position below that
+config as the current group. Directories are groups; a git checkout is a
+project, and a command run from inside one acts on the group that contains it.
+No per-group config is needed (the ones `sync --groups` writes still work, and
+are simply found first):
+
+```bash
+cd ~/ws                      && gitty sync --path=tenant/images   # from the root: --path is required
+cd ~/ws/tenant/images        && gitty sync                        # the current group: tenant/images
+cd ~/ws/tenant/images/app    && gitty sync                        # inside a checkout: still tenant/images
+cd ~/ws/tenant               && gitty sync --path=images          # --path is relative to the current group
+cd ~/ws/tenant/images        && gitty status                      # only this subtree
+```
+
 ### Sync Flags
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--path` | `""` | **(Required)** The GitLab group or subgroup path (e.g., `tenant/images`). |
+| `--path` | `""` | The GitLab group or subgroup path to sync (e.g., `tenant/images`), relative to the current directory's group. Omitted, the current group is synced — so at the workspace root it is required. |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
 | `--anon` | `false` | Sync public groups and repositories anonymously. Any `GITLAB_TOKEN` / `CI_JOB_TOKEN` in the environment is ignored, so a stale token cannot turn an anonymous run into a 401. Conflicts with `--token`. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
@@ -408,9 +426,10 @@ clone_all_repos:
 
 ## Inspecting a workspace (`gitty status`)
 
-Reports the branch and freshness of every checkout in the workspace, one line
-per repository. It is read-only and needs no token or network access — results
-reflect the last sync unless you pass `--fetch`.
+Reports the branch and freshness of every checkout under the current
+directory's group (the whole workspace from its root), one line per repository.
+It is read-only and needs no token or network access — results reflect the
+last sync unless you pass `--fetch`.
 
 ```bash
 gitty status
@@ -447,7 +466,9 @@ marking each project `present` (already checked out) or `new` (a sync would
 clone it). It never invokes git and never writes to the workspace.
 
 `ls` takes its target as a positional argument and resolves it the way a shell
-resolves a directory, against the workspace directory you are standing in:
+resolves a directory, against the group of the directory you are standing in
+(any directory in the workspace; inside a checkout, the group that contains
+it):
 
 ```bash
 gitty ls                      # the current context; at the workspace root, the top-level groups
@@ -458,10 +479,9 @@ gitty ls /tenant/images       # absolute, from the instance root
 gitty ls ..                   # the parent group
 ```
 
-Inside a managed subgroup directory (one `sync --groups` created) a bare
-`gitty ls` lists that subgroup — no flags required. Flags may go on either side
-of the argument: `gitty ls acme --nested` works as well as
-`gitty ls --nested acme`.
+Inside any subgroup directory a bare `gitty ls` lists that subgroup — no flags
+required. Flags may go on either side of the argument: `gitty ls acme --nested`
+works as well as `gitty ls --nested acme`.
 
 On a terminal it prints a tree:
 
