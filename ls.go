@@ -23,14 +23,18 @@ type lsOptions struct {
 	Token  string
 	Anon   bool
 	Nested bool
-	Format string
-	Color  string
+	// IncludeArchived lists archived projects and groups too; they are left
+	// out by default, as sync leaves them out.
+	IncludeArchived bool
+	Format          string
+	Color           string
 }
 
 // lsProject is one remote project and whether it is already checked out.
 type lsProject struct {
-	Path    string `json:"path"`
-	Present bool   `json:"present"`
+	Path     string `json:"path"`
+	Present  bool   `json:"present"`
+	Archived bool   `json:"archived,omitempty"`
 }
 
 // lsGroup is one remote group with the projects directly inside it.
@@ -52,6 +56,7 @@ type lsSummary struct {
 	Projects int `json:"projects"`
 	New      int `json:"new"`
 	Present  int `json:"present"`
+	Archived int `json:"archived,omitempty"`
 }
 
 // resolveLsTarget maps an ls argument onto a GitLab group path the way a shell
@@ -106,9 +111,9 @@ func buildLsReport(ctx context.Context, s *syncer, target string, nested bool) (
 		pErr     error
 	)
 	wg.Add(3)
-	go func() { defer wg.Done(); groups, gErr = s.src.Subgroups(ctx, target, nested) }()
+	go func() { defer wg.Done(); groups, gErr = s.src.Subgroups(ctx, target, nested, s.includeArchived) }()
 	go func() { defer wg.Done(); root, _ = s.src.Group(ctx, target) }()
-	go func() { defer wg.Done(); projects, pErr = s.src.Projects(ctx, target, nested) }()
+	go func() { defer wg.Done(); projects, pErr = s.src.Projects(ctx, target, nested, s.includeArchived) }()
 	wg.Wait()
 	if gErr != nil {
 		return lsReport{}, fmt.Errorf("listing subgroups for %s: %w", target, gErr)
@@ -147,8 +152,11 @@ func assembleReport(s *syncer, target string, nested bool, groups []*gitlab.Grou
 		if i := strings.LastIndex(parent, "/"); i != -1 {
 			parent = parent[:i]
 		}
-		byGroup[parent] = append(byGroup[parent], lsProject{Path: p.PathWithNamespace, Present: present})
+		byGroup[parent] = append(byGroup[parent], lsProject{Path: p.PathWithNamespace, Present: present, Archived: p.Archived})
 		report.Summary.Projects++
+		if p.Archived {
+			report.Summary.Archived++
+		}
 		if present {
 			report.Summary.Present++
 		} else {
@@ -259,6 +267,9 @@ func writeLsTree(w io.Writer, r lsReport, p palette) {
 			r.Summary.Projects, plural(r.Summary.Projects, "project"),
 			p.paint(p.present, fmt.Sprintf("%d present", r.Summary.Present)),
 			p.paint(p.missing, fmt.Sprintf("%d to clone", r.Summary.New)))
+		if r.Summary.Archived > 0 {
+			summary += p.paint(p.dim, fmt.Sprintf(" (%d archived)", r.Summary.Archived))
+		}
 	}
 	fmt.Fprintln(w, summary)
 }
@@ -289,6 +300,9 @@ func writeChildren(w io.Writer, n *lsNode, prefix string, p palette) {
 		if proj.Present {
 			state, style = "present", p.present
 		}
+		if proj.Archived {
+			state += ", archived"
+		}
 		fmt.Fprintf(w, "%s%s  %s\n",
 			prefix+branch, p.paint(style, lastSegment(proj.Path)), p.paint(p.dim, state))
 		i++
@@ -312,11 +326,19 @@ func writeLsText(s *syncer, r lsReport) {
 			if proj.Present {
 				state = "present"
 			}
+			if proj.Archived {
+				s.event("project", proj.Path, state, "archived")
+				continue
+			}
 			s.event("project", proj.Path, state)
 		}
 	}
-	fmt.Fprintf(s.out, "summary groups=%d projects=%d new=%d present=%d\n",
+	line := fmt.Sprintf("summary groups=%d projects=%d new=%d present=%d",
 		r.Summary.Groups, r.Summary.Projects, r.Summary.New, r.Summary.Present)
+	if r.Summary.Archived > 0 {
+		line += fmt.Sprintf(" archived=%d", r.Summary.Archived)
+	}
+	fmt.Fprintln(s.out, line)
 }
 
 // runLs prints the remote group/project inventory for a target, marking which
@@ -339,6 +361,7 @@ func runLs(ctx context.Context, opts lsOptions) error {
 		return err
 	}
 	s.nested = opts.Nested
+	s.includeArchived = opts.IncludeArchived
 
 	target, topLevel := resolveLsTarget(opts.Target, s.cfg.RootPath)
 

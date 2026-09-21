@@ -120,6 +120,7 @@ func gitRun(t *testing.T, dir string, args ...string) {
 type apiGroup struct {
 	ID       int    `json:"id"`
 	FullPath string `json:"full_path"`
+	Archived bool   `json:"archived,omitempty"`
 }
 
 type apiProject struct {
@@ -128,6 +129,7 @@ type apiProject struct {
 	HTTPURLToRepo     string `json:"http_url_to_repo"`
 	SSHURLToRepo      string `json:"ssh_url_to_repo"`
 	DefaultBranch     string `json:"default_branch,omitempty"`
+	Archived          bool   `json:"archived,omitempty"`
 }
 
 type fakeGitLab struct {
@@ -298,6 +300,7 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				list = append(list, projects...)
 			}
 		}
+		list = filterArchivedProjects(list, r.URL.Query().Get("archived"))
 		lo, hi := paginate(w, r, f.pageSize, len(list))
 		writeJSON(w, http.StatusOK, list[lo:hi])
 
@@ -307,7 +310,7 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			notFound()
 			return
 		}
-		writeJSON(w, http.StatusOK, orEmptyGroups(f.subgroups[target]))
+		writeJSON(w, http.StatusOK, orEmptyGroups(filterArchivedGroups(f.subgroups[target], r.URL.Query().Get("archived"))))
 
 	case strings.HasSuffix(rest, "/descendant_groups"):
 		target := strings.TrimSuffix(rest, "/descendant_groups")
@@ -315,7 +318,7 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			notFound()
 			return
 		}
-		writeJSON(w, http.StatusOK, orEmptyGroups(f.descendants[target]))
+		writeJSON(w, http.StatusOK, orEmptyGroups(filterArchivedGroups(f.descendants[target], r.URL.Query().Get("archived"))))
 
 	default:
 		if g, known := f.groups[rest]; known {
@@ -363,6 +366,36 @@ func paginate(w http.ResponseWriter, r *http.Request, pageSize, n int) (int, int
 		w.Header().Set("X-Next-Page", strconv.Itoa(page+1))
 	}
 	return lo, hi
+}
+
+// filterArchivedProjects applies GitLab's archived query parameter: "true"
+// keeps only archived projects, "false" only live ones, absent keeps all.
+func filterArchivedProjects(in []apiProject, param string) []apiProject {
+	if param == "" {
+		return in
+	}
+	want := param == "true"
+	var out []apiProject
+	for _, p := range in {
+		if p.Archived == want {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func filterArchivedGroups(in []apiGroup, param string) []apiGroup {
+	if param == "" {
+		return in
+	}
+	want := param == "true"
+	var out []apiGroup
+	for _, g := range in {
+		if g.Archived == want {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // project builds an apiProject whose clone URL points at this fake server's
@@ -2270,5 +2303,89 @@ func TestE2ECommandsWorkFromAnywhere(t *testing.T) {
 	_, stderr, code = runGitty(t, t.TempDir(), nil, "ls", "--anon")
 	if code != 2 || !strings.Contains(stderr, "no .gitty/config") {
 		t.Errorf("outside a workspace: exit %d, stderr:\n%s", code, stderr)
+	}
+}
+
+// TestE2EArchivedExcludedByDefault: archived projects and groups are neither
+// listed nor synced unless --archived asks for them, and then ls says which
+// ones they are.
+func TestE2EArchivedExcludedByDefault(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/live", map[string]string{"l.txt": "l"})
+	f.addRepo(t, "acme/retired", map[string]string{"r.txt": "r"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.subgroups["acme"] = []apiGroup{{ID: 2, FullPath: "acme/old", Archived: true}, {ID: 3, FullPath: "acme/new"}}
+	f.groups["acme/old"] = apiGroup{ID: 2, FullPath: "acme/old", Archived: true}
+	f.groups["acme/new"] = apiGroup{ID: 3, FullPath: "acme/new"}
+	retired := f.project(401, "acme/retired")
+	retired.Archived = true
+	f.projects["acme"] = []apiProject{f.project(400, "acme/live"), retired}
+
+	ws := initWorkspace(t, f)
+
+	// ls: archived left out by default, no summary noise about it.
+	stdout, _, code := runGitty(t, ws, nil, "ls", "acme", "--anon", "--format=text")
+	if code != 0 {
+		t.Fatalf("ls exit = %d:\n%s", code, stdout)
+	}
+	if strings.Contains(stdout, "retired") || strings.Contains(stdout, "acme/old") {
+		t.Errorf("archived items listed by default:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "project acme/live new\n") || !strings.Contains(stdout, "group acme/new ") {
+		t.Errorf("live items missing:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "archived=") {
+		t.Errorf("summary should not mention archived when none were requested:\n%s", stdout)
+	}
+
+	// ls --archived: included and marked.
+	stdout, _, code = runGitty(t, ws, nil, "ls", "acme", "--anon", "--format=text", "--archived")
+	if code != 0 {
+		t.Fatalf("ls --archived exit = %d:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "project acme/retired new archived\n") || !strings.Contains(stdout, "group acme/old ") {
+		t.Errorf("archived items should be listed and marked:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "archived=1") {
+		t.Errorf("summary should count archived projects:\n%s", stdout)
+	}
+
+	// sync (positional target): only the live project is brought up.
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync exit = %d:\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "clone acme/live\n") || strings.Contains(stdout, "acme/retired") {
+		t.Errorf("sync should bring up live projects only:\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "retired")); !os.IsNotExist(err) {
+		t.Error("archived project must not be cloned by default")
+	}
+
+	// sync --archived brings the archived one too; --groups skips archived groups by default.
+	if _, _, code := runGitty(t, ws, nil, "sync", "acme", "--anon", "--archived"); code != 0 {
+		t.Fatalf("sync --archived exit = %d", code)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "retired", "r.txt")); got != "r" {
+		t.Errorf("archived project not cloned with --archived: %q", got)
+	}
+	if _, _, code := runGitty(t, ws, nil, "sync", "acme", "--groups", "--anon"); code != 0 {
+		t.Fatalf("sync --groups exit = %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "old")); !os.IsNotExist(err) {
+		t.Error("archived group directory created without --archived")
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "new")); err != nil {
+		t.Error("live group directory missing")
+	}
+
+	// --path still works, but not together with the positional argument.
+	if _, _, code := runGitty(t, ws, nil, "sync", "--path=acme", "--anon", "--dry-run"); code != 0 {
+		t.Errorf("--path form should still work, exit %d", code)
+	}
+	if _, stderr, code := runGitty(t, ws, nil, "sync", "acme", "--path=acme", "--anon"); code != 2 || !strings.Contains(stderr, "not both") {
+		t.Errorf("both forms together should be a usage error (exit %d):\n%s", code, stderr)
 	}
 }

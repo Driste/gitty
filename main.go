@@ -35,7 +35,7 @@ func main() {
 	initCmd.Var(&initCloneHosts, "allow-clone-host", "Additional host whose repositories this workspace may clone and send its token to (repeatable, or comma-separated)")
 
 	syncCmd := flag.NewFlagSet("sync", flag.ExitOnError)
-	syncPath := syncCmd.String("path", "", "GitLab Group Path (e.g., tenant/images) (required)")
+	syncPath := syncCmd.String("path", "", "GitLab group path (deprecated: pass it as a positional argument)")
 	syncToken := syncCmd.String("token", "", "GitLab Access Token (falls back to env vars)")
 	syncDryRun := syncCmd.Bool("dry-run", false, "Print what would happen without actually making changes")
 	syncGroups := syncCmd.Bool("groups", false, "Fetch and create group/subgroup directory structures")
@@ -46,6 +46,7 @@ func main() {
 	syncRecloneBroken := syncCmd.Bool("reclone-broken", false, "Move aside non-repo directories that block a clone (renamed, never deleted) and re-clone")
 	syncJobs := syncCmd.Int("jobs", 4, "Number of concurrent repo clone/pull operations (1-16)")
 	syncAcceptHostKeys := syncCmd.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
+	syncArchived := syncCmd.Bool("archived", false, "Include archived projects and groups (left out by default)")
 	var syncCloneHosts stringList
 	syncCmd.Var(&syncCloneHosts, "allow-clone-host", "Additional host whose repositories may be cloned and sent this workspace's token (repeatable, or comma-separated)")
 
@@ -64,6 +65,7 @@ func main() {
 	lsToken := lsCmd.String("token", "", "GitLab Access Token (falls back to env vars)")
 	lsAnon := lsCmd.Bool("anon", false, "List public resources anonymously (no token required)")
 	lsNested := lsCmd.Bool("nested", false, "Include nested subgroups/projects recursively")
+	lsArchived := lsCmd.Bool("archived", false, "Include archived projects and groups (left out by default)")
 	lsFormat := lsCmd.String("format", "auto", "Output format: auto, tree, text, or json")
 	lsColor := lsCmd.String("color", "auto", "Colorize output: auto, always, or never")
 
@@ -102,10 +104,24 @@ func main() {
 			CloneHosts: initCloneHosts,
 		}))
 	case "sync":
-		syncCmd.Parse(os.Args[2:])
+		// The group is a positional argument, relative to the current
+		// directory's group; flags may sit on either side of it. --path is
+		// the older spelling and still works.
+		syncFlagArgs, syncPositional := splitFlagArgs(syncCmd, os.Args[2:])
+		syncCmd.Parse(syncFlagArgs)
+		syncTarget := *syncPath
+		if len(syncPositional) > 0 {
+			if syncTarget != "" {
+				exitOnError(usageErrf("pass the group either as an argument or with --path, not both"))
+			}
+			syncTarget = syncPositional[0]
+		}
+		if len(syncPositional) > 1 {
+			exitOnError(usageErrf("sync takes at most one group argument, got %d", len(syncPositional)))
+		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		err := runSync(ctx, syncOptions{
-			Path:          *syncPath,
+			Path:          syncTarget,
 			Token:         *syncToken,
 			DryRun:        *syncDryRun,
 			Groups:        *syncGroups,
@@ -117,6 +133,7 @@ func main() {
 			Jobs:          *syncJobs,
 
 			AcceptNewHostKeys: *syncAcceptHostKeys,
+			IncludeArchived:   *syncArchived,
 			AllowCloneHosts:   syncCloneHosts,
 		})
 		stop()
@@ -152,12 +169,13 @@ func main() {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		err := runLs(ctx, lsOptions{
-			Target: lsTarget,
-			Token:  *lsToken,
-			Anon:   *lsAnon,
-			Nested: *lsNested,
-			Format: *lsFormat,
-			Color:  *lsColor,
+			Target:          lsTarget,
+			Token:           *lsToken,
+			Anon:            *lsAnon,
+			Nested:          *lsNested,
+			IncludeArchived: *lsArchived,
+			Format:          *lsFormat,
+			Color:           *lsColor,
 		})
 		stop()
 		exitOnError(err)
@@ -247,7 +265,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "Usage: gitty <command> [flags]")
 	fmt.Fprintln(os.Stderr, "\nCommands:")
 	fmt.Fprintln(os.Stderr, "  init    Initialize a .gitty/config file in the current directory")
-	fmt.Fprintln(os.Stderr, "  sync    Sync (clone/pull) a GitLab group based on the .gitty/config")
+	fmt.Fprintln(os.Stderr, "  sync    Sync (clone/pull) a GitLab group: gitty sync [group] [flags]")
 	fmt.Fprintln(os.Stderr, "  status  Report the branch and freshness of every checkout in the workspace")
 	fmt.Fprintln(os.Stderr, "  ls      List the remote groups/projects for a target and what a sync would clone")
 	fmt.Fprintln(os.Stderr, "  agent   Print an MCP-style schema describing how an LLM/agent should use gitty")

@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.1.0"
+const AgentSchemaVersion = "3.2.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -125,7 +125,7 @@ func buildAgentSchema() AgentSchema {
 					Properties: map[string]SchemaProp{
 						"path": {
 							Type:        "string",
-							Description: "GitLab group or subgroup path to sync, relative to the current group (e.g., 'tenant/images'). Omitted, the current directory's group is synced — which is the workspace's root group at the workspace root, so there it is required.",
+							Description: "GitLab group or subgroup path to sync, relative to the current directory's group (e.g., 'tenant/images'). Passed as a positional argument: gitty sync <path> (--path is also accepted, but not both). Omitted, the current directory's group is synced — at the workspace root there is no such group, so there it is required.",
 						},
 						"token": {
 							Type:        "string",
@@ -176,6 +176,11 @@ func buildAgentSchema() AgentSchema {
 							Description: "Print what would happen without creating directories or executing git commands.",
 							Default:     false,
 						},
+						"archived": {
+							Type:        "boolean",
+							Description: "Include projects and groups GitLab has archived. They are left out by default, so a workspace mirrors the live namespace.",
+							Default:     false,
+						},
 						"allow-clone-host": {
 							Type:        "string",
 							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
@@ -186,7 +191,7 @@ func buildAgentSchema() AgentSchema {
 				Invocation: Invocation{
 					Command:   "gitty",
 					BaseArgs:  []string{"sync"},
-					FlagStyle: "--<name>=<value> for strings, --<name> for booleans",
+					FlagStyle: "the 'path' argument is positional (gitty sync <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it",
 				},
 			},
 			{
@@ -258,6 +263,11 @@ func buildAgentSchema() AgentSchema {
 						"nested": {
 							Type:        "boolean",
 							Description: "Recurse into nested subgroups instead of listing only the immediate group. Per-group project counts are only complete in this mode.",
+							Default:     false,
+						},
+						"archived": {
+							Type:        "boolean",
+							Description: "Include projects and groups GitLab has archived, marking each archived project. Left out by default, matching what sync would clone.",
 							Default:     false,
 						},
 						"format": {

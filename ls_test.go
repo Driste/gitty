@@ -320,3 +320,44 @@ func TestRunLsRequiresWorkspace(t *testing.T) {
 		t.Errorf("ls without a workspace should be a usage error (exit 2), got %v", err)
 	}
 }
+
+// ls marks archived projects in every format when they are requested.
+func TestLsMarksArchived(t *testing.T) {
+	t.Chdir(t.TempDir())
+	src := fakeSource{
+		groups: map[string]*gitlab.Group{"acme": {FullPath: "acme"}},
+		projects: map[string][]*gitlab.Project{
+			"acme": {
+				{PathWithNamespace: "acme/live", HTTPURLToRepo: "https://gitlab.com/acme/live.git"},
+				{PathWithNamespace: "acme/retired", HTTPURLToRepo: "https://gitlab.com/acme/retired.git", Archived: true},
+			},
+		},
+	}
+	s, stdout, _ := newTestSyncer(&Config{URL: "https://gitlab.com", HTTP: true}, src, (&recordingGit{}).run)
+	s.includeArchived = true
+	report, err := buildLsReport(context.Background(), s, "acme", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Archived != 1 || report.Summary.Projects != 2 {
+		t.Errorf("summary = %+v", report.Summary)
+	}
+
+	writeLsText(s, report)
+	if !strings.Contains(stdout.String(), "project acme/retired new archived\n") || !strings.Contains(stdout.String(), "archived=1") {
+		t.Errorf("text form:\n%s", stdout.String())
+	}
+
+	var tree bytes.Buffer
+	writeLsTree(&tree, report, newPalette(false))
+	if !strings.Contains(tree.String(), "retired  new, archived") || !strings.Contains(tree.String(), "(1 archived)") {
+		t.Errorf("tree form:\n%s", tree.String())
+	}
+
+	// Without the flag the fake, like GitLab, does not return them at all.
+	s.includeArchived = false
+	report, _ = buildLsReport(context.Background(), s, "acme", false)
+	if report.Summary.Projects != 1 || report.Summary.Archived != 0 {
+		t.Errorf("default summary = %+v", report.Summary)
+	}
+}

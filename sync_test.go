@@ -241,11 +241,22 @@ func (f fakeSource) TopLevelGroups(ctx context.Context) ([]*gitlab.Group, error)
 	return f.topLevel, nil
 }
 
-func (f fakeSource) Subgroups(ctx context.Context, target string, nested bool) ([]*gitlab.Group, error) {
+func (f fakeSource) Subgroups(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Group, error) {
 	if f.subErr != nil {
 		return nil, f.subErr
 	}
-	return f.subgroups[target], nil
+	if archived {
+		return f.subgroups[target], nil
+	}
+	// The fake has no archived flag on groups (client-go's Group lacks one);
+	// a group named with an "-archived" suffix stands in for one.
+	var out []*gitlab.Group
+	for _, g := range f.subgroups[target] {
+		if !strings.HasSuffix(g.FullPath, "-archived") {
+			out = append(out, g)
+		}
+	}
+	return out, nil
 }
 
 func (f fakeSource) Group(ctx context.Context, target string) (*gitlab.Group, error) {
@@ -255,9 +266,23 @@ func (f fakeSource) Group(ctx context.Context, target string) (*gitlab.Group, er
 	return nil, fmt.Errorf("group %q not found", target)
 }
 
-func (f fakeSource) Projects(ctx context.Context, target string, nested bool) ([]*gitlab.Project, error) {
+func (f fakeSource) Projects(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Project, error) {
 	if f.projErr != nil {
 		return nil, f.projErr
+	}
+	if !archived {
+		var live []*gitlab.Project
+		for _, p := range f.projects[target] {
+			if !p.Archived {
+				live = append(live, p)
+			}
+		}
+		for _, p := range live {
+			if p.DefaultBranch == "" {
+				p.DefaultBranch = "main"
+			}
+		}
+		return live, nil
 	}
 	// Real projects report their default branch; fixtures that leave it out
 	// get the common one, so a bring-up does not have to ask the remote.
@@ -1248,4 +1273,61 @@ func TestListPages(t *testing.T) {
 			t.Errorf("want the page error, got %v", err)
 		}
 	})
+}
+
+// Archived projects are retired by their owners; a sync leaves them alone
+// unless asked, and then treats them like any other project.
+func TestSyncSkipsArchivedByDefault(t *testing.T) {
+	src := fakeSource{projects: map[string][]*gitlab.Project{
+		"acme": {
+			{PathWithNamespace: "acme/live", HTTPURLToRepo: "https://gitlab.com/acme/live.git"},
+			{PathWithNamespace: "acme/retired", HTTPURLToRepo: "https://gitlab.com/acme/retired.git", Archived: true},
+		},
+	}}
+
+	t.Run("default", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		rec := &recordingGit{}
+		s, stdout, _ := newTestSyncer(&Config{URL: "https://gitlab.com", HTTP: true}, src, rec.run)
+		s.syncRepos(context.Background(), "acme")
+		if !strings.Contains(stdout.String(), "clone acme/live\n") || strings.Contains(stdout.String(), "acme/retired") {
+			t.Errorf("want only the live project:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("--archived", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		rec := &recordingGit{}
+		s, stdout, _ := newTestSyncer(&Config{URL: "https://gitlab.com", HTTP: true}, src, rec.run)
+		s.includeArchived = true
+		s.syncRepos(context.Background(), "acme")
+		if !strings.Contains(stdout.String(), "clone acme/retired\n") {
+			t.Errorf("--archived should include the archived project:\n%s", stdout.String())
+		}
+	})
+}
+
+// A .gitty/config owned by someone else is refused, since it decides which
+// instance receives the user's token.
+func TestDiscoverWorkspaceRefusesForeignConfig(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to create a file owned by another user")
+	}
+	root := t.TempDir()
+	if err := SaveConfigTo(root, &Config{URL: "https://evil.example.com", HTTP: true}); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(root, ConfigDir, ConfigName)
+	if err := os.Chown(conf, 65534, 65534); err != nil {
+		t.Skipf("chown: %v", err)
+	}
+	sub := filepath.Join(root, "acme")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
+	_, err := DiscoverWorkspace()
+	if err == nil || !strings.Contains(err.Error(), "owned by another user") || exitCode(err) != 2 {
+		t.Errorf("want a refusal naming the owner problem, got %v", err)
+	}
 }
