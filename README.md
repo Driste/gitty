@@ -167,18 +167,18 @@ cd ~/ws/tenant/images        && gitty status               # only this subtree
 | `--nested` | `false` | Include nested subgroups and projects recursively. |
 | `--dry-run`| `false` | Print planned actions (`plan clone <path>` etc.) without creating directories or executing git commands. Dry-run output is diffable against a real run's actions and produces the identical `summary` line. |
 | `--jobs` | `4` | Number of concurrent repo clone/pull operations (1-16). `--jobs=1` restores fully serial behavior. |
-| `--verbose` | `false` | Print gitty's version, each git invocation and its output, and — after every clone or pull — the origin URL git itself resolved from inside the checkout, so you can see whether a `url.<base>.insteadOf` rule took effect. URL credentials are redacted. |
+| `--verbose` | `false` | Print gitty's version, git's version and `HOME`; each git invocation and its output; and — after every clone or pull — the origin URL git itself resolved from inside the checkout, so you can see whether a `url.<base>.insteadOf` rule took effect. URL credentials are redacted. |
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
 | `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
 | `--allow-clone-host` | `""` | Record an extra host this run expects to clone from, silencing the note about it. Repeatable, or comma-separated. Adds to whatever `init` stored. |
 
 ### Your git config is respected
 
-gitty hands git the clone URL and gets out of the way. It adds no
+gitty hands git the advertised URL and gets out of the way. It adds no
 `url.<...>.insteadOf` override of its own, and it never refuses a URL because
 it disagrees about where it points. Whatever rules you have configured apply to
-gitty's clones, pulls and fetches exactly as they would to a `git clone` you
-typed yourself.
+gitty's fetches and pulls exactly as they would to a `git fetch` you typed
+yourself, in that checkout.
 
 That matters when your instance advertises an external endpoint you cannot
 reach from where gitty runs, and you map it back to the internal one:
@@ -259,11 +259,17 @@ per run, because your token travels with it:
 
 ```
 note: clone URL https://git.internal/acme/app.git is not on the configured
-instance https://gitlab.example.com; git decides the final URL (url.insteadOf
-rules apply) and any token travels with it
-hint: if that is expected, list the host with --allow-clone-host=<host> to
-silence this note
+instance https://gitlab.example.com; git decides where that really goes (your
+url.insteadOf rules apply, including ones in conditional includes that are
+only visible from inside a repository) and any token travels with it
+hint: --verbose shows the URL git actually resolved for each repository; if
+this host is expected, list it with --allow-clone-host=<host> to silence this
+note
 ```
+
+The URL in the note is the one git resolved from inside the repository, after
+your rewrites — so a rule that maps an advertised host back onto the instance
+produces no note at all.
 
 Split deployments do this legitimately. Record that it is intended and the note
 goes away:
@@ -316,6 +322,7 @@ pull tenant/images/app         # repo fast-forwarded (git pull --ff-only)
 group tenant/images            # group dir + nested config ensured
 reclone tenant/images/app      # broken checkout moved aside and re-cloned
 error tenant/images/app git pull failed
+error tenant/images/lib git fetch failed   # a clone that failed (the fetch is its network step)
 plan clone tenant/images/app   # --dry-run: "plan " + the exact action line
 summary cloned=3 pulled=12 skipped=0 errors=1   # always the last line
 ```
@@ -351,27 +358,29 @@ as such.
 ### Token scopes
 
 Because gitty clones over HTTP(S), the token does two jobs: it reads the API
-*and* authenticates git. A token with only `api` or `read_api` can list groups
-but **cannot clone** — it needs **`read_repository`** as well. That combination
-fails in a confusing way (the listing works, every clone 401s), so gitty
-detects it and says so:
+*and* authenticates git. The `api` scope covers both. A token with only
+`read_api` can list groups but **cannot clone** — it needs **`read_repository`**
+(or `write_repository`) as well. That combination fails in a confusing way (the
+listing works, every clone 401s), so gitty detects it and says so:
 
 ```
 hint: gitty clones over HTTP(S) and authenticated git with the GITLAB_TOKEN
-token. That token needs the read_repository scope — 'api' or 'read_api' alone
-lets it list groups but not clone. Re-run 'gitty init --force --ssh' to clone
-with SSH keys instead.
+token. That token needs the read_repository scope (or api) — read_api alone
+lets it list groups but not clone. Re-run 'gitty init' to check the token's
+scopes, or 'gitty init --force --ssh' to clone with SSH keys instead.
 ```
 
 ### Authentication for HTTP clones
 
-In HTTP(S) mode (the default), gitty authenticates `git clone`/`git pull` itself: it
-re-execs as git's askpass helper and hands the token over via the child
+In HTTP(S) mode (the default), gitty authenticates `git fetch`/`git pull` itself:
+it re-execs as git's askpass helper and hands the token over via the child
 process environment — never on the command line, never written to any git
 config or credential store (ambient credential helpers are disabled for the
 invocation). Personal/project access tokens authenticate as `oauth2`; a
-`CI_JOB_TOKEN` authenticates as `gitlab-ci-token` automatically. Credentials
-are only ever sent to the host of the configured instance URL.
+`CI_JOB_TOKEN` authenticates as `gitlab-ci-token` automatically. The token
+goes to whichever host git resolves the URL to — your git config controls
+that — and gitty notes once per run when that host is not the configured
+instance's (see `--allow-clone-host`).
 
 ### How `--groups` and `--repos` work together:
 * `gitty sync tenant`: Syncs **only** the immediate repositories inside `tenant`.
@@ -464,7 +473,7 @@ unknowable rather than zero.
 | `--token` | `""` | Only needed with `--fetch`. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. |
 | `--anon` | `false` | With `--fetch`, contact public repositories without a token. |
 | `--jobs` | `4` | Repositories inspected concurrently (1-16). |
-| `--verbose` | `false` | Print each git invocation to stderr (URLs redacted). |
+| `--verbose` | `false` | Print gitty's version and each git invocation to stderr (URLs redacted). |
 | `--accept-new-host-keys` | `false` | With `--fetch` over SSH, record unknown host keys without prompting. |
 | `--allow-clone-host` | `""` | With `--fetch`, record an extra host this workspace expects to contact. Repeatable. |
 
@@ -520,6 +529,7 @@ colour**, so scripts keep parsing stable output. Override either with
 | `--token` | `""` | GitLab access token. Falls back to `GITLAB_TOKEN` / `CI_JOB_TOKEN`. Required unless `--anon`. |
 | `--anon` | `false` | List public groups and projects anonymously. |
 | `--nested` | `false` | Recurse into nested subgroups. Per-group project counts are only complete in this mode. |
+| `--archived` | `false` | Include projects and groups GitLab has archived, marking each archived project (`archived` on its event line, `, archived` in the tree). Left out by default, matching what `sync` would clone. |
 | `--format` | `auto` | `auto` (tree on a terminal, `text` when piped), `tree`, `text`, or `json`. |
 | `--color` | `auto` | `auto` (only on a terminal), `always`, or `never`. |
 
@@ -544,32 +554,33 @@ The output is a single JSON document shaped like an MCP tool list:
 ```json
 {
   "name": "gitty",
-  "version": "1.0.0",
+  "version": "3.2.0",
   "description": "A configurable CLI to synchronize ... GitLab groups ...",
+  "exitCodes": { "0": "success", "1": "...", "2": "...", "130": "..." },
   "tools": [
     {
       "name": "sync",
-      "description": "Sync a GitLab group based on the workspace's .gitty/config ...",
+      "description": "Sync a GitLab group. ... Works from anywhere inside a workspace ...",
       "inputSchema": {
         "type": "object",
         "properties": {
-          "path":   { "type": "string",  "description": "GitLab group or subgroup path ..." },
+          "path":   { "type": "string",  "description": "GitLab group or subgroup path to sync, relative to the current directory's group ... Passed as a positional argument ..." },
           "nested": { "type": "boolean", "description": "Recurse into nested subgroups ...", "default": false }
-        },
-        "required": ["path"]
+        }
       },
       "invocation": {
         "command": "gitty",
         "baseArgs": ["sync"],
-        "flagStyle": "--<name>=<value> for strings, --<name> for booleans"
+        "flagStyle": "the 'path' argument is positional (gitty sync <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it"
       }
     }
   ]
 }
 ```
 
-Each tool's `inputSchema` is JSON Schema, and `invocation` tells the agent how
-to map the arguments onto an argv array (e.g. the `sync` tool with
+(Abridged: the real output lists every command and flag.) Each tool's
+`inputSchema` is JSON Schema, and `invocation` tells the agent how to map the
+arguments onto an argv array (e.g. the `sync` tool with
 `{"path": "tenant/images", "nested": true}` becomes
 `gitty sync tenant/images --nested`).
 
