@@ -66,25 +66,25 @@ run 0 "gitty init (default transport)" -- init
 grep -q '^http = true' .gitty/config || fail "init should default to the HTTP transport"
 
 echo "== ls (remote inventory, no git, no clone)"
-run 0 "gitty ls --nested" -- ls --path="$PARENT" --nested --anon
+run 0 "gitty ls --nested" -- ls "$PARENT" --nested --anon
 contains "project $REPO new" "$OUT"
 contains "summary groups=" "$OUT"
 [ ! -d "$PARENT" ] || fail "ls must not create anything in the workspace"
 
 echo "== ls --format=json parses"
-run 0 "gitty ls --format=json" -- ls --path="$PARENT" --nested --anon --format=json
+run 0 "gitty ls --format=json" -- ls "$PARENT" --nested --anon --format=json
 echo "$OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["summary"]["projects"] > 0, d' \
   || fail "ls --format=json did not produce a usable report"
 ok "json report parsed"
 
 echo "== dry run"
-run 0 "gitty sync --dry-run" -- sync --path="$GROUP" --anon --dry-run
+run 0 "gitty sync --dry-run" -- sync "$GROUP" --anon --dry-run
 contains "plan clone $REPO" "$OUT"
 DRY="$OUT"
 [ ! -d "$GROUP" ] || fail "dry run created directories"
 
 echo "== real sync (clone)"
-run 0 "gitty sync" -- sync --path="$GROUP" --anon
+run 0 "gitty sync" -- sync "$GROUP" --anon
 contains "clone $REPO" "$OUT"
 contains "summary cloned=1 pulled=0 skipped=0 errors=0" "$OUT"
 REAL="$OUT"
@@ -103,7 +103,7 @@ printf '%s\n' "$REAL" | grep -qvE '^(clone|pull|group|project|reclone|skip|statu
   && fail "stdout contained a non-event line" || ok "all stdout lines are events"
 
 echo "== re-sync (fast-forward pull, idempotent)"
-run 0 "gitty sync (again)" -- sync --path="$GROUP" --anon
+run 0 "gitty sync (again)" -- sync "$GROUP" --anon
 contains "pull $REPO" "$OUT"
 contains "summary cloned=0 pulled=1 skipped=0 errors=0" "$OUT"
 
@@ -114,12 +114,12 @@ contains "dirty=false" "$OUT"
 contains "summary repos=1" "$OUT"
 
 echo "== ls now reports the repo as present"
-run 0 "gitty ls (after sync)" -- ls --path="$GROUP" --anon
+run 0 "gitty ls (after sync)" -- ls "$GROUP" --anon
 contains "project $REPO present" "$OUT"
 
 echo "== exit codes"
-run 1 "unknown group exits 1" -- sync --path="$PARENT/definitely-not-a-real-group" --anon
-run 2 "missing token exits 2" -- sync --path="$GROUP"
+run 1 "unknown group exits 1" -- sync "$PARENT/definitely-not-a-real-group" --anon
+run 2 "missing token exits 2" -- sync "$GROUP"
 
 echo
 echo "integration smoke test passed"

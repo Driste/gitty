@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -56,15 +57,18 @@ func TestSyncToolAdvertisesAnon(t *testing.T) {
 		t.Errorf("anon.Default = %v, want false", anon.Default)
 	}
 
-	// path must remain a required argument for sync.
-	foundPath := false
+	// path is optional: from inside a group's directory a bare sync acts on
+	// that group. The schema must not tell an agent otherwise.
 	for _, r := range sync.InputSchema.Required {
 		if r == "path" {
-			foundPath = true
+			t.Errorf("sync tool Required = %v; path must be optional", sync.InputSchema.Required)
 		}
 	}
-	if !foundPath {
-		t.Errorf("sync tool Required = %v, want it to include %q", sync.InputSchema.Required, "path")
+	if _, ok := sync.InputSchema.Properties["path"]; !ok {
+		t.Error("sync tool should still describe the path argument")
+	}
+	if !strings.Contains(sync.Invocation.FlagStyle, "positional") {
+		t.Errorf("sync invocation should say path is positional, got %q", sync.Invocation.FlagStyle)
 	}
 }
 

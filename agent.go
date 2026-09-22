@@ -186,7 +186,6 @@ func buildAgentSchema() AgentSchema {
 							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
 						},
 					},
-					Required: []string{"path"},
 				},
 				Invocation: Invocation{
 					Command:   "gitty",
