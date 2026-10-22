@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -132,7 +133,7 @@ func reportAuth(w io.Writer, cfg *Config, cred credential, chk tokenCheck) {
 	}
 	if chk.err != nil {
 		fmt.Fprintf(w, "Could not verify the token from %s against %s: %v\n", cred.source, cfg.URL, chk.err)
-		fmt.Fprintln(w, "  The workspace was still created; re-check once the instance is reachable.")
+		fmt.Fprintln(w, "  Re-check once the instance is reachable.")
 		return
 	}
 	if chk.unauthorized {
@@ -182,29 +183,78 @@ func cloneNeedSuffix(cfg *Config) string {
 	return ""
 }
 
-// checkAuthForInit verifies the credential for a freshly created workspace and
-// reports the result. It is advisory: the workspace already exists, so a
-// network failure or a bad token is reported, never fatal.
-func checkAuthForInit(w io.Writer, cfg *Config, tokenFlag string) {
+// checkAuth verifies the configured credential against the workspace's
+// instance and reports the result to w. The check is a quick courtesy, not a
+// sync: it skips the client's retry/backoff loop and is bounded by a short
+// timeout, so an unreachable instance costs seconds, not minutes.
+func checkAuth(w io.Writer, cfg *Config, tokenFlag string) (credential, tokenCheck) {
 	cred := resolveCredential(tokenFlag)
 	if cred.token == "" {
 		reportAuth(w, cfg, cred, tokenCheck{})
-		return
+		return cred, tokenCheck{}
 	}
 
-	// The check is a quick courtesy, not a sync: it must not stall `init` on
-	// an unreachable instance, so it skips the client's retry/backoff loop
-	// and is bounded by a short timeout.
 	client, err := gitlab.NewClient(cred.token,
 		gitlab.WithBaseURL(cfg.URL),
 		gitlab.WithoutRetries(),
 	)
 	if err != nil {
-		reportAuth(w, cfg, cred, tokenCheck{err: err})
-		return
+		chk := tokenCheck{err: err}
+		reportAuth(w, cfg, cred, chk)
+		return cred, chk
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	reportAuth(w, cfg, cred, verifyToken(ctx, client, cred))
+	chk := verifyToken(ctx, client, cred)
+	reportAuth(w, cfg, cred, chk)
+	return cred, chk
+}
+
+// checkAuthForInit runs the check for a freshly created workspace. It is
+// advisory: the workspace already exists, so a network failure or a bad token
+// is reported, never fatal.
+func checkAuthForInit(w io.Writer, cfg *Config, tokenFlag string) {
+	checkAuth(w, cfg, tokenFlag)
+}
+
+// runAuth is `gitty auth`: the same check, on demand, for an existing
+// workspace — after rotating a token, before a long sync, or when a sync just
+// failed with an authentication error. Unlike at init it has a verdict: a
+// missing, rejected or revoked token exits 2 (fix the configuration), an
+// instance that could not be reached exits 1 (try again), and a token that
+// works exits 0. The report itself is the command's output, so it goes to
+// stdout.
+func runAuth(tokenFlag string) error {
+	cfg, err := DiscoverWorkspace()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Instance %s, cloning over %s\n", cfg.URL, transportName(cfg))
+	cred, chk := checkAuth(os.Stdout, cfg, tokenFlag)
+	switch {
+	case cred.token == "":
+		return usageErrf("no token configured")
+	case chk.skipped != "":
+		return nil // a CI job token: nothing to verify, nothing wrong
+	case chk.err != nil:
+		return fmt.Errorf("could not verify the token: %w", chk.err)
+	case chk.unauthorized:
+		return usageErrf("the token was rejected by %s", cfg.URL)
+	case chk.revoked:
+		return usageErrf("the token is revoked")
+	case chk.scopesKnown && !scopesAllowAPI(chk.scopes):
+		return usageErrf("the token cannot read the API")
+	case chk.scopesKnown && cfg.HTTP && !scopesAllowHTTPClone(chk.scopes):
+		return usageErrf("the token cannot clone over HTTP(S)")
+	}
+	return nil
+}
+
+// transportName describes a workspace's clone transport for humans.
+func transportName(cfg *Config) string {
+	if cfg.HTTP {
+		return "HTTP(S)"
+	}
+	return "SSH"
 }

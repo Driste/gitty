@@ -87,6 +87,9 @@ type syncer struct {
 
 	mu     sync.Mutex
 	counts syncCounts
+	// failures keeps every error event's path and detail, in order, so a
+	// long run can end with a recap instead of leaving the user to scroll.
+	failures []string
 }
 
 // event emits one machine-readable line on the primary output stream:
@@ -126,6 +129,23 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 		s.counts.skipped++
 	case "error":
 		s.counts.errors++
+		s.failures = append(s.failures, strings.TrimSpace(path+" "+strings.Join(detail, " ")))
+	}
+}
+
+// recapFailures lists everything that failed, at the end, on stderr. The
+// per-item error events and git output scroll past during a large sync; the
+// recap is the part worth reading when it is over. It is deliberately not on
+// stdout: the summary line is the event stream's last word.
+func (s *syncer) recapFailures() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.failures) == 0 {
+		return
+	}
+	fmt.Fprintf(s.errOut, "\n%d failed:\n", len(s.failures))
+	for _, f := range s.failures {
+		fmt.Fprintf(s.errOut, "  %s\n", f)
 	}
 }
 
@@ -309,6 +329,7 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	// alike, and is identical between dry and real runs (parity contract).
 	fmt.Fprintf(s.out, "summary cloned=%d pulled=%d skipped=%d errors=%d\n",
 		s.counts.cloned, s.counts.pulled, s.counts.skipped, s.counts.errors)
+	s.recapFailures()
 
 	// An interrupted run reports 130 even when items had already failed; the
 	// workspace is left recoverable and a re-run picks up where this stopped.

@@ -90,7 +90,7 @@ func TestReportAuth(t *testing.T) {
 			cfg:  httpCfg,
 			cred: credential{token: "t", source: "GITLAB_TOKEN"},
 			chk:  tokenCheck{err: errDial},
-			want: []string{"Could not verify", "workspace was still created"},
+			want: []string{"Could not verify", "Re-check once the instance is reachable"},
 			// Must not accuse the token of being invalid.
 			unwanted: []string{"REJECTED"},
 		},

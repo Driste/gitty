@@ -1331,3 +1331,41 @@ func TestDiscoverWorkspaceRefusesForeignConfig(t *testing.T) {
 		t.Errorf("want a refusal naming the owner problem, got %v", err)
 	}
 }
+
+// A run that had failures ends with a recap of them on stderr, after the
+// summary line has closed the event stream.
+func TestFailureRecap(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rec := &recordingGit{failOn: func(dir string, args []string) bool {
+		return isNetworkGit(gitSubArgs(append([]string{dir}, args...))) && strings.Contains(dir, "bad")
+	}}
+	s, stdout, stderr := newTestSyncer(
+		&Config{URL: "https://gitlab.com", HTTP: true},
+		fakeSource{projects: map[string][]*gitlab.Project{"acme": {
+			{PathWithNamespace: "acme/good", HTTPURLToRepo: "https://gitlab.com/acme/good.git"},
+			{PathWithNamespace: "acme/bad1", HTTPURLToRepo: "https://gitlab.com/acme/bad1.git"},
+			{PathWithNamespace: "acme/bad2", HTTPURLToRepo: "https://gitlab.com/acme/bad2.git"},
+		}}},
+		rec.run,
+	)
+	s.syncRepos(context.Background(), "acme")
+	s.recapFailures()
+
+	if strings.Contains(stdout.String(), "failed:") {
+		t.Errorf("recap must not be on stdout:\n%s", stdout.String())
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "2 failed:\n") || !strings.Contains(got, "  acme/bad1 git fetch failed\n") || !strings.Contains(got, "  acme/bad2 git fetch failed\n") {
+		t.Errorf("recap missing or wrong:\n%s", got)
+	}
+	if strings.Contains(got, "  acme/good") {
+		t.Errorf("recap should list failures only:\n%s", got)
+	}
+
+	// No failures, no recap.
+	s2, _, stderr2 := newTestSyncer(&Config{URL: "https://gitlab.com", HTTP: true}, fakeSource{}, (&recordingGit{}).run)
+	s2.recapFailures()
+	if stderr2.Len() != 0 {
+		t.Errorf("unexpected recap output: %q", stderr2.String())
+	}
+}

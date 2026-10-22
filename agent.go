@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.2.0"
+const AgentSchemaVersion = "3.3.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -285,6 +285,24 @@ func buildAgentSchema() AgentSchema {
 					Command:   "gitty",
 					BaseArgs:  []string{"ls"},
 					FlagStyle: "the 'path' argument is positional (gitty ls <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it",
+				},
+			},
+			{
+				Name:        "auth",
+				Description: "Check the configured token against the workspace's GitLab instance and report the authenticated user, the token's scopes, and any scope the workspace needs but the token lacks. Exit 0 when the token works, 2 when it is missing, rejected, revoked or under-scoped, 1 when the instance could not be reached. Run it after rotating a token or when a sync fails with an authentication error.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token to verify. Falls back to GITLAB_TOKEN or CI_JOB_TOKEN. Never stored.",
+						},
+					},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"auth"},
+					FlagStyle: "--<name>=<value> for strings",
 				},
 			},
 			{

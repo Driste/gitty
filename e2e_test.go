@@ -2389,3 +2389,50 @@ func TestE2EArchivedExcludedByDefault(t *testing.T) {
 		t.Errorf("both forms together should be a usage error (exit %d):\n%s", code, stderr)
 	}
 }
+
+// gitty auth re-runs the token check for an existing workspace, with an exit
+// code: 0 when the token works, 2 when it is missing or rejected.
+func TestE2EAuthCommand(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-auth-check"
+	f := newFakeGitLab(t)
+	f.requireToken = token
+	f.authUser = "alice"
+	f.authScopes = []string{"api"}
+	ws := initWorkspace(t, f)
+	sub := filepath.Join(ws, "acme")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// From a subdirectory, a working token: report on stdout, exit 0.
+	stdout, stderr, code := runGitty(t, sub, []string{"GITLAB_TOKEN=" + token}, "auth")
+	if code != 0 {
+		t.Fatalf("auth exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	for _, want := range []string{"Instance " + f.srv.URL, "HTTP(S)", "authenticated as @alice", "Scopes: api"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+
+	// A rejected token is a configuration problem: exit 2.
+	stdout, stderr, code = runGitty(t, ws, []string{"GITLAB_TOKEN=wrong"}, "auth")
+	if code != 2 || !strings.Contains(stdout, "REJECTED") || !strings.Contains(stderr, "rejected") {
+		t.Errorf("rejected token: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+
+	// No token at all: exit 2 with the setup hint.
+	stdout, stderr, code = runGitty(t, ws, nil, "auth")
+	if code != 2 || !strings.Contains(stdout, "No GitLab token found") || !strings.Contains(stderr, "no token") {
+		t.Errorf("missing token: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+
+	// A token that can list but not clone over HTTP(S) fails the check too.
+	f.authScopes = []string{"read_api"}
+	stdout, stderr, code = runGitty(t, ws, []string{"GITLAB_TOKEN=" + token}, "auth")
+	if code != 2 || !strings.Contains(stdout, "read_repository") || !strings.Contains(stderr, "cannot clone") {
+		t.Errorf("under-scoped token: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+}

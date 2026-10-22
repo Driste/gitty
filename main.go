@@ -60,6 +60,9 @@ func main() {
 	var statusCloneHosts stringList
 	statusCmd.Var(&statusCloneHosts, "allow-clone-host", "With --fetch, an additional host that may be contacted with this workspace's token (repeatable, or comma-separated)")
 
+	authCmd := flag.NewFlagSet("auth", flag.ExitOnError)
+	authToken := authCmd.String("token", "", "GitLab Access Token to verify (falls back to env vars)")
+
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
 	lsPath := lsCmd.String("path", "", "GitLab group path (deprecated: pass it as a positional argument)")
 	lsToken := lsCmd.String("token", "", "GitLab Access Token (falls back to env vars)")
@@ -179,6 +182,9 @@ func main() {
 		})
 		stop()
 		exitOnError(err)
+	case "auth":
+		authCmd.Parse(os.Args[2:])
+		exitOnError(runAuth(*authToken))
 	case "version":
 		runVersion()
 	case "agent":
@@ -268,6 +274,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  sync    Sync (clone/pull) a GitLab group: gitty sync [group] [flags]")
 	fmt.Fprintln(os.Stderr, "  status  Report the branch and freshness of every checkout in the workspace")
 	fmt.Fprintln(os.Stderr, "  ls      List the remote groups/projects for a target and what a sync would clone")
+	fmt.Fprintln(os.Stderr, "  auth    Check the token against the workspace's instance and report its scopes")
 	fmt.Fprintln(os.Stderr, "  agent   Print an MCP-style schema describing how an LLM/agent should use gitty")
 	fmt.Fprintln(os.Stderr, "  version Print the gitty version")
 	fmt.Fprintln(os.Stderr, "\nRun 'gitty <command> -h' for specific flags.")

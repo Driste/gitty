@@ -13,6 +13,7 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **CI/CD Ready**: Clones over HTTP(S) by default, authenticated with the same token gitty already uses for the API — no SSH keys to provision. Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN`, and exits non-zero when any group or repository fails to sync so a broken pipeline stage is never reported green.
 * **Safe Destinations**: Refuses to write outside the workspace (namespace paths containing `..` or absolute paths are skipped) and reports any repository advertised on a host other than the configured GitLab instance.
 * **Works From Anywhere**: `sync`, `status` and `ls` find the workspace from any directory inside it and act on that directory's group — `cd` into a subgroup and `gitty sync` syncs just that subgroup.
+* **Says What Failed**: A sync with errors ends with a recap of every failed item, and `gitty auth` checks your token any time with a real exit code.
 * **Live Namespace Only**: Projects and groups GitLab has archived are left out of `ls` and `sync` unless you ask for them with `--archived`.
 
 ---
@@ -61,7 +62,8 @@ release or a local build.
 
 Releases are built and published by
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which runs
-when a `v*` tag is pushed **or** a GitHub Release is published:
+when a version tag is pushed — `v1.0.0` or bare `1.0.0`, both work — **or** a
+GitHub Release is published:
 
 ```bash
 git tag v1.0.0
@@ -331,6 +333,15 @@ Exit codes: `0` success · `1` completed with per-item failures · `2` usage or
 configuration error · `130` interrupted (Ctrl-C; git is signalled cleanly and
 a re-run recovers the workspace).
 
+A run with failures ends with a recap of them on stderr, so you never have to
+scroll back through a long sync to find what went wrong:
+
+```
+2 failed:
+  tenant/images/app git pull failed
+  tenant/images/lib git fetch failed
+```
+
 ### `init` checks your token
 
 `init` asks the instance who your token belongs to and what it is allowed to
@@ -354,6 +365,22 @@ created either way — takes well under a second, and never blocks: pass
 enough to support token introspection; where it is unavailable gitty says so
 rather than guessing. CI job tokens cannot be introspected and are reported
 as such.
+
+### Re-checking your token (`gitty auth`)
+
+The same check is available on demand for an existing workspace — after
+rotating a token, before a long sync, or when a sync just failed with an
+authentication error:
+
+```bash
+gitty auth            # uses GITLAB_TOKEN / CI_JOB_TOKEN
+gitty auth --token=…  # verify a specific token (never stored)
+```
+
+It prints the instance and transport, then the report above, and unlike at
+`init` it has a verdict: exit `0` when the token works, `2` when it is missing,
+rejected, revoked or lacks a scope this workspace needs, `1` when the instance
+could not be reached. Works from any directory inside the workspace.
 
 ### Token scopes
 

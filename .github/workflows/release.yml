@@ -2,7 +2,7 @@
 # SHA256SUMS checksum file, to a GitHub Release.
 #
 # Runs for both ways a release gets made:
-#   - pushing a version tag (v*), which creates the release
+#   - pushing a version tag (v1.2.3 or bare 1.2.3), which creates the release
 #   - publishing a GitHub Release (including one created from an existing tag
 #     or promoted from a draft), which uploads to it
 # Publishing is idempotent, so a tag push followed by a release publish for the
@@ -13,6 +13,7 @@ on:
   push:
     tags:
       - "v*"
+      - "[0-9]*"
   release:
     types: [published]
 
