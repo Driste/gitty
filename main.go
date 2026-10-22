@@ -24,68 +24,17 @@ func main() {
 		os.Exit(2)
 	}
 
-	initCmd := flag.NewFlagSet("init", flag.ExitOnError)
-	initURL := initCmd.String("url", "https://gitlab.com", "GitLab Base URL")
-	initSSH := initCmd.Bool("ssh", false, "Clone over SSH (git@...) instead of the default HTTP(S)")
-	initHTTP := initCmd.Bool("http", false, "Clone over HTTP(S) (this is the default; accepted for compatibility)")
-	initForce := initCmd.Bool("force", false, "Overwrite an existing .gitty/config")
-	initToken := initCmd.String("token", "", "GitLab Access Token to verify (falls back to env vars)")
-	initVerify := initCmd.Bool("verify", true, "Check the token against the instance and report its scopes")
-	var initCloneHosts stringList
-	initCmd.Var(&initCloneHosts, "allow-clone-host", "Additional host whose repositories this workspace may clone and send its token to (repeatable, or comma-separated)")
-
-	syncCmd := flag.NewFlagSet("sync", flag.ExitOnError)
-	syncPath := syncCmd.String("path", "", "GitLab group path (deprecated: pass it as a positional argument)")
-	syncToken := syncCmd.String("token", "", "GitLab Access Token (falls back to env vars)")
-	syncDryRun := syncCmd.Bool("dry-run", false, "Print what would happen without actually making changes")
-	syncGroups := syncCmd.Bool("groups", false, "Fetch and create group/subgroup directory structures")
-	syncRepos := syncCmd.Bool("repos", false, "Fetch and clone/pull repositories")
-	syncNested := syncCmd.Bool("nested", false, "Include nested subgroups/projects recursively")
-	syncAnon := syncCmd.Bool("anon", false, "Access public resources anonymously (no token required)")
-	syncVerbose := syncCmd.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
-	syncRecloneBroken := syncCmd.Bool("reclone-broken", false, "Move aside non-repo directories that block a clone (renamed, never deleted) and re-clone")
-	syncJobs := syncCmd.Int("jobs", 4, "Number of concurrent repo clone/pull operations (1-16)")
-	syncAcceptHostKeys := syncCmd.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
-	syncArchived := syncCmd.Bool("archived", false, "Include archived projects and groups (left out by default)")
-	syncPrune := syncCmd.Bool("prune", false, "Move checkouts that no longer exist upstream aside as <dir>.gitty-orphan-<n> (never deleted); without it they are only reported")
-	var syncExclude stringList
-	syncCmd.Var(&syncExclude, "exclude", "Namespace path or glob to leave out, e.g. acme/vendor or 'acme/*-mirror' (repeatable, or comma-separated; adds to the workspace's exclude list)")
-	var syncCloneHosts stringList
-	syncCmd.Var(&syncCloneHosts, "allow-clone-host", "Additional host whose repositories may be cloned and sent this workspace's token (repeatable, or comma-separated)")
-
-	statusCmd := flag.NewFlagSet("status", flag.ExitOnError)
-	statusToken := statusCmd.String("token", "", "GitLab Access Token (only needed with --fetch)")
-	statusAnon := statusCmd.Bool("anon", false, "With --fetch, contact public repositories anonymously")
-	statusFetch := statusCmd.Bool("fetch", false, "Refresh remote-tracking refs first so ahead/behind reflect the remote now")
-	statusVerbose := statusCmd.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
-	statusJobs := statusCmd.Int("jobs", 4, "Number of concurrent repositories to inspect (1-16)")
-	statusAcceptHostKeys := statusCmd.Bool("accept-new-host-keys", false, "With --fetch over SSH, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new)")
-	var statusCloneHosts stringList
-	statusCmd.Var(&statusCloneHosts, "allow-clone-host", "With --fetch, an additional host that may be contacted with this workspace's token (repeatable, or comma-separated)")
-
-	authCmd := flag.NewFlagSet("auth", flag.ExitOnError)
-	authToken := authCmd.String("token", "", "GitLab Access Token to verify (falls back to env vars)")
-
-	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
-	lsPath := lsCmd.String("path", "", "GitLab group path (deprecated: pass it as a positional argument)")
-	lsToken := lsCmd.String("token", "", "GitLab Access Token (falls back to env vars)")
-	lsAnon := lsCmd.Bool("anon", false, "List public resources anonymously (no token required)")
-	lsNested := lsCmd.Bool("nested", false, "Include nested subgroups/projects recursively")
-	lsArchived := lsCmd.Bool("archived", false, "Include archived projects and groups (left out by default)")
-	var lsExclude stringList
-	lsCmd.Var(&lsExclude, "exclude", "Namespace path or glob to leave out (repeatable, or comma-separated; adds to the workspace's exclude list)")
-	lsFormat := lsCmd.String("format", "auto", "Output format: auto, tree, text, or json")
-	lsColor := lsCmd.String("color", "auto", "Colorize output: auto, always, or never")
-
 	switch os.Args[1] {
 	case "init":
-		initCmd.Parse(os.Args[2:])
+		fs := newFlagSet("init")
+		f := declareInitFlags(fs)
+		fs.Parse(os.Args[2:])
 		// Inside a GitLab CI job, default the instance URL to the job's own
 		// server unless --url was passed explicitly. Only init applies this
 		// default: once written, the workspace config is the source of truth.
-		resolvedURL := *initURL
+		resolvedURL := *f.url
 		urlSet := false
-		initCmd.Visit(func(fl *flag.Flag) {
+		fs.Visit(func(fl *flag.Flag) {
 			if fl.Name == "url" {
 				urlSet = true
 			}
@@ -100,99 +49,93 @@ func main() {
 		// the API authenticates the clones too, which is what makes an
 		// unattended run work without SSH keys. --ssh opts out; --http is
 		// still accepted so existing scripts keep working.
-		if *initSSH && *initHTTP {
+		if *f.ssh && *f.http {
 			exitOnError(usageErrf("--ssh and --http are mutually exclusive"))
 		}
 		exitOnError(runInit(initOptions{
 			URL:        resolvedURL,
-			HTTP:       !*initSSH,
-			Force:      *initForce,
-			Verify:     *initVerify,
-			Token:      *initToken,
-			CloneHosts: initCloneHosts,
+			HTTP:       !*f.ssh,
+			Force:      *f.force,
+			Verify:     *f.verify,
+			Token:      *f.token,
+			CloneHosts: f.cloneHosts,
 		}))
 	case "sync":
 		// The group is a positional argument, relative to the current
 		// directory's group; flags may sit on either side of it. --path is
 		// the older spelling and still works.
-		syncFlagArgs, syncPositional := splitFlagArgs(syncCmd, os.Args[2:])
-		syncCmd.Parse(syncFlagArgs)
-		syncTarget := *syncPath
-		if len(syncPositional) > 0 {
-			if syncTarget != "" {
-				exitOnError(usageErrf("pass the group either as an argument or with --path, not both"))
-			}
-			syncTarget = syncPositional[0]
-		}
-		if len(syncPositional) > 1 {
-			exitOnError(usageErrf("sync takes at most one group argument, got %d", len(syncPositional)))
-		}
+		fs := newFlagSet("sync")
+		f := declareSyncFlags(fs)
+		flagArgs, positional := splitFlagArgs(fs, os.Args[2:])
+		fs.Parse(flagArgs)
+		target, err := positionalTarget("sync", *f.path, positional)
+		exitOnError(err)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		err := runSync(ctx, syncOptions{
-			Path:          syncTarget,
-			Token:         *syncToken,
-			DryRun:        *syncDryRun,
-			Groups:        *syncGroups,
-			Repos:         *syncRepos,
-			Nested:        *syncNested,
-			Anon:          *syncAnon,
-			Verbose:       *syncVerbose,
-			RecloneBroken: *syncRecloneBroken,
-			Jobs:          *syncJobs,
+		err = runSync(ctx, syncOptions{
+			Path:          target,
+			Token:         *f.token,
+			DryRun:        *f.dryRun,
+			Groups:        *f.groups,
+			Repos:         *f.repos,
+			Nested:        *f.nested,
+			Anon:          *f.anon,
+			Verbose:       *f.verbose,
+			RecloneBroken: *f.recloneBroken,
+			Jobs:          *f.jobs,
 
-			AcceptNewHostKeys: *syncAcceptHostKeys,
-			IncludeArchived:   *syncArchived,
-			AllowCloneHosts:   syncCloneHosts,
-			Exclude:           syncExclude,
-			Prune:             *syncPrune,
+			AcceptNewHostKeys: *f.acceptHostKeys,
+			IncludeArchived:   *f.archived,
+			AllowCloneHosts:   f.cloneHosts,
+			Exclude:           f.exclude,
+			Prune:             *f.prune,
 		})
 		stop()
 		exitOnError(err)
 	case "status":
-		statusCmd.Parse(os.Args[2:])
+		fs := newFlagSet("status")
+		f := declareStatusFlags(fs)
+		fs.Parse(os.Args[2:])
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		err := runStatus(ctx, statusOptions{
-			Token:   *statusToken,
-			Anon:    *statusAnon,
-			Fetch:   *statusFetch,
-			Verbose: *statusVerbose,
-			Jobs:    *statusJobs,
+			Token:   *f.token,
+			Anon:    *f.anon,
+			Fetch:   *f.fetch,
+			Verbose: *f.verbose,
+			Jobs:    *f.jobs,
 
-			AcceptNewHostKeys: *statusAcceptHostKeys,
-			AllowCloneHosts:   statusCloneHosts,
+			AcceptNewHostKeys: *f.acceptHostKeys,
+			AllowCloneHosts:   f.cloneHosts,
 		})
 		stop()
 		exitOnError(err)
 	case "ls":
 		// Flags may sit on either side of the positional group argument.
-		lsFlagArgs, lsPositional := splitFlagArgs(lsCmd, os.Args[2:])
-		lsCmd.Parse(lsFlagArgs)
-		lsTarget := *lsPath
-		if len(lsPositional) > 0 {
-			if lsTarget != "" {
-				exitOnError(usageErrf("pass the group either as an argument or with --path, not both"))
-			}
-			lsTarget = lsPositional[0]
-		}
-		if len(lsPositional) > 1 {
-			exitOnError(usageErrf("ls takes at most one group argument, got %d", len(lsPositional)))
-		}
+		fs := newFlagSet("ls")
+		f := declareLsFlags(fs)
+		flagArgs, positional := splitFlagArgs(fs, os.Args[2:])
+		fs.Parse(flagArgs)
+		target, err := positionalTarget("ls", *f.path, positional)
+		exitOnError(err)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		err := runLs(ctx, lsOptions{
-			Target:          lsTarget,
-			Token:           *lsToken,
-			Anon:            *lsAnon,
-			Nested:          *lsNested,
-			IncludeArchived: *lsArchived,
-			Exclude:         lsExclude,
-			Format:          *lsFormat,
-			Color:           *lsColor,
+		err = runLs(ctx, lsOptions{
+			Target:          target,
+			Token:           *f.token,
+			Anon:            *f.anon,
+			Nested:          *f.nested,
+			IncludeArchived: *f.archived,
+			Exclude:         f.exclude,
+			Format:          *f.format,
+			Color:           *f.color,
 		})
 		stop()
 		exitOnError(err)
 	case "auth":
-		authCmd.Parse(os.Args[2:])
-		exitOnError(runAuth(*authToken))
+		fs := newFlagSet("auth")
+		f := declareAuthFlags(fs)
+		fs.Parse(os.Args[2:])
+		exitOnError(runAuth(*f.token))
+	case "completion":
+		exitOnError(runCompletion(os.Stdout, os.Args[2:]))
 	case "version":
 		runVersion()
 	case "agent":
@@ -274,16 +217,13 @@ func splitFlagArgs(fs *flag.FlagSet, args []string) (flagArgs, positional []stri
 }
 
 // printUsage writes usage to stderr: it is only ever printed on error paths
-// (no arguments or an unknown command).
+// (no arguments or an unknown command). The command list comes from the
+// same table that drives dispatch and completion.
 func printUsage() {
 	fmt.Fprintln(os.Stderr, "Usage: gitty <command> [flags]")
 	fmt.Fprintln(os.Stderr, "\nCommands:")
-	fmt.Fprintln(os.Stderr, "  init    Initialize a .gitty/config file in the current directory")
-	fmt.Fprintln(os.Stderr, "  sync    Sync (clone/pull) a GitLab group: gitty sync [group] [flags]")
-	fmt.Fprintln(os.Stderr, "  status  Report the branch and freshness of every checkout in the workspace")
-	fmt.Fprintln(os.Stderr, "  ls      List the remote groups/projects for a target and what a sync would clone")
-	fmt.Fprintln(os.Stderr, "  auth    Check the token against the workspace's instance and report its scopes")
-	fmt.Fprintln(os.Stderr, "  agent   Print an MCP-style schema describing how an LLM/agent should use gitty")
-	fmt.Fprintln(os.Stderr, "  version Print the gitty version")
+	for _, c := range commands {
+		fmt.Fprintf(os.Stderr, "  %-11s %s\n", c.name, c.summary)
+	}
 	fmt.Fprintln(os.Stderr, "\nRun 'gitty <command> -h' for specific flags.")
 }

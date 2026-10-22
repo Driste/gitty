@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.5.0"
+const AgentSchemaVersion = "3.6.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -316,6 +316,25 @@ func buildAgentSchema() AgentSchema {
 					Command:   "gitty",
 					BaseArgs:  []string{"auth"},
 					FlagStyle: "--<name>=<value> for strings",
+				},
+			},
+			{
+				Name:        "completion",
+				Description: "Print a shell completion script for bash, zsh or fish to stdout. Not useful to an agent directly; included so the command list is complete.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"shell": {
+							Type:        "string",
+							Description: "One of bash, zsh, fish. Passed as a positional argument.",
+						},
+					},
+					Required: []string{"shell"},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"completion"},
+					FlagStyle: "the 'shell' argument is positional (gitty completion <shell>)",
 				},
 			},
 			{

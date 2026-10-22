@@ -16,6 +16,7 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Says What Failed**: A sync with errors ends with a recap of every failed item, and `gitty auth` checks your token any time with a real exit code.
 * **Excludes**: List the projects or subgroups you never want (`exclude = [...]` in the config, or `--exclude`) and every sync and listing leaves them out, reporting each skip.
 * **Orphans**: Checkouts whose project was deleted or moved upstream are reported by `sync` and `ls`; `sync --prune` moves them aside — never deletes.
+* **Shell Completion**: `gitty completion bash|zsh|fish` completes commands, flags, and group paths.
 * **Live Namespace Only**: Projects and groups GitLab has archived are left out of `ls` and `sync` unless you ask for them with `--archived`.
 
 ---
@@ -622,6 +623,25 @@ colour**, so scripts keep parsing stable output. Override either with
 
 `--path` still works in place of the positional argument, but the two cannot be
 combined.
+
+---
+
+## Shell completion (`gitty completion`)
+
+```bash
+# bash
+gitty completion bash > ~/.local/share/bash-completion/completions/gitty
+# zsh
+gitty completion zsh > "${fpath[1]}/_gitty"      # then restart the shell
+# fish
+gitty completion fish > ~/.config/fish/completions/gitty.fish
+```
+
+Completes commands, every command's flags, and — for `sync` and `ls` — the
+group argument as a directory, since inside a workspace groups *are*
+directories and the argument is relative to the one you are in. The scripts
+are generated from the same table that drives the binary, so a new flag is
+completed as soon as it exists.
 
 ---
 
