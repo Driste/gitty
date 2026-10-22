@@ -2436,3 +2436,68 @@ func TestE2EAuthCommand(t *testing.T) {
 		t.Errorf("under-scoped token: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 }
+
+// TestE2EOrphans: a checkout whose project disappeared upstream is reported
+// by sync and ls, and moved aside — never deleted — by sync --prune.
+func TestE2EOrphans(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/keep", map[string]string{"k.txt": "k"})
+	f.addRepo(t, "acme/gone", map[string]string{"g.txt": "g"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(500, "acme/keep"), f.project(501, "acme/gone")}
+
+	ws := initWorkspace(t, f)
+	if _, _, code := runGitty(t, ws, nil, "sync", "acme", "--anon"); code != 0 {
+		t.Fatalf("initial sync exit = %d", code)
+	}
+
+	// The project is deleted upstream.
+	f.projects["acme"] = []apiProject{f.project(500, "acme/keep")}
+
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0 (an orphan is not an error):\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "orphan acme/gone no project upstream\n") || !strings.Contains(stdout, "orphans=1 pruned=0") {
+		t.Errorf("sync should report the orphan:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "gone", "g.txt")); got != "g" {
+		t.Error("reporting must leave the checkout where it is")
+	}
+
+	stdout, _, code = runGitty(t, ws, nil, "ls", "acme", "--anon", "--format=text")
+	if code != 0 || !strings.Contains(stdout, "orphan acme/gone no project upstream\n") || !strings.Contains(stdout, "orphans=1") {
+		t.Errorf("ls should list the orphan (exit %d):\n%s", code, stdout)
+	}
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "acme", "--anon", "--prune", "--dry-run")
+	if code != 0 || !strings.Contains(stdout, "plan prune acme/gone\n") {
+		t.Errorf("dry-run prune (exit %d):\n%s\n%s", code, stdout, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "gone", "g.txt")); err != nil {
+		t.Error("dry run must not move the checkout")
+	}
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "acme", "--anon", "--prune")
+	if code != 0 || !strings.Contains(stdout, "prune acme/gone\n") || !strings.Contains(stdout, "orphans=1 pruned=1") {
+		t.Errorf("prune (exit %d):\n%s\n%s", code, stdout, stderr)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "gone.gitty-orphan-1", "g.txt")); got != "g" {
+		t.Errorf("pruned checkout should be intact under its aside name, got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "gone")); !os.IsNotExist(err) {
+		t.Error("pruned checkout should no longer be in place")
+	}
+
+	// Afterwards: nothing to report, and status does not see the aside dir.
+	stdout, _, _ = runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if strings.Contains(stdout, "orphan") {
+		t.Errorf("no orphans expected after pruning:\n%s", stdout)
+	}
+	stdout, _, _ = runGitty(t, ws, nil, "status")
+	if strings.Contains(stdout, "gitty-orphan") || !strings.Contains(stdout, "status acme/keep ") {
+		t.Errorf("status should skip the aside dir and still see keep:\n%s", stdout)
+	}
+}

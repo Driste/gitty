@@ -430,7 +430,7 @@ func newTestSyncer(cfg *Config, src gitlabSource, git gitRunner) (*syncer, *byte
 	return s, stdout, stderr
 }
 
-var eventLineRe = regexp.MustCompile(`^(clone|pull|group|project|reclone|skip|status|error|plan|summary) `)
+var eventLineRe = regexp.MustCompile(`^(clone|pull|group|project|reclone|skip|orphan|prune|status|error|plan|summary) `)
 
 // assertEventLines fails if any stdout line does not match the event grammar.
 func assertEventLines(t *testing.T, stdout *bytes.Buffer) {
@@ -1459,5 +1459,126 @@ func TestProgressLine(t *testing.T) {
 	s2.syncRepos(context.Background(), "acme")
 	if strings.Contains(stderr2.String(), "\x1b") {
 		t.Errorf("no progress output expected when not a terminal:\n%q", stderr2.String())
+	}
+}
+
+// A checkout nothing upstream accounts for is an orphan: reported by sync,
+// moved aside (never deleted) by --prune, and never confused with archived or
+// excluded projects or with subgroups a flat sync did not cover.
+func TestOrphans(t *testing.T) {
+	known := []*gitlab.Project{
+		{PathWithNamespace: "acme/live", HTTPURLToRepo: "https://gitlab.com/acme/live.git"},
+		{PathWithNamespace: "acme/retired", HTTPURLToRepo: "https://gitlab.com/acme/retired.git", Archived: true},
+	}
+	setup := func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		for _, r := range []string{"acme/live", "acme/retired", "acme/gone", "acme/vendor/lib", "acme/team/deep-gone"} {
+			mkRepo(t, filepath.FromSlash(r))
+		}
+	}
+
+	t.Run("flat: reported, subgroups untouched", func(t *testing.T) {
+		setup(t)
+		s, stdout, _ := newTestSyncer(
+			&Config{URL: "https://gitlab.com", HTTP: true, Exclude: []string{"acme/vendor"}},
+			fakeSource{projects: map[string][]*gitlab.Project{"acme": known}},
+			(&recordingGit{}).run,
+		)
+		s.syncRepos(context.Background(), "acme")
+		out := stdout.String()
+		if !strings.Contains(out, "orphan acme/gone no project upstream\n") {
+			t.Errorf("missing orphan event:\n%s", out)
+		}
+		for _, no := range []string{"orphan acme/retired", "orphan acme/vendor", "orphan acme/team/deep-gone", "orphan acme/live"} {
+			if strings.Contains(out, no) {
+				t.Errorf("%q must not be an orphan:\n%s", no, out)
+			}
+		}
+		if s.counts.orphans != 1 || s.counts.pruned != 0 {
+			t.Errorf("counts = %+v", s.counts)
+		}
+		if _, err := os.Stat(filepath.Join("acme", "gone", ".git")); err != nil {
+			t.Error("reporting must not move anything")
+		}
+	})
+
+	t.Run("nested: subgroup orphans too", func(t *testing.T) {
+		setup(t)
+		s, stdout, _ := newTestSyncer(
+			&Config{URL: "https://gitlab.com", HTTP: true, Exclude: []string{"acme/vendor"}},
+			fakeSource{projects: map[string][]*gitlab.Project{"acme": known}},
+			(&recordingGit{}).run,
+		)
+		s.nested = true
+		s.syncRepos(context.Background(), "acme")
+		if !strings.Contains(stdout.String(), "orphan acme/team/deep-gone no project upstream\n") {
+			t.Errorf("nested sync should find the subgroup orphan:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("--prune moves aside, --dry-run plans", func(t *testing.T) {
+		setup(t)
+		s, stdout, _ := newTestSyncer(
+			&Config{URL: "https://gitlab.com", HTTP: true},
+			fakeSource{projects: map[string][]*gitlab.Project{"acme": known}},
+			(&recordingGit{}).run,
+		)
+		s.prune, s.dryRun = true, true
+		s.syncRepos(context.Background(), "acme")
+		if !strings.Contains(stdout.String(), "plan prune acme/gone\n") {
+			t.Errorf("dry run should plan the prune:\n%s", stdout.String())
+		}
+		if _, err := os.Stat(filepath.Join("acme", "gone", ".git")); err != nil {
+			t.Error("dry run must not move anything")
+		}
+
+		s.dryRun = false
+		stdout.Reset()
+		s.syncRepos(context.Background(), "acme")
+		if !strings.Contains(stdout.String(), "prune acme/gone\n") {
+			t.Errorf("missing prune event:\n%s", stdout.String())
+		}
+		if _, err := os.Stat(filepath.Join("acme", "gone")); !os.IsNotExist(err) {
+			t.Error("pruned checkout should have been moved")
+		}
+		if _, err := os.Stat(filepath.Join("acme", "gone.gitty-orphan-1", ".git", "HEAD")); err != nil {
+			t.Errorf("pruned checkout should be intact under its aside name: %v", err)
+		}
+		// Moved-aside orphans are invisible to later walks.
+		repos, _ := findRepos(".")
+		for _, r := range repos {
+			if strings.Contains(r, "gitty-orphan") {
+				t.Errorf("aside dir should be skipped by findRepos: %v", repos)
+			}
+		}
+		assertEventLines(t, stdout)
+	})
+
+	t.Run("a failed listing reports no orphans", func(t *testing.T) {
+		setup(t)
+		s, stdout, _ := newTestSyncer(
+			&Config{URL: "https://gitlab.com", HTTP: true},
+			fakeSource{projErr: fmt.Errorf("boom")},
+			(&recordingGit{}).run,
+		)
+		s.syncRepos(context.Background(), "acme")
+		if strings.Contains(stdout.String(), "orphan ") {
+			t.Errorf("no listing, no orphan verdicts:\n%s", stdout.String())
+		}
+	})
+}
+
+// The summary line gains orphan figures only when there are any.
+func TestSummaryCarriesOrphansOnlyWhenPresent(t *testing.T) {
+	t.Chdir(t.TempDir())
+	var out bytes.Buffer
+	s := &syncer{cfg: &Config{}, out: &out, errOut: &bytes.Buffer{}}
+	s.event("clone", "acme/a")
+	line := fmt.Sprintf("summary cloned=%d pulled=%d skipped=%d errors=%d", s.counts.cloned, s.counts.pulled, s.counts.skipped, s.counts.errors)
+	if s.counts.orphans != 0 {
+		t.Fatal("no orphans expected")
+	}
+	if line != "summary cloned=1 pulled=0 skipped=0 errors=0" {
+		t.Errorf("summary = %q", line)
 	}
 }

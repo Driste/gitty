@@ -386,3 +386,38 @@ func TestLsOmitsExcluded(t *testing.T) {
 		}
 	}
 }
+
+func TestLsReportsOrphans(t *testing.T) {
+	t.Chdir(t.TempDir())
+	mkRepo(t, filepath.Join("acme", "gone"))
+	mkRepo(t, filepath.Join("acme", "retired"))
+	src := fakeSource{
+		groups: map[string]*gitlab.Group{"acme": {FullPath: "acme"}},
+		projects: map[string][]*gitlab.Project{"acme": {
+			{PathWithNamespace: "acme/live", HTTPURLToRepo: "https://gitlab.com/acme/live.git"},
+			{PathWithNamespace: "acme/retired", HTTPURLToRepo: "https://gitlab.com/acme/retired.git", Archived: true},
+		}},
+	}
+	s, stdout, _ := newTestSyncer(&Config{URL: "https://gitlab.com", HTTP: true}, src, (&recordingGit{}).run)
+	report, err := buildLsReport(context.Background(), s, "acme", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Orphans != 1 || report.Summary.Projects != 2 || report.Summary.Archived != 0 {
+		t.Errorf("summary = %+v (archived not requested, one orphan)", report.Summary)
+	}
+	writeLsText(s, report)
+	out := stdout.String()
+	if !strings.Contains(out, "orphan acme/gone no project upstream\n") || !strings.Contains(out, "orphans=1") {
+		t.Errorf("text form:\n%s", out)
+	}
+	if strings.Contains(out, "acme/retired") {
+		t.Errorf("an archived project with a checkout is neither listed by default nor an orphan:\n%s", out)
+	}
+	var tree bytes.Buffer
+	writeLsTree(&tree, report, newPalette(false))
+	if !strings.Contains(tree.String(), "gone  orphan") || !strings.Contains(tree.String(), "1 orphan with no project upstream") {
+		t.Errorf("tree form:\n%s", tree.String())
+	}
+	assertEventLines(t, stdout)
+}

@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.4.0"
+const AgentSchemaVersion = "3.5.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -185,6 +185,11 @@ func buildAgentSchema() AgentSchema {
 							Type:        "string",
 							Description: "Namespace path or glob to leave out, e.g. 'acme/vendor' (covers everything beneath it) or 'acme/*-mirror'. Repeatable, and also accepts a comma-separated list. Adds to the workspace's exclude list; excluded projects are reported as 'skip <path> excluded'.",
 						},
+						"prune": {
+							Type:        "boolean",
+							Description: "Move checkouts that no longer exist upstream (reported as 'orphan <path> no project upstream' without this flag) aside as <dir>.gitty-orphan-<n>, reported as 'prune <path>'. Nothing is ever deleted. Archived and excluded projects are never treated as orphans.",
+							Default:     false,
+						},
 						"allow-clone-host": {
 							Type:        "string",
 							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
@@ -246,7 +251,7 @@ func buildAgentSchema() AgentSchema {
 			},
 			{
 				Name:        "ls",
-				Description: "List the remote groups and projects under a target, marking each project 'new' (a sync would clone it) or 'present' (already checked out). Read-only: it contacts the GitLab API but never invokes git or writes to the workspace.",
+				Description: "List the remote groups and projects under a target, marking each project 'new' (a sync would clone it), 'present' (already checked out) or 'orphan' (checked out locally but no longer upstream; a sync --prune would move it aside). Read-only: it contacts the GitLab API but never invokes git or writes to the workspace.",
 				InputSchema: InputSchema{
 					Type: "object",
 					Properties: map[string]SchemaProp{

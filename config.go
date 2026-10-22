@@ -215,7 +215,7 @@ func contextBelow(cfgDir, wd string) (groupDir, below string) {
 	var parts []string
 	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
 		next := filepath.Join(groupDir, seg)
-		if seg == ConfigDir || strings.Contains(seg, brokenAsideMarker) || classifyDest(next) == destRepo {
+		if seg == ConfigDir || strings.Contains(seg, brokenAsideMarker) || strings.Contains(seg, orphanAsideMarker) || classifyDest(next) == destRepo {
 			break
 		}
 		groupDir = next

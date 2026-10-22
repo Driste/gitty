@@ -7,7 +7,9 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +51,8 @@ type syncCounts struct {
 	pulled  int
 	skipped int
 	errors  int
+	orphans int // checkouts with no project upstream (pruned ones included)
+	pruned  int // orphans moved aside by --prune
 }
 
 // syncer carries the resolved configuration and collaborators for a single
@@ -69,8 +73,10 @@ type syncer struct {
 	// an archived project is one its owners have retired, and a workspace
 	// mirroring the live namespace should not keep pulling it down.
 	includeArchived bool
-	cred            credential
-	exePath         string // this binary, for the askpass re-exec
+	// prune moves orphaned checkouts aside instead of only reporting them.
+	prune   bool
+	cred    credential
+	exePath string // this binary, for the askpass re-exec
 
 	// acceptNewHostKeys maps to ssh's StrictHostKeyChecking=accept-new:
 	// unknown hosts are recorded without prompting, a changed key is still
@@ -182,7 +188,7 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 	line := kind
 	if s.dryRun {
 		switch kind {
-		case "clone", "pull", "group", "reclone":
+		case "clone", "pull", "group", "reclone", "prune":
 			line = "plan " + kind
 		}
 	}
@@ -201,6 +207,11 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 		s.counts.pulled++
 	case "skip":
 		s.counts.skipped++
+	case "orphan":
+		s.counts.orphans++
+	case "prune":
+		s.counts.orphans++
+		s.counts.pruned++
 	case "error":
 		s.counts.errors++
 		s.failures = append(s.failures, strings.TrimSpace(path+" "+strings.Join(detail, " ")))
@@ -347,6 +358,10 @@ type syncOptions struct {
 	// see Config.Excluded.
 	AllowCloneHosts []string
 	Exclude         []string
+
+	// Prune moves checkouts that no longer exist upstream aside (never
+	// deletes them); see findOrphans.
+	Prune bool
 }
 
 // maxJobs bounds --jobs: beyond ~16 concurrent clones the bottleneck is the
@@ -374,6 +389,7 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.recloneBroken = opts.RecloneBroken
 	s.acceptNewHostKeys = opts.AcceptNewHostKeys
 	s.includeArchived = opts.IncludeArchived
+	s.prune = opts.Prune
 	s.jobs = opts.Jobs
 	s.cfg.AllowCloneHosts(opts.AllowCloneHosts)
 	s.cfg.AddExcludes(opts.Exclude)
@@ -413,8 +429,14 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.progressStop()
 	// The summary is always the last stdout line, on success and failure
 	// alike, and is identical between dry and real runs (parity contract).
-	fmt.Fprintf(s.out, "summary cloned=%d pulled=%d skipped=%d errors=%d\n",
+	summary := fmt.Sprintf("summary cloned=%d pulled=%d skipped=%d errors=%d",
 		s.counts.cloned, s.counts.pulled, s.counts.skipped, s.counts.errors)
+	// Orphan figures appear only when there is something to say, so the
+	// summary line of a clean run is unchanged.
+	if s.counts.orphans > 0 {
+		summary += fmt.Sprintf(" orphans=%d pruned=%d", s.counts.orphans, s.counts.pruned)
+	}
+	fmt.Fprintln(s.out, summary)
 	s.recapFailures()
 
 	// An interrupted run reports 130 even when items had already failed; the
@@ -504,13 +526,21 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	s.diagf("--- Syncing Repositories ---")
 	s.diagf("Fetching projects for: '%s' (Nested: %t)...", target, s.nested)
 
-	allProjects, err := s.src.Projects(ctx, target, s.nested, s.includeArchived)
+	// Everything upstream, archived included: archived projects are not
+	// synced unless asked, but a checkout of one is not an orphan either.
+	known, err := s.src.Projects(ctx, target, s.nested, true)
 	if err != nil {
 		s.event("error", target, "listing projects failed")
 		s.diagf("listing projects for %s: %v", target, err)
 		return
 	}
-
+	var allProjects []*gitlab.Project
+	for _, p := range known {
+		if p.Archived && !s.includeArchived {
+			continue
+		}
+		allProjects = append(allProjects, p)
+	}
 	s.diagf("Found %d projects.", len(allProjects))
 
 	// Excluded projects are reported, not silently dropped: a skip event per
@@ -524,6 +554,7 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 		kept = append(kept, p)
 	}
 	allProjects = kept
+	defer s.reportOrphans(ctx, target, known)
 	s.progressTotal(len(allProjects))
 
 	// Sync one repository on its own first so an SSH host-key prompt happens
@@ -538,6 +569,84 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	forEachConcurrent(ctx, s.jobs, allProjects, func(p *gitlab.Project) {
 		s.syncOneRepo(ctx, p)
 	})
+}
+
+// orphan is a local checkout with no project behind it upstream any more —
+// deleted, moved to another namespace, or transferred away.
+type orphan struct {
+	nsPath string // its GitLab-style path, for event lines
+	dir    string // its directory, relative to the working directory
+}
+
+// findOrphans compares the checkouts under target's directory with the
+// projects upstream (archived included) and returns the ones nothing upstream
+// accounts for. Without nested only the target's own directory is examined,
+// matching what the sync itself covered. Excluded paths are not orphans: the
+// user asked gitty to leave them alone.
+func (s *syncer) findOrphans(target string, known []*gitlab.Project) []orphan {
+	expected := make(map[string]bool, len(known))
+	for _, p := range known {
+		expected[filepath.ToSlash(filepath.Clean(getLocalRelPath(p.PathWithNamespace, s.cfg.RootPath)))] = true
+	}
+	targetDir := filepath.Clean(getLocalRelPath(target, s.cfg.RootPath))
+	if targetDir == "" {
+		targetDir = "."
+	}
+	if !isWithinWorkspace(targetDir) {
+		return nil
+	}
+	repos, err := findRepos(targetDir)
+	if err != nil {
+		return nil
+	}
+	var out []orphan
+	for _, r := range repos {
+		if !s.nested && strings.Contains(r, "/") {
+			continue // a checkout in a subgroup this flat sync did not cover
+		}
+		dir := filepath.ToSlash(filepath.Join(targetDir, r))
+		if expected[dir] {
+			continue
+		}
+		nsPath := path.Join(s.cfg.RootPath, dir)
+		if s.cfg.Excluded(nsPath) {
+			continue
+		}
+		out = append(out, orphan{nsPath: nsPath, dir: filepath.FromSlash(dir)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].nsPath < out[j].nsPath })
+	return out
+}
+
+// orphanAsideMarker names the directories --prune moves orphans to. Like
+// moved-aside broken checkouts they are archived copies, never deleted, and
+// workspace walks skip them.
+const orphanAsideMarker = ".gitty-orphan-"
+
+// reportOrphans emits an orphan event for every checkout nothing upstream
+// accounts for and, with --prune, moves each aside as <dir>.gitty-orphan-<n>.
+// It runs after an interrupted sync too, since it needs no network, but not
+// when the listing itself failed — an empty "known" would make every checkout
+// look orphaned.
+func (s *syncer) reportOrphans(ctx context.Context, target string, known []*gitlab.Project) {
+	for _, o := range s.findOrphans(target, known) {
+		if !s.prune {
+			s.event("orphan", o.nsPath, "no project upstream")
+			continue
+		}
+		if s.dryRun {
+			s.event("prune", o.nsPath)
+			continue
+		}
+		aside, err := moveAside(o.dir, orphanAsideMarker)
+		if err != nil {
+			s.event("error", o.nsPath, "moving orphan aside failed")
+			s.diagf("%s: %v", o.nsPath, err)
+			continue
+		}
+		s.event("prune", o.nsPath)
+		s.diagf("%s: moved to %s", o.nsPath, aside)
+	}
 }
 
 // destState classifies a repo's local destination path.
@@ -584,8 +693,15 @@ func classifyDest(dest string) destState {
 // renameAside moves a broken destination to dest+".gitty-broken-<n>" (never
 // deleting anything) so a fresh clone can take its place.
 func renameAside(dest string) (string, error) {
+	return moveAside(dest, brokenAsideMarker)
+}
+
+// moveAside renames dest to dest+marker+<n>, choosing the first n that is
+// free. Nothing is ever deleted: the directory keeps its contents under a
+// name that workspace walks know to skip.
+func moveAside(dest, marker string) (string, error) {
 	for n := 1; n < 100; n++ {
-		aside := fmt.Sprintf("%s.gitty-broken-%d", dest, n)
+		aside := fmt.Sprintf("%s%s%d", dest, marker, n)
 		if _, err := os.Stat(aside); os.IsNotExist(err) {
 			if err := os.Rename(dest, aside); err != nil {
 				return "", err
@@ -593,7 +709,7 @@ func renameAside(dest string) (string, error) {
 			return aside, nil
 		}
 	}
-	return "", fmt.Errorf("too many .gitty-broken directories beside %s", dest)
+	return "", fmt.Errorf("too many %s directories beside %s", strings.Trim(marker, "."), dest)
 }
 
 // syncOneRepo handles one project end-to-end and emits its own events.

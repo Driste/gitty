@@ -15,6 +15,7 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Works From Anywhere**: `sync`, `status` and `ls` find the workspace from any directory inside it and act on that directory's group — `cd` into a subgroup and `gitty sync` syncs just that subgroup.
 * **Says What Failed**: A sync with errors ends with a recap of every failed item, and `gitty auth` checks your token any time with a real exit code.
 * **Excludes**: List the projects or subgroups you never want (`exclude = [...]` in the config, or `--exclude`) and every sync and listing leaves them out, reporting each skip.
+* **Orphans**: Checkouts whose project was deleted or moved upstream are reported by `sync` and `ls`; `sync --prune` moves them aside — never deletes.
 * **Live Namespace Only**: Projects and groups GitLab has archived are left out of `ls` and `sync` unless you ask for them with `--archived`.
 
 ---
@@ -164,6 +165,7 @@ cd ~/ws/tenant/images        && gitty status               # only this subtree
 | `--path` | `""` | The same, as a flag (deprecated; kept for existing scripts). Not together with the positional form. |
 | `--archived` | `false` | Include projects and groups GitLab has archived. Left out by default. |
 | `--exclude` | `""` | Namespace path or glob to leave out — `acme/vendor` (and everything beneath it), `'acme/*-mirror'`. Repeatable, or comma-separated. Adds to the workspace's `exclude` list (see below). |
+| `--prune` | `false` | Move checkouts that no longer exist upstream aside as `<dir>.gitty-orphan-<n>`. Never deletes anything. Without it, orphans are only reported. |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
 | `--anon` | `false` | Sync public groups and repositories anonymously. Any `GITLAB_TOKEN` / `CI_JOB_TOKEN` in the environment is ignored, so a stale token cannot turn an anonymous run into a 401. Conflicts with `--token`. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
@@ -195,6 +197,26 @@ patterns for one run. Excluded items are reported rather than silently dropped
 — `sync` emits `skip <path> excluded` for each and counts them in the summary's
 `skipped=` — and the list is inherited by the subgroup directories `--groups`
 creates. An excluded project that is already checked out is left alone.
+
+### Checkouts that no longer exist upstream (orphans)
+
+Projects get deleted, moved to another namespace, or transferred away. The
+checkouts they left behind in your workspace are **orphans**: `sync` reports
+each one after it has synced the rest —
+
+```
+orphan tenant/images/old no project upstream
+```
+
+— and `ls` lists them as `orphan` (red in the tree), so you can see what a sync
+will not touch. Archived projects are not orphans (they still exist; they are
+just not synced by default), and neither is anything you have excluded.
+
+Nothing is removed on your behalf. `sync --prune` moves each orphan aside as
+`<dir>.gitty-orphan-<n>` — contents intact, out of the way of future syncs and
+`status` — and reports it as `prune <path>`. A `--dry-run` shows `plan prune`.
+Without `--nested`, only the target group's own directory is examined, matching
+what the sync itself covered.
 
 ### Progress on a terminal
 
@@ -353,11 +375,17 @@ clone tenant/images/app        # repo cloned
 pull tenant/images/app         # repo fast-forwarded (git pull --ff-only)
 group tenant/images            # group dir + nested config ensured
 reclone tenant/images/app      # broken checkout moved aside and re-cloned
+skip tenant/images/vendor excluded          # matched an exclude pattern
+orphan tenant/images/old no project upstream   # local checkout, nothing upstream (see --prune)
+prune tenant/images/old        # --prune: moved aside as old.gitty-orphan-1
 error tenant/images/app git pull failed
 error tenant/images/lib git fetch failed   # a clone that failed (the fetch is its network step)
 plan clone tenant/images/app   # --dry-run: "plan " + the exact action line
 summary cloned=3 pulled=12 skipped=0 errors=1   # always the last line
 ```
+
+When a run finds orphans the summary line also carries `orphans=N pruned=M`;
+on a clean run it is exactly the line above.
 
 Exit codes: `0` success · `1` completed with per-item failures · `2` usage or
 configuration error · `130` interrupted (Ctrl-C; git is signalled cleanly and
@@ -539,8 +567,9 @@ unknowable rather than zero.
 ## Browsing (`gitty ls`)
 
 Lists the remote groups and projects under a target, nesting subgroups and
-marking each project `present` (already checked out) or `new` (a sync would
-clone it). It never invokes git and never writes to the workspace.
+marking each project `present` (already checked out), `new` (a sync would
+clone it) or `orphan` (checked out locally, but no longer upstream). It never
+invokes git and never writes to the workspace.
 
 `ls` takes its target as a positional argument and resolves it the way a shell
 resolves a directory, against the group of the directory you are standing in
@@ -679,4 +708,4 @@ go build -o gitty . && ./scripts/integration-test.sh
 - [x] Async pull down repos (`--jobs`)
 - [x] Show repos current branches and if they are out of date, maybe a cache (`gitty status`, with `--fetch`)
 - [x] Show how many projects are in each group (`gitty ls`)
-- [ ] Show the current groups/projects and which will be removed or added when doing a subsequent run (`gitty ls` covers *added*; *removed* still needs orphan detection)
+- [x] Show the current groups/projects and which will be removed or added when doing a subsequent run (`gitty ls`: `new` is what a sync adds, `orphan` is what no longer exists upstream; `sync --prune` moves orphans aside)

@@ -47,6 +47,7 @@ func main() {
 	syncJobs := syncCmd.Int("jobs", 4, "Number of concurrent repo clone/pull operations (1-16)")
 	syncAcceptHostKeys := syncCmd.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
 	syncArchived := syncCmd.Bool("archived", false, "Include archived projects and groups (left out by default)")
+	syncPrune := syncCmd.Bool("prune", false, "Move checkouts that no longer exist upstream aside as <dir>.gitty-orphan-<n> (never deleted); without it they are only reported")
 	var syncExclude stringList
 	syncCmd.Var(&syncExclude, "exclude", "Namespace path or glob to leave out, e.g. acme/vendor or 'acme/*-mirror' (repeatable, or comma-separated; adds to the workspace's exclude list)")
 	var syncCloneHosts stringList
@@ -143,6 +144,7 @@ func main() {
 			IncludeArchived:   *syncArchived,
 			AllowCloneHosts:   syncCloneHosts,
 			Exclude:           syncExclude,
+			Prune:             *syncPrune,
 		})
 		stop()
 		exitOnError(err)
