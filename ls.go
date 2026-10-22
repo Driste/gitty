@@ -26,8 +26,10 @@ type lsOptions struct {
 	// IncludeArchived lists archived projects and groups too; they are left
 	// out by default, as sync leaves them out.
 	IncludeArchived bool
-	Format          string
-	Color           string
+	// Exclude adds patterns to the workspace's own; see Config.Excluded.
+	Exclude []string
+	Format  string
+	Color   string
 }
 
 // lsProject is one remote project and whether it is already checked out.
@@ -143,6 +145,9 @@ func assembleReport(s *syncer, target string, nested bool, groups []*gitlab.Grou
 	report := lsReport{Target: target, Nested: nested}
 
 	for _, p := range projects {
+		if s.cfg.Excluded(p.PathWithNamespace) {
+			continue
+		}
 		present := false
 		rel := getLocalRelPath(p.PathWithNamespace, s.cfg.RootPath)
 		if isWithinWorkspace(rel) && classifyDest(filepath.Join(".", rel)) == destRepo {
@@ -169,6 +174,9 @@ func assembleReport(s *syncer, target string, nested bool, groups []*gitlab.Grou
 	seen := map[string]bool{}
 	var paths []string
 	for _, g := range groups {
+		if s.cfg.Excluded(g.FullPath) {
+			continue
+		}
 		if !seen[g.FullPath] {
 			seen[g.FullPath] = true
 			paths = append(paths, g.FullPath)
@@ -362,6 +370,7 @@ func runLs(ctx context.Context, opts lsOptions) error {
 	}
 	s.nested = opts.Nested
 	s.includeArchived = opts.IncludeArchived
+	s.cfg.AddExcludes(opts.Exclude)
 
 	target, topLevel := resolveLsTarget(opts.Target, s.cfg.RootPath)
 

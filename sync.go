@@ -90,6 +90,78 @@ type syncer struct {
 	// failures keeps every error event's path and detail, in order, so a
 	// long run can end with a recap instead of leaving the user to scroll.
 	failures []string
+
+	// progress is the one-line "[done/total] action path" indicator shown on
+	// a terminal; see progressLine.
+	progress progressLine
+}
+
+// progressLine keeps a single status line alive at the bottom of a terminal
+// while repositories are being synced. It only ever draws on a terminal, so
+// piped or redirected stderr sees nothing of it; and every other write to
+// either stream clears it first and redraws it afterwards, so event lines
+// and diagnostics stay whole. Callers hold the syncer's mutex.
+type progressLine struct {
+	w       io.Writer
+	on      bool
+	total   int
+	done    int
+	current string
+	shown   bool
+}
+
+// enable turns the line on when w is a terminal.
+func (p *progressLine) enable(w io.Writer) {
+	if f, ok := w.(*os.File); ok && isTerminal(f) {
+		p.w, p.on = w, true
+	}
+}
+
+func (p *progressLine) clear() {
+	if p.on && p.shown {
+		fmt.Fprint(p.w, "\r\x1b[2K")
+		p.shown = false
+	}
+}
+
+func (p *progressLine) draw() {
+	if !p.on || p.total == 0 || p.done >= p.total {
+		return
+	}
+	fmt.Fprintf(p.w, "\r\x1b[2K[%d/%d] %s", p.done, p.total, p.current)
+	p.shown = true
+}
+
+// start records that a repository's work has begun.
+func (s *syncer) progressStart(action, path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.progress.current = action + " " + path
+	s.progress.draw()
+}
+
+// finish records that a repository's work is over, whatever the outcome.
+func (s *syncer) progressFinish() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.progress.done++
+	s.progress.clear()
+	s.progress.draw()
+}
+
+// progressTotal sets how many repositories the run will touch.
+func (s *syncer) progressTotal(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.progress.total, s.progress.done = n, 0
+}
+
+// progressStop clears the line for good, before the summary.
+func (s *syncer) progressStop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.progress.clear()
+	s.progress.on = false
 }
 
 // event emits one machine-readable line on the primary output stream:
@@ -118,7 +190,9 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 	if len(detail) > 0 {
 		line += " " + strings.Join(detail, " ")
 	}
+	s.progress.clear()
 	fmt.Fprintln(s.out, line)
+	s.progress.draw()
 
 	switch kind {
 	case "clone", "reclone":
@@ -143,6 +217,7 @@ func (s *syncer) recapFailures() {
 	if len(s.failures) == 0 {
 		return
 	}
+	s.progress.clear()
 	fmt.Fprintf(s.errOut, "\n%d failed:\n", len(s.failures))
 	for _, f := range s.failures {
 		fmt.Fprintf(s.errOut, "  %s\n", f)
@@ -153,7 +228,9 @@ func (s *syncer) recapFailures() {
 func (s *syncer) diagf(format string, args ...any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.progress.clear()
 	fmt.Fprintf(s.errOut, format+"\n", args...)
+	s.progress.draw()
 }
 
 // runGit is the single choke point for git execution: it prints the redacted
@@ -171,12 +248,14 @@ func (s *syncer) runGit(ctx context.Context, path, dir string, extraEnv []string
 	}
 	if s.verbose && len(out) > 0 {
 		s.mu.Lock()
+		s.progress.clear()
 		fmt.Fprintf(s.errOut, "--- git %s for %s ---\n", strings.Join(redactArgs(args), " "), path)
 		s.errOut.Write(out)
 		if out[len(out)-1] != '\n' {
 			fmt.Fprintln(s.errOut)
 		}
 		fmt.Fprintf(s.errOut, "--- end %s ---\n", path)
+		s.progress.draw()
 		s.mu.Unlock()
 	}
 	return nil
@@ -203,6 +282,8 @@ func (s *syncer) reportGitFailure(path string, args []string, out []byte, err er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.eventLocked("error", path, "git "+gitSubcommand(args)+" failed")
+	s.progress.clear()
+	defer s.progress.draw()
 	fmt.Fprintf(s.errOut, "--- git %s for %s failed: %v ---\n", strings.Join(redactArgs(args), " "), path, err)
 	if len(out) > 0 {
 		s.errOut.Write(out)
@@ -262,8 +343,10 @@ type syncOptions struct {
 	Jobs              int
 
 	// AllowCloneHosts adds trusted clone hosts for this run only; see
-	// Config.AllowCloneHosts.
+	// Config.AllowCloneHosts. Exclude adds patterns to the workspace's own;
+	// see Config.Excluded.
 	AllowCloneHosts []string
+	Exclude         []string
 }
 
 // maxJobs bounds --jobs: beyond ~16 concurrent clones the bottleneck is the
@@ -293,6 +376,8 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.includeArchived = opts.IncludeArchived
 	s.jobs = opts.Jobs
 	s.cfg.AllowCloneHosts(opts.AllowCloneHosts)
+	s.cfg.AddExcludes(opts.Exclude)
+	s.progress.enable(s.errOut)
 
 	if s.verbose {
 		// Enough to tell which binary, which git and whose configuration a
@@ -325,6 +410,7 @@ func runSync(ctx context.Context, opts syncOptions) error {
 		s.syncRepos(ctx, fullTarget)
 	}
 
+	s.progressStop()
 	// The summary is always the last stdout line, on success and failure
 	// alike, and is identical between dry and real runs (parity contract).
 	fmt.Fprintf(s.out, "summary cloned=%d pulled=%d skipped=%d errors=%d\n",
@@ -360,6 +446,15 @@ func (s *syncer) syncGroups(ctx context.Context, target string) {
 	if root != nil {
 		allGroups = append([]*gitlab.Group{root}, allGroups...)
 	}
+	keptGroups := allGroups[:0]
+	for _, g := range allGroups {
+		if s.cfg.Excluded(g.FullPath) {
+			s.event("skip", g.FullPath, "excluded")
+			continue
+		}
+		keptGroups = append(keptGroups, g)
+	}
+	allGroups = keptGroups
 
 	s.diagf("Found %d groups to sync.", len(allGroups))
 
@@ -393,6 +488,7 @@ func (s *syncer) syncGroups(ctx context.Context, target string) {
 			HTTP:       s.cfg.HTTP,
 			RootPath:   g.FullPath,
 			CloneHosts: append([]string(nil), s.cfg.CloneHosts...),
+			Exclude:    append([]string(nil), s.cfg.Exclude...),
 		}
 		if err := SaveConfigTo(groupDest, subCfg); err != nil {
 			s.event("error", g.FullPath, "saving config failed")
@@ -416,6 +512,19 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	}
 
 	s.diagf("Found %d projects.", len(allProjects))
+
+	// Excluded projects are reported, not silently dropped: a skip event per
+	// project keeps the event stream a complete account of the listing.
+	kept := allProjects[:0]
+	for _, p := range allProjects {
+		if s.cfg.Excluded(p.PathWithNamespace) {
+			s.event("skip", p.PathWithNamespace, "excluded")
+			continue
+		}
+		kept = append(kept, p)
+	}
+	allProjects = kept
+	s.progressTotal(len(allProjects))
 
 	// Sync one repository on its own first so an SSH host-key prompt happens
 	// once rather than once per worker (see needsHostKeyWarmup).
@@ -494,6 +603,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 	if ctx.Err() != nil {
 		return
 	}
+	defer s.progressFinish()
 
 	cloneURL := s.cloneURL(p)
 
@@ -524,6 +634,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		// Existing checkout: fast-forward it. --ff-only refuses to create a
 		// merge commit, so a diverged or dirty checkout fails loudly instead
 		// of leaving the repo in a surprising state.
+		s.progressStart("pulling", p.PathWithNamespace)
 		env, args, ok := s.authForCheckout(ctx, p.PathWithNamespace, repoDest, "pull", "--ff-only")
 		if !ok {
 			return
@@ -567,6 +678,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		s.diagf("creating %s: %v", parentDir, err)
 		return
 	}
+	s.progressStart("cloning", p.PathWithNamespace)
 	if err := s.bringUp(ctx, p, repoDest, cloneURL, true); err == nil {
 		s.event(kind, p.PathWithNamespace)
 		s.reportResolvedOrigin(ctx, p.PathWithNamespace, repoDest, cloneURL)
@@ -691,6 +803,8 @@ func (s *syncer) explainFetchFailure(ctx context.Context, path, dest, url, effec
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.progress.clear()
+	defer s.progress.draw()
 	fmt.Fprintf(s.errOut, "--- url.insteadOf rules git sees inside %s ---\n", dest)
 	for _, line := range strings.Split(rules, "\n") {
 		// "file:<path>\t<key> <value>": redact token by token, since the

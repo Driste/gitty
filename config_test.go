@@ -167,3 +167,24 @@ func TestDiscoverWorkspace(t *testing.T) {
 		}
 	})
 }
+
+func TestConfigExcluded(t *testing.T) {
+	cfg := &Config{Exclude: []string{"acme/vendor", "acme/*-mirror", " /acme/platform/monorepo/ ", ""}}
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"acme/vendor", true},
+		{"acme/vendor/lib", true},         // beneath an excluded path
+		{"acme/vendor-tools", false},      // a sibling that merely shares the prefix
+		{"acme/upstream-mirror", true},    // glob
+		{"acme/x/upstream-mirror", false}, // * does not cross /
+		{"acme/platform/monorepo", true},  // whitespace and slashes trimmed
+		{"acme/app", false},
+	}
+	for _, tc := range tests {
+		if got := cfg.Excluded(tc.path); got != tc.want {
+			t.Errorf("Excluded(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}

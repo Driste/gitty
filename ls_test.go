@@ -361,3 +361,28 @@ func TestLsMarksArchived(t *testing.T) {
 		t.Errorf("default summary = %+v", report.Summary)
 	}
 }
+
+func TestLsOmitsExcluded(t *testing.T) {
+	t.Chdir(t.TempDir())
+	src := fakeSource{
+		groups:    map[string]*gitlab.Group{"acme": {FullPath: "acme"}},
+		subgroups: map[string][]*gitlab.Group{"acme": {{FullPath: "acme/vendor"}, {FullPath: "acme/team"}}},
+		projects: map[string][]*gitlab.Project{"acme": {
+			{PathWithNamespace: "acme/app", HTTPURLToRepo: "https://gitlab.com/acme/app.git"},
+			{PathWithNamespace: "acme/vendor/lib", HTTPURLToRepo: "https://gitlab.com/acme/vendor/lib.git"},
+		}},
+	}
+	s, _, _ := newTestSyncer(&Config{URL: "https://gitlab.com", HTTP: true, Exclude: []string{"acme/vendor"}}, src, (&recordingGit{}).run)
+	report, err := buildLsReport(context.Background(), s, "acme", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Projects != 1 {
+		t.Errorf("projects = %d, want 1 (vendor/lib excluded)", report.Summary.Projects)
+	}
+	for _, g := range report.Groups {
+		if g.Path == "acme/vendor" {
+			t.Error("excluded group listed")
+		}
+	}
+}

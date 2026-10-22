@@ -14,6 +14,7 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Safe Destinations**: Refuses to write outside the workspace (namespace paths containing `..` or absolute paths are skipped) and reports any repository advertised on a host other than the configured GitLab instance.
 * **Works From Anywhere**: `sync`, `status` and `ls` find the workspace from any directory inside it and act on that directory's group — `cd` into a subgroup and `gitty sync` syncs just that subgroup.
 * **Says What Failed**: A sync with errors ends with a recap of every failed item, and `gitty auth` checks your token any time with a real exit code.
+* **Excludes**: List the projects or subgroups you never want (`exclude = [...]` in the config, or `--exclude`) and every sync and listing leaves them out, reporting each skip.
 * **Live Namespace Only**: Projects and groups GitLab has archived are left out of `ls` and `sync` unless you ask for them with `--archived`.
 
 ---
@@ -162,6 +163,7 @@ cd ~/ws/tenant/images        && gitty status               # only this subtree
 | `[group]` | | The GitLab group or subgroup to sync (e.g., `tenant/images`), relative to the current directory's group, as a positional argument. Omitted, the current group is synced — so at the workspace root it is required. |
 | `--path` | `""` | The same, as a flag (deprecated; kept for existing scripts). Not together with the positional form. |
 | `--archived` | `false` | Include projects and groups GitLab has archived. Left out by default. |
+| `--exclude` | `""` | Namespace path or glob to leave out — `acme/vendor` (and everything beneath it), `'acme/*-mirror'`. Repeatable, or comma-separated. Adds to the workspace's `exclude` list (see below). |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
 | `--anon` | `false` | Sync public groups and repositories anonymously. Any `GITLAB_TOKEN` / `CI_JOB_TOKEN` in the environment is ignored, so a stale token cannot turn an anonymous run into a 401. Conflicts with `--token`. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
@@ -173,6 +175,34 @@ cd ~/ws/tenant/images        && gitty status               # only this subtree
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
 | `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
 | `--allow-clone-host` | `""` | Record an extra host this run expects to clone from, silencing the note about it. Repeatable, or comma-separated. Adds to whatever `init` stored. |
+
+### Leaving things out (`exclude`)
+
+Some projects you never want on disk — a monorepo measured in gigabytes, a
+vendored mirror, a subgroup that belongs to another team. List them once in
+`.gitty/config` and every `sync` and `ls` leaves them out:
+
+```toml
+url = "https://gitlab.example.com"
+http = true
+root_path = ""
+exclude = ["acme/vendor", "acme/*-mirror", "acme/platform/monorepo"]
+```
+
+An entry is a full GitLab path, which also covers everything beneath it, or a
+glob in Go's `path.Match` syntax (`*` does not cross `/`). `--exclude` adds
+patterns for one run. Excluded items are reported rather than silently dropped
+— `sync` emits `skip <path> excluded` for each and counts them in the summary's
+`skipped=` — and the list is inherited by the subgroup directories `--groups`
+creates. An excluded project that is already checked out is left alone.
+
+### Progress on a terminal
+
+When stderr is a terminal, `sync` keeps a single status line at the bottom
+while it works — `[12/97] cloning acme/platform/api` — and redraws it around
+every event and diagnostic so nothing is torn. Piped or redirected output never
+sees it, so scripts and logs get exactly the event lines and diagnostics
+documented above.
 
 ### Your git config is respected
 
@@ -557,6 +587,7 @@ colour**, so scripts keep parsing stable output. Override either with
 | `--anon` | `false` | List public groups and projects anonymously. |
 | `--nested` | `false` | Recurse into nested subgroups. Per-group project counts are only complete in this mode. |
 | `--archived` | `false` | Include projects and groups GitLab has archived, marking each archived project (`archived` on its event line, `, archived` in the tree). Left out by default, matching what `sync` would clone. |
+| `--exclude` | `""` | Namespace path or glob to leave out for this listing. Repeatable. Adds to the workspace's `exclude` list. |
 | `--format` | `auto` | `auto` (tree on a terminal, `text` when piped), `tree`, `text`, or `json`. |
 | `--color` | `auto` | `auto` (only on a terminal), `always`, or `never`. |
 

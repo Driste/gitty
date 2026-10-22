@@ -47,6 +47,8 @@ func main() {
 	syncJobs := syncCmd.Int("jobs", 4, "Number of concurrent repo clone/pull operations (1-16)")
 	syncAcceptHostKeys := syncCmd.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
 	syncArchived := syncCmd.Bool("archived", false, "Include archived projects and groups (left out by default)")
+	var syncExclude stringList
+	syncCmd.Var(&syncExclude, "exclude", "Namespace path or glob to leave out, e.g. acme/vendor or 'acme/*-mirror' (repeatable, or comma-separated; adds to the workspace's exclude list)")
 	var syncCloneHosts stringList
 	syncCmd.Var(&syncCloneHosts, "allow-clone-host", "Additional host whose repositories may be cloned and sent this workspace's token (repeatable, or comma-separated)")
 
@@ -69,6 +71,8 @@ func main() {
 	lsAnon := lsCmd.Bool("anon", false, "List public resources anonymously (no token required)")
 	lsNested := lsCmd.Bool("nested", false, "Include nested subgroups/projects recursively")
 	lsArchived := lsCmd.Bool("archived", false, "Include archived projects and groups (left out by default)")
+	var lsExclude stringList
+	lsCmd.Var(&lsExclude, "exclude", "Namespace path or glob to leave out (repeatable, or comma-separated; adds to the workspace's exclude list)")
 	lsFormat := lsCmd.String("format", "auto", "Output format: auto, tree, text, or json")
 	lsColor := lsCmd.String("color", "auto", "Colorize output: auto, always, or never")
 
@@ -138,6 +142,7 @@ func main() {
 			AcceptNewHostKeys: *syncAcceptHostKeys,
 			IncludeArchived:   *syncArchived,
 			AllowCloneHosts:   syncCloneHosts,
+			Exclude:           syncExclude,
 		})
 		stop()
 		exitOnError(err)
@@ -177,6 +182,7 @@ func main() {
 			Anon:            *lsAnon,
 			Nested:          *lsNested,
 			IncludeArchived: *lsArchived,
+			Exclude:         lsExclude,
 			Format:          *lsFormat,
 			Color:           *lsColor,
 		})

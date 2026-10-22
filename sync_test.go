@@ -1369,3 +1369,95 @@ func TestFailureRecap(t *testing.T) {
 		t.Errorf("unexpected recap output: %q", stderr2.String())
 	}
 }
+
+// Excluded projects and groups are skipped with a visible event, counted in
+// the summary, and the exclude list is inherited by subgroup configs.
+func TestExcludesAreSkippedAndReported(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rec := &recordingGit{}
+	s, stdout, _ := newTestSyncer(
+		&Config{URL: "https://gitlab.com", HTTP: true, Exclude: []string{"acme/vendor"}},
+		fakeSource{
+			subgroups: map[string][]*gitlab.Group{"acme": {{FullPath: "acme/team"}, {FullPath: "acme/vendor"}}},
+			projects: map[string][]*gitlab.Project{"acme": {
+				{PathWithNamespace: "acme/app", HTTPURLToRepo: "https://gitlab.com/acme/app.git"},
+				{PathWithNamespace: "acme/vendor/lib", HTTPURLToRepo: "https://gitlab.com/acme/vendor/lib.git"},
+			}},
+		},
+		rec.run,
+	)
+	s.cfg.AddExcludes([]string{"acme/*-mirror"})
+	s.syncGroups(context.Background(), "acme")
+	s.syncRepos(context.Background(), "acme")
+
+	out := stdout.String()
+	for _, want := range []string{"skip acme/vendor excluded\n", "skip acme/vendor/lib excluded\n", "clone acme/app\n", "group acme/team\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "clone acme/vendor/lib") || strings.Contains(out, "group acme/vendor\n") {
+		t.Errorf("excluded items were synced:\n%s", out)
+	}
+	if s.counts.skipped != 2 || s.counts.cloned != 1 {
+		t.Errorf("counts = %+v, want skipped=2 cloned=1", s.counts)
+	}
+	if _, err := os.Stat(filepath.Join("acme", "vendor")); !os.IsNotExist(err) {
+		t.Error("excluded group directory was created")
+	}
+
+	t.Chdir(filepath.Join("acme", "team"))
+	sub, err := LoadLocalConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sub.Exclude) != 2 || sub.Exclude[0] != "acme/vendor" || sub.Exclude[1] != "acme/*-mirror" {
+		t.Errorf("subgroup config exclude = %v, want both patterns inherited", sub.Exclude)
+	}
+}
+
+// The progress line is drawn only when enabled, is cleared before every other
+// line so output stays whole, and is gone before the summary.
+func TestProgressLine(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rec := &recordingGit{}
+	s, stdout, stderr := newTestSyncer(
+		&Config{URL: "https://gitlab.com", HTTP: true},
+		fakeSource{projects: map[string][]*gitlab.Project{"acme": {
+			{PathWithNamespace: "acme/one", HTTPURLToRepo: "https://gitlab.com/acme/one.git"},
+			{PathWithNamespace: "acme/two", HTTPURLToRepo: "https://gitlab.com/acme/two.git"},
+		}}},
+		rec.run,
+	)
+	// Force it on, as a terminal would.
+	s.progress.w, s.progress.on = stderr, true
+	s.jobs = 1
+	s.syncRepos(context.Background(), "acme")
+	s.progressStop()
+
+	got := stderr.String()
+	if !strings.Contains(got, "[0/2] cloning acme/one") || !strings.Contains(got, "[1/2] cloning acme/two") {
+		t.Errorf("progress updates missing:\n%q", got)
+	}
+	if !strings.HasSuffix(got, "\r\x1b[2K") {
+		t.Errorf("the line should be cleared at the end, got tail %q", got[max(0, len(got)-20):])
+	}
+	// Every drawn line is preceded by a clear, so a previous line never bleeds.
+	if strings.Count(got, "\r\x1b[2K[") != strings.Count(got, "] ") {
+		t.Errorf("each draw should start with a clear:\n%q", got)
+	}
+	// Event lines on stdout are untouched by any control sequence.
+	if strings.Contains(stdout.String(), "\x1b") || strings.Contains(stdout.String(), "\r") {
+		t.Errorf("stdout must carry no terminal control sequences:\n%q", stdout.String())
+	}
+
+	// Off (the default outside a terminal): stderr carries no control sequences.
+	s2, _, stderr2 := newTestSyncer(&Config{URL: "https://gitlab.com", HTTP: true},
+		fakeSource{projects: map[string][]*gitlab.Project{"acme": {
+			{PathWithNamespace: "acme/one", HTTPURLToRepo: "https://gitlab.com/acme/one.git"},
+		}}}, (&recordingGit{}).run)
+	s2.syncRepos(context.Background(), "acme")
+	if strings.Contains(stderr2.String(), "\x1b") {
+		t.Errorf("no progress output expected when not a terminal:\n%q", stderr2.String())
+	}
+}
