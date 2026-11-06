@@ -25,6 +25,15 @@ The approach is deliberately textual and local: references are found by
 scanning files git tracks for paths and URLs that resolve to projects of the
 instance, never by running package managers or evaluating build files.
 
+The MCP server is a **plugin**, not part of `gitty`: a second binary,
+`gitty-mcp`, that `gitty mcp` finds and runs the way git runs `git-<cmd>`.
+The plugin is thin — it drives `gitty context --format=json`, `gitty fetch`
+and `gitty index` and reads the index file — so the CLI remains the one
+implementation and the one public interface, and a user who never runs an
+agent never installs the server. Inside, the plugin separates tools that
+answer from the index from tools that need a local checkout; that is the
+seam a future shared, remote server will be cut along.
+
 ## Technical Context
 
 **Language/Version**: Go 1.24 (pinned in `go.mod`)
@@ -34,10 +43,12 @@ modules.** MCP is JSON-RPC 2.0 over stdio, hand-written.
 **Storage**: `<workspace>/.gitty/index.json` (schema-versioned, atomic write)
 **Testing**: `go test ./...` — unit tests on fixture trees; e2e against the
 existing fake GitLab (extended with description/topics/fork/registry fields)
-and real git; the MCP server driven over in-process pipes and once by a real
-client in CI.
+and real git; the plugin driven over pipes against a stub `gitty`, end to end
+against both built binaries, and once by a real client in CI.
 **Target Platform**: macOS/Linux amd64/arm64; Windows best-effort.
-**Project Type**: CLI (single `main` package, as today)
+**Project Type**: CLI (single `main` package at the root, as today) plus one
+plugin binary under `cmd/gitty-mcp/` and a small shared package
+`internal/contract/` holding the JSON types both sides agree on
 **Performance Goals**: cold index of 50 checkouts < 30 s; warm < 1 s; a warm
 `gitty_context` that fetches nothing < 300 ms.
 **Constraints**: read-only except the index file and clones; offline once the
@@ -55,6 +66,7 @@ to fit an instruction budget.
 | **I. CLI-first, safe by default** | Everything is read-only except two things, both additive and idempotent: the index file under `.gitty/` (`index` honours `--dry-run`) and clones of related projects, which go through the existing bring-up — same paths, same credentials, same dry-run parity, same recoverability. Fetching is on by default because the clarification asked for it, and it is still governed by a named switch (`--no-fetch` on the server, `fetch:false` per call, `--fetch` on the CLI) so a read-only deployment is one flag away. Nothing deletes, nothing force-pushes, nothing rewrites. Exit codes keep the 0/1/2/130 taxonomy. |
 | **II. Minimal deps, structured observability** | Zero new modules: JSON-RPC via `encoding/json`, reference extraction via line scanning and `regexp` (no general YAML/TOML parsing). `index` and `related` emit fixed-prefix events (`index`, `link`, `unresolved`, `related`, `related-by`, `summary`); `context` prints Markdown as its primary output (as `ls --format=tree` does) with `--format=json`. `--verbose` shows every git invocation and file scanned. The index holds no token; MCP results never carry one. The MCP server logs to stderr only. |
 | **III. Config-anchored workspaces** | Every entry point uses the existing workspace discovery; the server discovers from its working directory at start. The index sits beside `.gitty/config`, never in a repo, never in `$HOME`. `exclude`, `clone_hosts`, archived handling are reused unchanged. No flag mutates config. |
+| **The CLI is the only public interface** | The plugin adds no second implementation: every answer it gives is `gitty context --format=json`, `gitty fetch --format=json` or the index file, re-shaped for MCP. `gitty` builds, tests and runs without the plugin; `gitty mcp` without it is a clear exit 2. The JSON outputs and the index are versioned contracts (FR-016). Credentials never cross the process boundary — the plugin runs `gitty`, which resolves them as it always has. |
 | **Additional constraints** | GitLab REST only; token resolution order unchanged; `index` checks `ctx` between projects and writes atomically, so an interrupt leaves the previous index intact; fetches inherit sync's SIGINT handling. |
 | **Quality gates** | `go build`/`go vet`/`go test` as today; dry-run parity for `index` and `sync --related` shown by e2e tests. |
 
@@ -128,14 +140,63 @@ Deliberately not done: general YAML/TOML parsing, version-constraint
 evaluation, following `include: local:` chains beyond the tree. Evidence is a
 file and a line a human can open.
 
-### The MCP server (`gitty mcp`) — the primary surface
+### Plugins: `gitty <cmd>` runs `gitty-<cmd>`
 
-JSON-RPC 2.0 over stdio, newline-delimited, hand-written: `initialize`,
-`notifications/initialized`, `ping`, `tools/list`, `tools/call`. Started by
-the agent host in a working directory inside the workspace; discovers the
-workspace and resolves credentials once at start; holds the index in memory
-and refreshes it (per project, by HEAD) on demand. Protocol only on stdout;
-diagnostics on stderr. `--no-fetch` turns the server read-only.
+When `gitty`'s first argument is not a built-in command, `main.go` looks for
+an executable named `gitty-<cmd>` — in the directory of the running `gitty`
+binary first (a release archive unpacked in one place just works), then on
+`PATH` — and runs it with the remaining arguments, stdin/stdout/stderr
+inherited, exit code passed through, SIGINT forwarded. Nothing found:
+`Unknown command: <cmd> (no gitty-<cmd> beside gitty or on PATH)`, plus an
+install hint for `mcp`, exit 2. Built-in commands always win; a plugin
+cannot shadow `sync`.
+
+Before the exec, `gitty` runs the discovery every command runs and hands the
+result over as environment:
+
+| Variable | Value |
+|---|---|
+| `GITTY_BIN` | absolute path of the `gitty` that launched the plugin — the one the plugin runs for everything it does not do itself |
+| `GITTY_WORKSPACE` | the workspace root (the directory holding `.gitty/config`) |
+| `GITTY_GROUP` | the group of the working directory relative to the root; empty at the root |
+| `GITTY_INSTANCE` | the instance URL from the config |
+
+No token is passed. A plugin needing the API runs `GITTY_BIN`, which resolves
+credentials the way it always does (`--token`, `GITLAB_TOKEN`,
+`CI_JOB_TOKEN`). Discovery failing (not inside a workspace) is not fatal to
+the dispatch — the variables are left empty and the plugin decides;
+`gitty-mcp` refuses to start.
+
+`gitty mcp` is this rule applied to `gitty-mcp`; it has no code path of its
+own.
+
+### The MCP server — `gitty-mcp`, the primary surface
+
+A separate binary at `cmd/gitty-mcp/`, built from the same module, released
+from the same tag, required by nothing else. JSON-RPC 2.0 over stdio,
+newline-delimited, hand-written: `initialize`, `notifications/initialized`,
+`ping`, `tools/list`, `tools/call`. Protocol only on stdout; diagnostics on
+stderr. `--no-fetch` turns the server read-only.
+
+It is **thin by rule**: it owns the protocol, the tool schemas and the two
+tools that need nothing but a checkout (`gitty_search`, `gitty_read`).
+Everything else is `gitty`:
+
+| Tool | Backed by |
+|---|---|
+| `gitty_context`, `gitty_related` | `gitty context --format=json [--fetch] [--direction] [project]`, one process per call; the JSON is the tool result |
+| `gitty_projects` | the index file (`<workspace>/.gitty/index.json`) decoded with `internal/contract`; `gitty index` run first when it is missing; cached by modification time |
+| `gitty_fetch` | `gitty fetch --format=json <project>...` |
+| `gitty_search`, `gitty_read` | `git grep` and file reads inside checkouts named by the index — local by nature |
+
+The split in that table is deliberate: the first three rows are
+**index-backed** and could be served by any process holding the index; the
+last row needs the caller's disk. The plugin keeps them as two interfaces
+(`indexTools`, `workspaceTools`) behind one stdio front end, so a remote
+server later replaces the first and proxies the second — see *Looking
+ahead*.
+
+The tools, as the agent sees them:
 
 | Tool | Input | Does |
 |---|---|---|
@@ -146,11 +207,46 @@ diagnostics on stderr. `--no-fetch` turns the server read-only.
 | `gitty_search` | `{pattern, projects?, max?}` | `git grep -n` across local checkouts (or the named ones); results `project`, `file`, `line`, `text`; bounded. |
 | `gitty_read` | `{project, path, start?, end?}` | A file or line range from a local checkout; refuses `..`, absolute paths and symlinks that escape the checkout. |
 
-Fetching inside the server reuses `bringUp` — the same code path as `sync`,
-so credentials, host notes, interrupt handling, the unborn-resume logic and
-the events (logged to stderr here) are inherited. Concurrent clients are safe:
-the index is written atomically and an in-progress bring-up of the same
-project is resumed, not clobbered.
+Fetching happens inside `gitty` (`context --fetch`, `fetch`), so it is the
+same `bringUp` as `sync`: credentials, host notes, interrupt handling, the
+unborn-resume logic and the events (the plugin relays them to stderr) are
+inherited. Concurrent clients are safe: the index is written atomically and
+an in-progress bring-up of the same project is resumed, not clobbered.
+
+Cost: one `gitty` process per `gitty_context` call — a few milliseconds of
+start-up plus the index load, within SC-002's 300 ms for a warm index. A
+version skew between plugin and CLI surfaces as a tool error naming both
+schema versions, never as a misread result.
+
+### `gitty fetch <project>...`
+
+The explicit form of what `context --fetch` does: resolve each namespace
+path to a project (index first, API if unknown), skip the ones already
+checked out, feed the rest to the existing pool. Events as `sync`;
+`--format=json` prints one record per project (`path`, `dir`, `fetched`,
+`present`, `error`) for the plugin; `--dry-run` parity; `exclude` honoured;
+a project not named is never touched. `sync --related` and `gitty_fetch`
+are both this with a different way of choosing the list.
+
+### Looking ahead: a shared, remote `gitty-mcp` (not in this feature)
+
+If the local plugin proves out, the next step is one server many
+developers' agents share: an HTTP transport in front of the same
+`indexTools`, holding one index for the whole instance that grows as anyone
+indexes a project — a cache that gets better with use. What this feature
+does to keep that cheap, and nothing more:
+
+- `indexTools` and `workspaceTools` are separate interfaces behind one stdio
+  front end; the remote server implements the first and proxies the second
+  to the client's own `gitty-mcp`.
+- Results identify projects by namespace path; local paths are an attribute
+  computed from the caller's workspace, so a remote answer can be completed
+  locally ("acme/lib is at /ws/acme/lib on *your* machine").
+- The index format is versioned and workspace-independent: `local.dir` is
+  relative to the root, nothing in it is an absolute path.
+
+Transport, authentication, multi-workspace merging and who runs the server
+are that feature's questions, not this one's.
 
 ### Briefing (`gitty context`) — the same content for a terminal
 
@@ -213,31 +309,47 @@ briefing.go         # briefing model, built from the index for a project or grou
 context.go          # `gitty context`: Markdown and JSON renderers, --fetch
 related.go          # `gitty related` event lines
 indexcmd.go         # `gitty index`
-mcp.go              # JSON-RPC 2.0 over stdio: framing, dispatch, errors
-mcp_tools.go        # the six tools, input schemas, confinement checks
-fetch.go            # bring up a list of projects by path (shared by mcp, context --fetch, sync --related)
+fetch.go            # `gitty fetch <project>...` and the bring-up-by-path it shares with context --fetch and sync --related
+plugin.go           # `gitty <cmd>` → `gitty-<cmd>`: lookup beside the binary / on PATH, env, exec
 sync.go             # + --related selection
-commands.go         # + context, related, index, mcp in the command table (flags, completion)
+commands.go         # + context, related, index, fetch in the command table (flags, completion)
 agent.go            # + schema entries
 README.md, context.md  # user and agent docs
 
-index_test.go, scan_test.go, resolve_test.go, briefing_test.go, mcp_test.go
-e2e_test.go         # + fake GitLab: description, topics, forked_from, registry prefix
+internal/contract/
+└── contract.go     # the JSON types gitty prints and gitty-mcp reads: Index, Briefing, FetchResult; Schema
+
+cmd/gitty-mcp/
+├── main.go         # flags (--no-fetch, --jobs, --version), environment from gitty, start/stop
+├── rpc.go          # JSON-RPC 2.0 over stdio: framing, dispatch, error objects
+├── tools.go        # tool registry and schemas; indexTools (run gitty, read the index) and workspaceTools (search, read)
+└── *_test.go       # driven over io.Pipe against a stub `gitty` on PATH
+
+index_test.go, scan_test.go, resolve_test.go, briefing_test.go, plugin_test.go
+e2e_test.go         # + fake GitLab metadata; builds both binaries; MCP end to end over stdio
+
+.github/workflows/release.yml  # + builds gitty-mcp_<version>_<os>_<arch> beside gitty
 ```
 
-**Structure Decision**: stay in the single `main` package the project uses;
-one file per concern, as `ls.go`, `status.go` and `auth.go` are today.
+**Structure Decision**: the CLI stays the single `main` package at the root,
+one file per concern, as `ls.go`, `status.go` and `auth.go` are today. The
+plugin is a second `main` under `cmd/gitty-mcp/` in the same module (one
+`go build ./...`, one release), sharing only `internal/contract/`: the JSON it
+reads is the JSON `gitty` prints, so what is shared is types and a version
+constant, nothing with behaviour.
 
 ## Phasing
 
 | Phase | Delivers | Stories |
 |---|---|---|
+| **0 — Plugin seam** | `plugin.go` (`gitty <cmd>` → `gitty-<cmd>`, environment, exit codes); `internal/contract/`; the release workflow builds the second binary; README "Plugins" | — |
 | **1 — Foundation** | `index.go`, `resolve.go`, `scan.go` with the CI and manifest extractors and fork edges; fake-GitLab metadata; `gitty index`, `gitty related` | US3 |
-| **2 — Context, both surfaces** | `briefing.go`, `fetch.go`, `context.go` (`gitty context`, `--fetch`, `--format=json`); `mcp.go`, `mcp_tools.go` (`gitty mcp`, all six tools, `--no-fetch`); real-client smoke test; docs | US1, US2 |
+| **2 — Context, both surfaces** | `briefing.go`, `fetch.go` (`gitty fetch`), `context.go` (`gitty context`, `--fetch`, `--format=json`); `cmd/gitty-mcp/` (all six tools, `--no-fetch`); real-client smoke test; docs | US1, US2 |
 | **3 — Shell fetch + remaining sources** | `sync --related`; image, submodule and mentions extractors | US4 |
 
-Phase 1 and 2 together are the prototype the clarifications asked for: both
-surfaces, CI links first, fetching on. Phase 3 rounds it out.
+Phases 0–2 together are the prototype the clarifications asked for: both
+surfaces, CI links first, fetching on, the server as a plugin. Phase 3 rounds
+it out.
 
 ## Decisions Settled
 
@@ -249,6 +361,14 @@ surfaces, CI links first, fetching on. Phase 3 rounds it out.
    on the CLI; `--no-fetch` / `fetch:false` for read-only use.
 4. **Writing** — never inside a repository; nothing vendor-specific. The
    index is the only file gitty writes, beside its own config.
+5. **Packaging** — the MCP server is a plugin binary, `gitty-mcp`, run by
+   `gitty mcp` through a generic `gitty <cmd>` → `gitty-<cmd>` rule; thin,
+   driving `gitty` for everything but search and read; released from the
+   same tag; never required by the CLI.
+6. **Remote** — a shared, remote server is a later feature. This one keeps
+   the seam: index-backed and workspace-backed tools are separate
+   interfaces, identity is the namespace path, the index holds no absolute
+   paths.
 
 ## Complexity Tracking
 

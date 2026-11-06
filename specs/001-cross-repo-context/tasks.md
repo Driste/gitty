@@ -12,8 +12,48 @@
 
 ## Path Conventions
 
-Single `main` package at the repository root; one file per concern; tests
-beside the code as `*_test.go`; e2e in `e2e_test.go` against the fake GitLab.
+CLI: single `main` package at the repository root; one file per concern;
+tests beside the code as `*_test.go`; e2e in `e2e_test.go` against the fake
+GitLab. Plugin: `cmd/gitty-mcp/` (its own `main`), sharing
+`internal/contract/` with the CLI. Task IDs are stable; phases are ordered by
+their headings, so Phase 0 carries the highest numbers.
+
+---
+
+## Phase 0: Plugin seam (no story — enables US1)
+
+**Goal**: `gitty <cmd>` runs `gitty-<cmd>`; the JSON contract has a home; the
+release ships two binaries. Nothing MCP-specific yet.
+
+- [ ] T038 `plugin.go`: `findPlugin(name) (path, ok)` — `gitty-<name>` in
+      `filepath.Dir(os.Executable())` first, then `exec.LookPath`; on
+      Windows also `.exe`; `runPlugin(ctx, path, args, env) int` — exec with
+      inherited stdio, exit code passed through, SIGINT forwarded.
+- [ ] T039 `plugin.go` / `main.go`: `pluginEnv()` — run `DiscoverWorkspace`
+      (failure → empty values, not an error) and set `GITTY_BIN`
+      (`os.Executable`), `GITTY_WORKSPACE`, `GITTY_GROUP`, `GITTY_INSTANCE`;
+      the `default:` arm in `main.go` tries `findPlugin` before "Unknown
+      command"; the not-found message names `gitty-<cmd>` and both places
+      looked, with an install hint when `cmd == "mcp"`; exit 2.
+- [ ] T040 [P] `plugin_test.go`: a stub `gitty-echo` script on a temp `PATH`
+      (and one beside a copied binary, which must win) — arguments, the four
+      env vars, exit code 3 passed through, not-found message and exit 2,
+      built-in `sync` never shadowed.
+- [ ] T041 [P] `internal/contract/contract.go`: `Schema = "1"`; `Index`,
+      `Project`, `Local`, `Link`, `Unresolved`, `Briefing`, `Related`,
+      `FetchResult` with JSON tags; a doc comment per type naming the command
+      that prints it. (The root package uses these types directly in
+      T002/T017/T044.)
+- [ ] T042 [P] `.github/workflows/release.yml`: build
+      `gitty-mcp_${VERSION}_${os}_${arch}` from `./cmd/gitty-mcp` in the same
+      loop; checksum and upload `gitty-mcp_*` too; smoke: `gitty-mcp
+      --version` reports the tag. CI's `go vet ./...` / `go test ./...`
+      already cover the new packages.
+- [ ] T043 [P] `README.md`: "Plugins" — the lookup rule, the env vars, how
+      to install `gitty-mcp` (same release, drop it beside `gitty`).
+
+**Checkpoint**: `gitty mcp` without the plugin exits 2 with the hint; with a
+stub `gitty-mcp` on `PATH` it runs it with the env set.
 
 ---
 
@@ -31,9 +71,9 @@ links, built from CI configuration, manifests and the API.
 
 ### Index
 
-- [ ] T002 [P] [US3] `index.go`: `Index`, `IndexProject`, `LocalInfo`, `Link`,
-      `Unresolved` types with JSON tags per plan; `indexVersion = 1`;
-      `indexPath(workspaceDir)`.
+- [ ] T002 [P] [US3] `index.go`: the index model is `contract.Index` and
+      friends (T041), used directly — no second set of types; `indexVersion
+      = contract.Schema`; `indexPath(workspaceDir)`.
 - [ ] T003 [P] [US3] `index.go`: `loadIndex(dir) (*Index, error)` — missing
       file → empty index; version mismatch → empty index with a note;
       `saveIndex(dir, *Index)` — temp file + rename; never stores a token
@@ -119,6 +159,15 @@ project and the reason it matters, with absent ones fetched into place.
       checked-out ones, runs the existing `bringUp` into the namespace path,
       returns per-project outcome; honours `exclude`; never touches a project
       that is not named.
+- [ ] T044 [US1] `fetch.go`: `runFetch(ctx, opts)` — `gitty fetch
+      <project>...`: events `clone`/`pull`/`skip`/`error` as sync, summary;
+      `--format=json` prints `[]contract.FetchResult` (`path`, `dir`,
+      `fetched`, `present`, `error`); `--dry-run` prints `plan clone <path>`
+      and writes nothing; `--jobs`, `--token`, `--anon`, `--exclude`.
+- [ ] T045 [US1] `commands.go` / `agent.go`: register `fetch`;
+      `e2e_test.go`: `TestE2EFetch` — two names, one present (pulled), one
+      absent (cloned), a sibling untouched; JSON round-trips; `--dry-run`
+      writes nothing.
 - [ ] T019 [US1] `index.go`: `ensureFresh(ctx, s, subject)` — build the index
       if missing/mismatched, rescan the subject if its HEAD moved, rescan a
       just-fetched project so its links appear.
@@ -137,45 +186,64 @@ project and the reason it matters, with absent ones fetched into place.
       line shows `(fetched)`; without it the line names `gitty sync
       --related`; `--format=json` round-trips.
 
-### `gitty mcp`
+### `gitty-mcp` (the plugin, `cmd/gitty-mcp/`)
 
-- [ ] T024 [US1] `mcp.go`: JSON-RPC 2.0 over stdio — newline-delimited
-      request reader, `id`/`method`/`params`, responses and error objects
-      (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`); `initialize`
-      (protocolVersion echo, `serverInfo{name:"gitty", version}`,
-      `capabilities.tools`), `notifications/initialized`, `ping`,
+- [ ] T024 [US1] `cmd/gitty-mcp/rpc.go`: JSON-RPC 2.0 over stdio —
+      newline-delimited request reader, `id`/`method`/`params`, responses and
+      error objects (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`);
+      `initialize` (protocolVersion echo, `serverInfo{name:"gitty-mcp",
+      version}`, `capabilities.tools`), `notifications/initialized`, `ping`,
       `tools/list`, `tools/call`; logs to stderr only.
-- [ ] T025 [US1] `mcp_tools.go`: tool registry with JSON-schema inputs;
-      `gitty_context` (fetch default from server flag), `gitty_related`,
-      `gitty_projects`, `gitty_fetch`, `gitty_search` (`git grep -n -I
-      --max-count` per checkout, `max` cap, results as structured content),
-      `gitty_read` (confinement: reject `..`, absolute, and resolve symlinks
-      with `filepath.EvalSymlinks` inside the checkout; line range).
-- [ ] T026 [US1] `mcp.go`: `runMCP(opts)` — discover workspace, resolve
-      credentials, `--no-fetch`, `--jobs`; one in-memory index, refreshed per
-      request via `ensureFresh`; graceful exit on EOF / SIGTERM.
-- [ ] T027 [US1] `commands.go` / `agent.go`: register `mcp`.
-- [ ] T028 [P] [US1] `mcp_test.go`: drive the server over `io.Pipe` —
-      initialize, tools/list names six tools, `gitty_context` on the fixture
-      workspace returns the related project with `path`, `kind`, `evidence`,
-      `fetched`; `gitty_read` refuses `../x`, absolute paths and an escaping
-      symlink; `gitty_search` is bounded; malformed JSON → `-32700`; unknown
-      method → `-32601`.
-- [ ] T029 [US1] `e2e_test.go`: `TestE2EMCPContextFetches` — real binary,
-      real git, fake GitLab: `gitty_context` from A clones B into its
-      namespace path and returns that absolute path; second call `fetched:
-      false`; `--no-fetch` server lists B as absent and clones nothing.
-- [ ] T030 [US1] `scripts/mcp-smoke.sh` + CI step: start `gitty mcp` in the
-      integration workspace and exchange initialize/list/call over stdio
-      with a shell client (no extra tooling).
+- [ ] T025 [US1] `cmd/gitty-mcp/tools.go`: tool registry with JSON-schema
+      inputs, split into `indexTools` and `workspaceTools` behind one
+      dispatcher. `indexTools`: `gitty_context` → run `GITTY_BIN context
+      --format=json [--fetch] [--direction] [project]` in the workspace and
+      return the `contract.Briefing`; `gitty_related` → the same, links only;
+      `gitty_projects` → decode `<GITTY_WORKSPACE>/.gitty/index.json`, run
+      `GITTY_BIN index` first when missing, cache by mtime; `gitty_fetch` →
+      `GITTY_BIN fetch --format=json`. `workspaceTools`: `gitty_search`
+      (`git grep -n -I --max-count` per checkout from the index, `max` cap)
+      and `gitty_read` (confinement: reject `..`, absolute, and
+      `filepath.EvalSymlinks` inside the checkout; line range). A reply whose
+      `schema` is unsupported is a tool error naming both versions.
+- [ ] T026 [US1] `cmd/gitty-mcp/main.go`: flags `--no-fetch` (fetch default
+      for `gitty_context`), `--jobs`, `--version`; environment from `gitty`
+      (`GITTY_BIN`, `GITTY_WORKSPACE`, `GITTY_GROUP`, `GITTY_INSTANCE`);
+      without `GITTY_WORKSPACE` refuse to start ("run it as `gitty mcp` from
+      inside a workspace"); graceful exit on EOF / SIGTERM; `gitty`'s stderr
+      relayed to stderr.
+- [ ] T027 [US1] `agent.go`: `agent schema` gains a `plugins` list of the
+      `gitty-*` executables found (beside the binary, on `PATH`); for
+      `gitty-mcp` it includes the tool list from `gitty-mcp --describe`.
+- [ ] T028 [P] [US1] `cmd/gitty-mcp/*_test.go`: drive the server over
+      `io.Pipe` with a stub `gitty` on a temp `PATH` that prints canned
+      `context --format=json` / `fetch --format=json` and records its
+      arguments — initialize, tools/list names six tools, `gitty_context`
+      passes `--fetch` by default and `--no-fetch` suppresses it, the result
+      carries `path`, `kind`, `evidence`, `fetched`; `gitty_read` refuses
+      `../x`, absolute paths and an escaping symlink; `gitty_search` is
+      bounded; malformed JSON → `-32700`; unknown method → `-32601`;
+      unsupported `schema` → tool error.
+- [ ] T029 [US1] `e2e_test.go`: build `gitty-mcp` beside `gitty-e2e` in
+      `TestMain`; `TestE2EMCPContextFetches` — real binaries, real git, fake
+      GitLab: `gitty mcp` from A (plugin found beside the binary) answers
+      `gitty_context`, clones B into its namespace path and returns that
+      absolute path; second call `fetched: false`; `--no-fetch` lists B as
+      absent and clones nothing; `gitty mcp` with the plugin removed exits 2
+      with the hint.
+- [ ] T030 [US1] `scripts/mcp-smoke.sh` + CI step: build both binaries,
+      start `gitty mcp` in the integration workspace and exchange
+      initialize/list/call over stdio with a shell client (no extra tooling).
 
 ### Docs
 
 - [ ] T031 [P] [US1] `README.md`: "Context for agents" section — what links
-      are, `gitty mcp` setup (one generic stdio-server registration example),
-      the tools, fetch semantics and `--no-fetch`, `gitty context`,
+      are, installing `gitty-mcp` and registering `gitty mcp` as the server
+      (one generic stdio-server registration example), the tools, fetch
+      semantics and `--no-fetch`, `gitty context`, `gitty fetch`,
       `gitty index`/`related`; constitution-relevant notes (nothing written
-      in repos, index location, token never stored).
+      in repos, index location, token never stored, the plugin never holds
+      a token).
 - [ ] T032 [P] [US1] `context.md`: agent-facing documentation of the tools
       and the briefing shape.
 
@@ -199,16 +267,21 @@ project and the reason it matters, with absent ones fetched into place.
 
 ## Dependencies
 
+- T038 → T039 → T040; T041 before T002, T017, T044; T042, T043 any time
+  after T038.
 - T001 before T012, T016, T023, T029.
 - T002 → T003 → T004; T006 before T008; T008 before T009/T010 (they plug into
   it); T012 needs T004, T006, T008; T013/T014 need T012; T015 after T013/T014.
-- T017, T018 need Phase 1; T019 needs T012, T018; T021 needs T017–T019;
-  T024 → T025 → T026; T025 needs T017–T019; T028 needs T026.
+- T017, T018 need Phase 1; T019 needs T012, T018; T044 needs T018, T041;
+  T045 after T044; T021 needs T017–T019; T024 → T025 → T026; T025 needs
+  T021 and T044 (it runs them); T028 needs T026; T029 needs T039, T026,
+  T045; T027 after T026.
 - Phase 3 needs Phase 2's `fetch.go` only for T033.
 
-## Parallel Example (Phase 1)
+## Parallel Example
 
 ```
+T038 ‖ T041 ‖ T042 ‖ T043   # Phase 0: dispatch, contract types, release, docs
 T002 ‖ T006 ‖ T001      # types, resolver, fake API fields
 T003 ‖ T005 ‖ T007      # load/save, index tests, resolver tests
 T009 ‖ T010 ‖ T011      # the two extractors and their fixtures

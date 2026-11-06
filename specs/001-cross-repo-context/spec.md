@@ -40,13 +40,24 @@ yet.
   owns caching (the index) and fetching, and returns to the calling agent the
   path to each related project and the context of why it matters to the
   project the agent is working in. No files are written inside repositories.
+- Q: Is the MCP server part of the `gitty` binary? → A: **No — it is a
+  plugin.** It ships as a separate binary, `gitty-mcp`, found and run by
+  `gitty mcp` the way git runs `git-<cmd>`: beside the `gitty` executable
+  first, then on `PATH`. Users who never run an agent never carry it; the
+  core stays the CLI.
+- Q: Could the server later run remotely, shared by many developers as a
+  common cache? → A: **Eventually, yes — not in this feature.** The plugin is
+  built so that the part that answers from the index can be lifted out and
+  served over the network later; the part that needs a local checkout
+  (fetching, reading, searching) stays local. Nothing in this feature's
+  interfaces assumes the index and the checkouts share a machine.
 
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - An agent asks gitty what else matters (Priority: P1)
 
 An agent is working in a checkout inside a gitty workspace. Its host has
-`gitty mcp` configured once. The agent calls `gitty_context` (no arguments:
+`gitty mcp` (which runs the `gitty-mcp` plugin) configured once. The agent calls `gitty_context` (no arguments:
 "the project I am in"). gitty works out which other projects of the instance
 this one uses and which use it — from its CI configuration, its manifests, and
 the API — **syncs any related project that is not yet checked out into its
@@ -192,15 +203,40 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
 - Two MCP clients on the same workspace: the index file is written atomically;
   a concurrent fetch of the same project is serialised by the existing
   bring-up (an unborn repository is resumed, not clobbered).
+- `gitty mcp` with no `gitty-mcp` installed: exit 2 naming the binary looked
+  for and where; nothing else happens.
+- `gitty-mcp` run with a `gitty` of another version: a JSON reply whose
+  schema version the plugin does not support becomes a tool error naming
+  both versions — never a guess at the shape.
 
 ## Requirements *(mandatory)*
 
 ### Functional Requirements
 
-- **FR-001**: `gitty mcp` MUST serve MCP over stdio using only the standard
-  library, exposing `gitty_context`, `gitty_related`, `gitty_projects`,
-  `gitty_fetch`, `gitty_search` and `gitty_read`. It MUST write nothing but
-  protocol to stdout; diagnostics go to stderr.
+- **FR-001**: The MCP server MUST be a separate binary, `gitty-mcp`, serving
+  MCP over stdio using only the standard library and exposing `gitty_context`,
+  `gitty_related`, `gitty_projects`, `gitty_fetch`, `gitty_search` and
+  `gitty_read`. It MUST write nothing but protocol to stdout; diagnostics go
+  to stderr. `gitty` itself MUST build, test and run without it.
+- **FR-001a**: `gitty <cmd>` for a `cmd` not in the built-in command table
+  MUST look for an executable `gitty-<cmd>` — first beside the running
+  `gitty` binary, then on `PATH` — and run it with the remaining arguments,
+  inheriting stdin, stdout, stderr and the exit code. When none exists the
+  message MUST name the plugin that was looked for and where, and for `mcp`
+  how to install it; exit 2. `gitty mcp` is this rule applied to
+  `gitty-mcp`; built-in commands can never be shadowed by a plugin.
+- **FR-001b**: A plugin MUST receive, in its environment, the path of the
+  `gitty` binary that launched it (`GITTY_BIN`), the workspace root
+  (`GITTY_WORKSPACE`), the group of the working directory (`GITTY_GROUP`,
+  possibly empty) and the instance URL (`GITTY_INSTANCE`) — resolved by
+  `gitty` with the same discovery every command uses. Credentials MUST NOT be
+  passed: a plugin that needs the API runs `gitty`, which resolves them
+  itself.
+- **FR-001c**: `gitty-mcp` MUST NOT reimplement gitty: it obtains context by
+  running `gitty context --format=json`, fetches by running `gitty fetch`,
+  refreshes by running `gitty index`, and lists projects from the versioned
+  index file; only `gitty_search` and `gitty_read` — which need nothing but a
+  checkout — are implemented in the plugin itself.
 - **FR-002**: `gitty_context` MUST return, for the named project (or the one
   the server's working directory is in), its metadata and its outgoing and
   incoming links; each related project with its absolute local path or its
@@ -245,6 +281,16 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
 - **FR-015**: `gitty_context` and `gitty context` MUST build or refresh the
   index when it is missing, versioned differently, or when the current
   project's HEAD has moved since it was indexed.
+- **FR-016**: The JSON forms this feature introduces — `gitty context
+  --format=json`, `gitty fetch --format=json`, the index file — are public
+  contracts: each carries a schema version, additions never break a reader
+  of the same version, and a reader refuses a version it does not know
+  rather than guessing.
+- **FR-017**: `gitty fetch <project>...` MUST bring up exactly the named
+  projects (namespace paths) into their namespace paths through the existing
+  sync machinery — nothing else is touched — printing the usual events, and
+  with `--format=json` one record per project: path, directory, `fetched`,
+  `present`, error. It MUST honour `--dry-run` and `exclude`.
 
 ### Key Entities
 
@@ -278,6 +324,10 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
 - **SC-005**: The MCP server passes a smoke test with a real client:
   initialize, list tools, call `gitty_context`, call `gitty_read`.
 - **SC-006**: No new Go module dependency; nothing written inside a repository.
+- **SC-007**: `gitty` with no `gitty-mcp` present passes every test and
+  `gitty mcp` exits 2 with an actionable message; with `gitty-mcp` dropped
+  beside it, SC-005 passes with no configuration beyond registering
+  `gitty mcp` as the server command.
 
 ## Assumptions
 
@@ -292,6 +342,29 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
   (`container_registry_image_prefix`), with a `registry.` host heuristic as
   fallback.
 - MCP is served over stdio only; the agent host spawns one server per
-  session, in a working directory inside the workspace.
+  session, in a working directory inside the workspace, by running
+  `gitty mcp`.
 - Fetching uses the same credentials as `sync` (`--token`, `GITLAB_TOKEN`,
-  `CI_JOB_TOKEN`), resolved when the server starts.
+  `CI_JOB_TOKEN`), resolved by `gitty` on each invocation the plugin makes;
+  the plugin process never holds a token.
+- Spawning `gitty` per tool call costs milliseconds and fits the 300 ms
+  budget of SC-002 for a warm index; the plugin may cache the decoded index
+  between calls and invalidates it by the file's modification time.
+- `gitty-mcp` is released alongside `gitty` from the same tag, so the pair a
+  user downloads together always agrees on the contract version.
+
+## Out of Scope (this feature) — designed for, not built
+
+- **A shared, remote `gitty-mcp`.** The same tools served over HTTP by one
+  process that many developers' agents talk to, holding one index for the
+  instance — a shared cache that gets better as more projects are indexed.
+  The seam is kept open now: tools that answer from the index alone
+  (`gitty_context` without fetching, `gitty_related`, `gitty_projects`) are
+  separated in the plugin from tools that need a checkout on the caller's
+  disk (`gitty_fetch`, `gitty_search`, `gitty_read`, and fetching inside
+  `gitty_context`); results identify projects by namespace path with the
+  local path as an attribute, so a remote server can answer "what" and the
+  caller's machine can complete "where". Nothing is implemented beyond that
+  separation.
+- An HTTP transport, authentication of agents to the server, multi-workspace
+  indexes and index merging belong to that later feature.
