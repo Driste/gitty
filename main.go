@@ -141,9 +141,8 @@ func main() {
 	case "agent":
 		runAgent(os.Args[2:])
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		printUsage()
-		os.Exit(2)
+		// Not built in: run the gitty-<command> plugin, if there is one.
+		os.Exit(runPluginCommand(os.Stderr, os.Args[1], os.Args[2:]))
 	}
 }
 
@@ -218,12 +217,23 @@ func splitFlagArgs(fs *flag.FlagSet, args []string) (flagArgs, positional []stri
 
 // printUsage writes usage to stderr: it is only ever printed on error paths
 // (no arguments or an unknown command). The command list comes from the
-// same table that drives dispatch and completion.
+// same table that drives dispatch and completion; plugins are whatever is
+// installed at the moment.
 func printUsage() {
 	fmt.Fprintln(os.Stderr, "Usage: gitty <command> [flags]")
 	fmt.Fprintln(os.Stderr, "\nCommands:")
 	for _, c := range commands {
 		fmt.Fprintf(os.Stderr, "  %-11s %s\n", c.name, c.summary)
+	}
+	exe, _ := os.Executable()
+	if plugins := installedPlugins(exe); len(plugins) > 0 {
+		fmt.Fprintln(os.Stderr, "\nPlugins (gitty <name> runs gitty-<name>):")
+		for _, p := range plugins {
+			fmt.Fprintf(os.Stderr, "  %-11s %s\n", p.Name, p.Path)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "\nAny other command runs a plugin: an executable named gitty-<command>,")
+		fmt.Fprintln(os.Stderr, "beside gitty or on PATH.")
 	}
 	fmt.Fprintln(os.Stderr, "\nRun 'gitty <command> -h' for specific flags.")
 }

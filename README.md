@@ -645,6 +645,51 @@ completed as soon as it exists.
 
 ---
 
+## Plugins
+
+A command gitty does not have built in is looked up as an executable named
+`gitty-<command>` and run in gitty's place, the way git runs `git-<command>`:
+
+```bash
+gitty audit --all     # runs gitty-audit --all, if there is one
+```
+
+It is searched for **next to the `gitty` binary first, then on `PATH`** — so
+a plugin is installed by putting a file in either place, and removed by
+deleting it. gitty ships none and needs none. The current directory is never
+searched, and a plugin can add a command but never replace a built-in one
+(`gitty-sync` on your `PATH` is ignored). `gitty` with no arguments lists the
+plugins it can see.
+
+The plugin starts in the directory you ran `gitty` in, with your stdin,
+stdout, stderr and environment; its exit code is the command's. On Linux and
+macOS gitty replaces itself with the plugin, so there is no process in
+between. gitty adds four environment variables, from the same workspace
+discovery every command uses:
+
+| Variable | Value |
+| :--- | :--- |
+| `GITTY_BIN` | Absolute path of the `gitty` that launched the plugin. A plugin runs this for anything it does not do itself. |
+| `GITTY_WORKSPACE` | The workspace's root directory: the outermost one holding a `.gitty/config` for this workspace. Empty outside a workspace. |
+| `GITTY_GROUP` | Full namespace path of the group the working directory is in (inside a checkout: the group holding the project). Empty at the root of a workspace anchored at the instance's top level, and outside a workspace. |
+| `GITTY_INSTANCE` | The instance URL from the workspace config. Empty outside a workspace. |
+
+**No token is passed.** A plugin that needs the API runs `gitty`, which
+resolves credentials the way it always does (`--token`, `GITLAB_TOKEN`,
+`CI_JOB_TOKEN`). Being outside a workspace does not stop a plugin from
+starting — the variables are simply empty and the plugin decides what that
+means.
+
+A plugin can be written in anything. A shell script is enough:
+
+```bash
+#!/bin/sh
+# gitty-where: print the workspace this directory belongs to
+echo "${GITTY_WORKSPACE:-not in a workspace}"
+```
+
+---
+
 ## Agent Schema (`gitty agent schema`)
 
 `gitty agent schema` prints a machine-readable, MCP-style JSON description of

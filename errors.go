@@ -17,13 +17,24 @@ import (
 // flags, which this taxonomy deliberately matches.
 
 // usageError marks a problem the user must fix before a sync can even start.
-type usageError struct{ msg string }
+// cause, when set, lets callers tell one usage problem from another with
+// errors.Is without parsing the message.
+type usageError struct {
+	msg   string
+	cause error
+}
 
 func (e *usageError) Error() string { return e.msg }
+func (e *usageError) Unwrap() error { return e.cause }
 
 func usageErrf(format string, a ...any) error {
 	return &usageError{msg: fmt.Sprintf(format, a...)}
 }
+
+// errNoWorkspace is the cause of the usage error workspace discovery returns
+// when there is simply no .gitty/config above the directory — as opposed to
+// one that exists but was refused or could not be read.
+var errNoWorkspace = errors.New("not inside a gitty workspace")
 
 // syncFailedError reports a run that finished but had per-item failures.
 type syncFailedError struct{ failures int }

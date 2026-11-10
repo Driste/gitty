@@ -144,9 +144,12 @@ file and a line a human can open.
 
 When `gitty`'s first argument is not a built-in command, `main.go` looks for
 an executable named `gitty-<cmd>` — in the directory of the running `gitty`
-binary first (a release archive unpacked in one place just works), then on
-`PATH` — and runs it with the remaining arguments, stdin/stdout/stderr
-inherited, exit code passed through, SIGINT forwarded. Nothing found:
+binary first (a release archive unpacked in one place just works; a symlinked
+`gitty` also looks beside its target), then on `PATH`, never in the current
+directory — and runs it with the remaining arguments. On Linux and macOS
+`gitty` replaces itself with the plugin (`exec`), so stdin, stdout, signals
+and the exit code are the plugin's own and no process sits in between; on
+Windows it runs a child and passes the exit code on. Nothing found:
 `Unknown command: <cmd> (no gitty-<cmd> beside gitty or on PATH)`, plus an
 install hint for `mcp`, exit 2. Built-in commands always win; a plugin
 cannot shadow `sync`.
@@ -157,15 +160,18 @@ result over as environment:
 | Variable | Value |
 |---|---|
 | `GITTY_BIN` | absolute path of the `gitty` that launched the plugin — the one the plugin runs for everything it does not do itself |
-| `GITTY_WORKSPACE` | the workspace root (the directory holding `.gitty/config`) |
-| `GITTY_GROUP` | the group of the working directory relative to the root; empty at the root |
+| `GITTY_WORKSPACE` | the workspace root: the outermost directory holding a `.gitty/config` of this workspace (`sync --groups` writes one into every group directory, so the nearest is often not the top) |
+| `GITTY_GROUP` | full namespace path of the group the working directory is in; empty at the root of a workspace anchored at the instance's top level |
 | `GITTY_INSTANCE` | the instance URL from the config |
 
 No token is passed. A plugin needing the API runs `GITTY_BIN`, which resolves
 credentials the way it always does (`--token`, `GITLAB_TOKEN`,
-`CI_JOB_TOKEN`). Discovery failing (not inside a workspace) is not fatal to
-the dispatch — the variables are left empty and the plugin decides;
-`gitty-mcp` refuses to start.
+`CI_JOB_TOKEN`). Not being inside a workspace is not fatal to the dispatch —
+the variables are set but empty and the plugin decides; `gitty-mcp` refuses
+to start. A workspace that exists but was refused (owned by another user) or
+is unreadable gets a `note:` on stderr, since the plugin could only say "no
+workspace". The plugin starts in the directory the user was in: unlike the
+built-in commands, the dispatch does not move into the group's directory.
 
 `gitty mcp` is this rule applied to `gitty-mcp`; it has no code path of its
 own.

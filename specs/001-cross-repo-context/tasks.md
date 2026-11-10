@@ -25,32 +25,42 @@ their headings, so Phase 0 carries the highest numbers.
 **Goal**: `gitty <cmd>` runs `gitty-<cmd>`; the JSON contract has a home; the
 release ships two binaries. Nothing MCP-specific yet.
 
-- [ ] T038 `plugin.go`: `findPlugin(name) (path, ok)` — `gitty-<name>` in
-      `filepath.Dir(os.Executable())` first, then `exec.LookPath`; on
-      Windows also `.exe`; `runPlugin(ctx, path, args, env) int` — exec with
-      inherited stdio, exit code passed through, SIGINT forwarded.
-- [ ] T039 `plugin.go` / `main.go`: `pluginEnv()` — run `DiscoverWorkspace`
-      (failure → empty values, not an error) and set `GITTY_BIN`
-      (`os.Executable`), `GITTY_WORKSPACE`, `GITTY_GROUP`, `GITTY_INSTANCE`;
-      the `default:` arm in `main.go` tries `findPlugin` before "Unknown
-      command"; the not-found message names `gitty-<cmd>` and both places
-      looked, with an install hint when `cmd == "mcp"`; exit 2.
-- [ ] T040 [P] `plugin_test.go`: a stub `gitty-echo` script on a temp `PATH`
-      (and one beside a copied binary, which must win) — arguments, the four
-      env vars, exit code 3 passed through, not-found message and exit 2,
-      built-in `sync` never shadowed.
-- [ ] T041 [P] `internal/contract/contract.go`: `Schema = "1"`; `Index`,
-      `Project`, `Local`, `Link`, `Unresolved`, `Briefing`, `Related`,
-      `FetchResult` with JSON tags; a doc comment per type naming the command
-      that prints it. (The root package uses these types directly in
-      T002/T017/T044.)
+- [x] T038 `plugin.go`: `findPlugin(name, exe) (path, ok)` — `gitty-<name>`
+      beside the binary (and beside its symlink target) first, then
+      `exec.LookPath`, which also covers `.exe` on Windows and refuses the
+      current directory; `execPlugin` in `plugin_unix.go` replaces the
+      process (`syscall.Exec`), so stdio, signals and the exit code are the
+      plugin's own with nothing in between; `plugin_windows.go` runs a child
+      and passes its exit code on.
+- [x] T039 `plugin.go` / `main.go` / `config.go`: `pluginEnv()` — locate
+      the workspace without changing directory (`locateWorkspace`; "not in a
+      workspace" → empty values, any other failure → a note on stderr) and
+      set `GITTY_BIN`, `GITTY_WORKSPACE` (the outermost config of the
+      workspace, `workspaceRoot`), `GITTY_GROUP`, `GITTY_INSTANCE`, replacing
+      inherited values; the `default:` arm in `main.go` runs the plugin; the
+      not-found message names `gitty-<cmd>` and the places looked, with an
+      install hint instead of usage when `cmd == "mcp"`; exit 2.
+- [x] T040 [P] `plugin_test.go`: a stub `gitty-echo` script on a temp `PATH`
+      (and one beside a copied binary, which must win) — arguments, stdin,
+      the four env vars, the working directory, exit code 3 passed through,
+      not-found message and exit 2, a built-in never shadowed, the current
+      directory never searched, an unrunnable plugin reported; unit tests
+      for lookup order, `installedPlugins`, `pluginEnv`, `workspaceRoot`.
+- [x] T041 [P] `internal/contract/contract.go`: `Schema = 1` for what the
+      commands print and `IndexVersion = 1` for the file; `Index`,
+      `Project`, `Local`, `Link`, `Unresolved`, `Briefing`, `Subject`,
+      `Member`, `Related`, `FetchReport`, `FetchResult` with JSON tags; the
+      link kinds as constants; `Supported` for version checks. (The root
+      package uses these types directly in T002/T017/T044.)
 - [ ] T042 [P] `.github/workflows/release.yml`: build
       `gitty-mcp_${VERSION}_${os}_${arch}` from `./cmd/gitty-mcp` in the same
       loop; checksum and upload `gitty-mcp_*` too; smoke: `gitty-mcp
       --version` reports the tag. CI's `go vet ./...` / `go test ./...`
-      already cover the new packages.
-- [ ] T043 [P] `README.md`: "Plugins" — the lookup rule, the env vars, how
-      to install `gitty-mcp` (same release, drop it beside `gitty`).
+      already cover the new packages. (Done with T026: there is nothing to
+      build until `cmd/gitty-mcp` exists.)
+- [x] T043 [P] `README.md`: "Plugins" — the lookup rule, the env vars, what
+      a plugin is started with. (Installing `gitty-mcp` is documented with
+      the plugin itself, T031.)
 
 **Checkpoint**: `gitty mcp` without the plugin exits 2 with the hint; with a
 stub `gitty-mcp` on `PATH` it runs it with the env set.

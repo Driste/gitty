@@ -36,3 +36,5 @@ repos/
 gitty
 
 .claude
+# The MCP plugin, when built at the repository root (cmd/gitty-mcp is the source)
+/gitty-mcp
