@@ -27,6 +27,11 @@ const Schema = 1
 // version is rebuilt by gitty, and refused by everything else.
 const IndexVersion = 1
 
+// ScannerVersion identifies the rules links are extracted with. It is not a
+// format version: an index whose scanner is older reads fine, and gitty
+// rescans its checkouts so that links found by newer rules appear.
+const ScannerVersion = 1
+
 // Supported reports whether a document of the given version can be read by
 // code built against this package, and if not, an error naming both sides —
 // what a reader should surface instead of decoding further.
@@ -58,6 +63,7 @@ const (
 // relative to the workspace root — and it never holds a credential.
 type Index struct {
 	Version  int    `json:"version"`
+	Scanner  int    `json:"scanner"`  // see ScannerVersion
 	Instance string `json:"instance"` // the instance URL from the workspace config
 	// Root is the namespace path the workspace's root directory stands for
 	// ("" when the workspace is anchored at the instance's top level). A
@@ -65,7 +71,16 @@ type Index struct {
 	Root string `json:"root"`
 	// Hosts are the host names under which the instance's repositories are
 	// referred to: the configured one, and any other the API advertises.
-	Hosts       []string  `json:"hosts,omitempty"`
+	Hosts []string `json:"hosts,omitempty"`
+	// Registry is the host (and port, and path, if any) of the instance's
+	// container registry: an image named <registry>/<project path>[/...]
+	// belongs to that project. Empty when the instance has none, or when no
+	// checkout has been looked up yet.
+	Registry string `json:"registry,omitempty"`
+	// Exclude is the exclude list in effect when the index was last brought
+	// up to date. No link in the index starts or ends at a project it
+	// covers; gitty rescans when the list in effect differs.
+	Exclude     []string  `json:"exclude,omitempty"`
 	GeneratedAt time.Time `json:"generated_at"`
 	// ListedAt is when project metadata was last read from the API; scanning
 	// checkouts for links does not need the network and does not move it.
@@ -80,14 +95,16 @@ type Index struct {
 type Project struct {
 	// ID is GitLab's project id. Zero means the project is not known
 	// upstream: a checkout made by hand, or one whose project is gone.
-	ID             int64    `json:"id,omitempty"`
-	Description    string   `json:"description,omitempty"`
-	DefaultBranch  string   `json:"default_branch,omitempty"`
-	Topics         []string `json:"topics,omitempty"`
-	Archived       bool     `json:"archived,omitempty"`
-	ForkedFrom     string   `json:"forked_from,omitempty"`     // namespace path of the fork's origin
-	RegistryPrefix string   `json:"registry_prefix,omitempty"` // container registry image prefix
-	WebURL         string   `json:"web_url,omitempty"`
+	ID            int64    `json:"id,omitempty"`
+	Description   string   `json:"description,omitempty"`
+	DefaultBranch string   `json:"default_branch,omitempty"`
+	Topics        []string `json:"topics,omitempty"`
+	Archived      bool     `json:"archived,omitempty"`
+	WebURL        string   `json:"web_url,omitempty"`
+	// ForkedFrom is the namespace path of the project this one was forked
+	// from. It is known for projects that are checked out: a listing does
+	// not carry it, and gitty looks it up per checkout.
+	ForkedFrom string `json:"forked_from,omitempty"`
 	// Local is present when the project is checked out in the workspace.
 	Local *Local `json:"local,omitempty"`
 }
@@ -118,6 +135,7 @@ type Link struct {
 type Unresolved struct {
 	From     string `json:"from"`
 	Ref      string `json:"ref"`
+	Kind     string `json:"kind"` // the kind of link it would have been
 	Evidence string `json:"evidence"`
 }
 

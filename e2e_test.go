@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,12 +125,34 @@ type apiGroup struct {
 }
 
 type apiProject struct {
-	ID                int    `json:"id"`
+	ID                int      `json:"id"`
+	PathWithNamespace string   `json:"path_with_namespace"`
+	HTTPURLToRepo     string   `json:"http_url_to_repo"`
+	SSHURLToRepo      string   `json:"ssh_url_to_repo"`
+	WebURL            string   `json:"web_url,omitempty"`
+	DefaultBranch     string   `json:"default_branch,omitempty"`
+	Description       string   `json:"description,omitempty"`
+	Topics            []string `json:"topics,omitempty"`
+
+	// Only GitLab's full project representation carries these; a listing
+	// asked for with simple=true leaves them out (see simplified).
+	Archived                     bool           `json:"archived,omitempty"`
+	ContainerRegistryImagePrefix string         `json:"container_registry_image_prefix,omitempty"`
+	ForkedFromProject            *apiForkParent `json:"forked_from_project,omitempty"`
+}
+
+type apiForkParent struct {
 	PathWithNamespace string `json:"path_with_namespace"`
-	HTTPURLToRepo     string `json:"http_url_to_repo"`
-	SSHURLToRepo      string `json:"ssh_url_to_repo"`
-	DefaultBranch     string `json:"default_branch,omitempty"`
-	Archived          bool   `json:"archived,omitempty"`
+}
+
+// simplified returns the project as GitLab's simple=true listing renders it:
+// identifying fields only. Keeping the fake honest about this is what stops
+// gitty from quietly depending on a field the trimmed listing does not have.
+func (p apiProject) simplified() apiProject {
+	p.Archived = false
+	p.ContainerRegistryImagePrefix = ""
+	p.ForkedFromProject = nil
+	return p
 }
 
 type fakeGitLab struct {
@@ -171,6 +194,10 @@ type fakeGitLab struct {
 	subgroups   map[string][]apiGroup
 	descendants map[string][]apiGroup
 	projects    map[string][]apiProject
+	// shared holds, per group, projects of other namespaces that have been
+	// shared with it. GitLab lists them with the group's own unless asked
+	// not to (with_shared=false).
+	shared map[string][]apiProject
 
 	mu          sync.Mutex
 	lastToken   string
@@ -185,6 +212,7 @@ func newFakeGitLab(t *testing.T) *fakeGitLab {
 		subgroups:   map[string][]apiGroup{},
 		descendants: map[string][]apiGroup{},
 		projects:    map[string][]apiProject{},
+		shared:      map[string][]apiProject{},
 	}
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
@@ -270,6 +298,20 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A single project by its (URL-encoded, here already decoded) path.
+	if pathNS, ok := strings.CutPrefix(r.URL.Path, "/api/v4/projects/"); ok {
+		for _, projects := range f.projects {
+			for _, p := range projects {
+				if p.PathWithNamespace == pathNS {
+					writeJSON(w, http.StatusOK, p)
+					return
+				}
+			}
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "404 Project Not Found"})
+		return
+	}
+
 	// The top-level group listing that backs `gitty ls /`.
 	if r.URL.Path == "/api/v4/groups" {
 		writeJSON(w, http.StatusOK, orEmptyGroups(f.topLevel))
@@ -300,9 +342,21 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				list = append(list, projects...)
 			}
 		}
+		if r.URL.Query().Get("with_shared") != "false" {
+			list = append(list, f.shared[target]...)
+		}
 		list = filterArchivedProjects(list, r.URL.Query().Get("archived"))
+		sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 		lo, hi := paginate(w, r, f.pageSize, len(list))
-		writeJSON(w, http.StatusOK, list[lo:hi])
+		page := list[lo:hi]
+		if r.URL.Query().Get("simple") == "true" {
+			trimmed := make([]apiProject, len(page))
+			for i, p := range page {
+				trimmed[i] = p.simplified()
+			}
+			page = trimmed
+		}
+		writeJSON(w, http.StatusOK, page)
 
 	case strings.HasSuffix(rest, "/subgroups"):
 		target := strings.TrimSuffix(rest, "/subgroups")
@@ -406,9 +460,15 @@ func (f *fakeGitLab) project(id int, pathNS string) apiProject {
 		PathWithNamespace: pathNS,
 		HTTPURLToRepo:     f.srv.URL + "/git/" + pathNS + ".git",
 		SSHURLToRepo:      "git@example.invalid:" + pathNS + ".git",
+		WebURL:            f.srv.URL + "/" + pathNS,
 		DefaultBranch:     "main",
+
+		ContainerRegistryImagePrefix: fakeRegistryHost + "/" + pathNS,
 	}
 }
+
+// fakeRegistryHost is the container registry the fake instance advertises.
+const fakeRegistryHost = "registry.example.invalid"
 
 // addRepo creates a work repo with the given files, publishes it as a bare
 // repo served over HTTP at /git/<name>.git, and returns the work repo path so

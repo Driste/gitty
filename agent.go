@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.6.0"
+const AgentSchemaVersion = "3.7.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -298,6 +298,100 @@ func buildAgentSchema() AgentSchema {
 					Command:   "gitty",
 					BaseArgs:  []string{"ls"},
 					FlagStyle: "the 'path' argument is positional (gitty ls <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it",
+				},
+			},
+			{
+				Name:        "index",
+				Description: "Refresh the workspace index: project metadata from the GitLab API, and the links between projects found in the checkouts (CI includes, triggers and components; dependencies named in package manifests; forks). The index is one file, .gitty/index.json at the workspace root; it always covers the whole workspace wherever the command is run. 'related' and 'context' keep it fresh by themselves, so this is only needed to pick up projects created upstream, or to see every step. Prints one event per line: 'index <project> new|changed|unchanged|removed', 'link <from> <kind> <to> <evidence>', 'unresolved <from> <reference> <evidence>', then a summary. A checkout is read again only when its commit has moved.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token. Falls back to the GITLAB_TOKEN or CI_JOB_TOKEN environment variables. Required unless anon is set. Never written to the index.",
+						},
+						"anon": {
+							Type:        "boolean",
+							Description: "Index public projects anonymously, without a token.",
+							Default:     false,
+						},
+						"dry-run": {
+							Type:        "boolean",
+							Description: "Report what would be indexed (index lines are prefixed 'plan') without writing the index file.",
+							Default:     false,
+						},
+						"rescan": {
+							Type:        "boolean",
+							Description: "Read every checkout again, not only those whose commit moved. Use it to pick up edits that have not been committed.",
+							Default:     false,
+						},
+						"archived": {
+							Type:        "boolean",
+							Description: "Also ask archived projects what they use. They are always indexed as something other projects may use.",
+							Default:     false,
+						},
+						"exclude": {
+							Type:        "string",
+							Description: "Namespace path or glob to leave out of this run: neither read nor linked to. Repeatable, and also accepts a comma-separated list. Adds to the workspace's exclude list.",
+						},
+						"jobs": {
+							Type:        "integer",
+							Description: "Number of checkouts to read concurrently (1-16).",
+							Default:     4,
+						},
+						"verbose": {
+							Type:        "boolean",
+							Description: "Print each git invocation and its output to stderr.",
+							Default:     false,
+						},
+					},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"index"},
+					FlagStyle: "--<name>=<value> for strings and integers, --<name> for booleans",
+				},
+			},
+			{
+				Name:        "related",
+				Description: "List the links of a project as greppable lines: 'related <project> <kind> <target> <evidence>' for each project it uses, 'related-by <project> <kind> <source> <evidence>' for each project that uses it, 'unresolved <project> <reference> <evidence>' for references to something that is not a known project, then 'summary uses=N used-by=N unresolved=N'. Kinds: depends, ci-include, ci-trigger, ci-component, image, submodule, fork, mentions. The evidence is a file and line in the project that holds the reference (or 'api:<field>'). Answered from the workspace index, which is brought up to date first; the instance is only contacted if the index has to be built.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"project": {
+							Type:        "string",
+							Description: "The project (or group) to report on: a namespace path such as 'acme/app' (a leading '/' makes it absolute; otherwise it is tried relative to the current directory's group first), or a directory. Omitted: the project whose checkout the command runs in, or the group when run in a group's directory. Passed as a positional argument.",
+						},
+						"direction": {
+							Type:        "string",
+							Description: "Which links to list: 'uses' (what the project refers to), 'used-by' (what refers to it), or 'both'.",
+							Default:     "both",
+						},
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token; only needed when the index has to be built.",
+						},
+						"anon": {
+							Type:        "boolean",
+							Description: "If the index has to be built, list public projects anonymously.",
+							Default:     false,
+						},
+						"jobs": {
+							Type:        "integer",
+							Description: "Number of checkouts to read concurrently when the index is refreshed (1-16).",
+							Default:     4,
+						},
+						"verbose": {
+							Type:        "boolean",
+							Description: "Print each git invocation and its output to stderr.",
+							Default:     false,
+						},
+					},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"related"},
+					FlagStyle: "the 'project' argument is positional (gitty related <project>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it",
 				},
 			},
 			{

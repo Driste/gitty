@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -264,6 +265,33 @@ func (f fakeSource) Group(ctx context.Context, target string) (*gitlab.Group, er
 		return g, nil
 	}
 	return nil, fmt.Errorf("group %q not found", target)
+}
+
+// NamespaceProjects returns everything at or beneath target, as the real
+// listing does with include_subgroups.
+func (f fakeSource) NamespaceProjects(ctx context.Context, target string) ([]*gitlab.Project, error) {
+	if f.projErr != nil {
+		return nil, f.projErr
+	}
+	var out []*gitlab.Project
+	for group, projects := range f.projects {
+		if group == target || strings.HasPrefix(group, target+"/") {
+			out = append(out, projects...)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PathWithNamespace < out[j].PathWithNamespace })
+	return out, nil
+}
+
+func (f fakeSource) Project(ctx context.Context, path string) (*gitlab.Project, error) {
+	for _, projects := range f.projects {
+		for _, p := range projects {
+			if p.PathWithNamespace == path {
+				return p, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("project %q not found", path)
 }
 
 func (f fakeSource) Projects(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Project, error) {

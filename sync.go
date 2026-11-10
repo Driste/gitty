@@ -36,6 +36,16 @@ type gitlabSource interface {
 	// TopLevelGroups returns the instance's top-level groups — the namespaces
 	// visible to the caller, with no parent.
 	TopLevelGroups(ctx context.Context) ([]*gitlab.Group, error)
+	// NamespaceProjects returns every project that lives beneath target,
+	// archived ones included and marked — the listing the index is built
+	// from. Unlike Projects it leaves out projects that are merely shared
+	// with the group: they live in another namespace, and the index is of
+	// this one.
+	NamespaceProjects(ctx context.Context, target string) ([]*gitlab.Project, error)
+	// Project returns the single project with the given namespace path, in
+	// GitLab's full representation: what a listing trims away (the fork
+	// origin, the container registry prefix) is here.
+	Project(ctx context.Context, path string) (*gitlab.Project, error)
 }
 
 // gitRunner executes a git command in dir with extra environment entries and
@@ -188,7 +198,7 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 	line := kind
 	if s.dryRun {
 		switch kind {
-		case "clone", "pull", "group", "reclone", "prune":
+		case "clone", "pull", "group", "reclone", "prune", "index":
 			line = "plan " + kind
 		}
 	}
@@ -1510,7 +1520,29 @@ func (s gitlabClientSource) TopLevelGroups(ctx context.Context) ([]*gitlab.Group
 	return all, nil
 }
 
+func (s gitlabClientSource) NamespaceProjects(ctx context.Context, target string) ([]*gitlab.Project, error) {
+	return s.listProjects(ctx, target, true, true, false)
+}
+
+func (s gitlabClientSource) Project(ctx context.Context, path string) (*gitlab.Project, error) {
+	p, _, err := s.client.Projects.GetProject(path, nil, gitlab.WithContext(ctx))
+	return p, err
+}
+
 func (s gitlabClientSource) Projects(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Project, error) {
+	return s.listProjects(ctx, target, nested, archived, true)
+}
+
+// listProjects lists a group's projects. shared says whether projects of
+// other namespaces that have been shared with the group count: they do for a
+// sync, which mirrors what the group can see, and do not for the index.
+func (s gitlabClientSource) listProjects(ctx context.Context, target string, nested, archived, shared bool) ([]*gitlab.Project, error) {
+	// GitLab includes shared projects unless told otherwise; only say so
+	// when leaving them out, so a sync's requests stay exactly as they were.
+	var withShared *bool
+	if !shared {
+		withShared = &shared
+	}
 	list := func(ctx context.Context, archivedOnly bool) ([]*gitlab.Project, error) {
 		// simple=true trims each project to its identifying fields — path,
 		// URLs, default branch — which is all gitty reads, and is a fifth of
@@ -1523,6 +1555,7 @@ func (s gitlabClientSource) Projects(ctx context.Context, target string, nested,
 				IncludeSubGroups: &nested,
 				Simple:           &simple,
 				Archived:         &archivedOnly,
+				WithShared:       withShared,
 				ListOptions:      gitlab.ListOptions{PerPage: 100, Page: int64(page)},
 			}, gitlab.WithContext(ctx))
 		})

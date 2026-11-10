@@ -645,6 +645,114 @@ completed as soon as it exists.
 
 ---
 
+## Cross-repository context
+
+Projects in one GitLab instance lean on each other: a pipeline includes
+templates from another project, a service imports a shared library, a job
+triggers a deployment somewhere else. gitty finds those references in the
+checkouts it manages and keeps them in an **index**, so that the question
+"what else matters to this project, and where is it on my disk?" has an
+answer that does not involve reading every repository.
+
+A **link** is one evidenced reference from a project to another:
+
+| Kind | Found in | What it means |
+| :--- | :--- | :--- |
+| `ci-include` | `.gitlab-ci.yml`: `include: project:` / `remote:` | The pipeline includes configuration from the project. |
+| `ci-trigger` | `.gitlab-ci.yml`: `trigger: project:` | The pipeline triggers the project's pipeline. |
+| `ci-component` | `.gitlab-ci.yml`: `include: component:` | The pipeline uses a CI/CD component the project publishes. |
+| `depends` | Package manifests (`go.mod`, `package.json`, `requirements*.txt`, `pyproject.toml`, `Gemfile`, `Cargo.toml`, `pom.xml`, `build.gradle`, `composer.json`, `*.tf`, `Chart.yaml`, `.npmrc`, …); clone URLs in CI scripts; `needs: project:` | The project is named as a dependency: by its URL on the instance, its Go module path, or its package registry. |
+| `fork` | The GitLab API | The project was forked from the other one. |
+
+Every link carries its **evidence** — a file and line (`go.mod:12`), or the
+API field it came from — so it can be opened and checked. A reference only
+becomes a link when it lands on a project that really exists in the
+workspace's part of the instance; one that points at the instance but matches
+nothing is reported as **unresolved**, never presented as a project.
+
+The scan is deliberately textual. gitty reads the files git tracks, picks the
+ones whose names say they declare dependencies or pipeline configuration, and
+looks at their lines. It does not evaluate build files, expand version ranges
+or run a package manager, so it needs nothing installed and cannot be made to
+execute anything. Vendored trees (`vendor/`, `node_modules/`, `third_party/`),
+test fixtures, lockfiles, files over 1 MiB and binaries are not read. In CI
+files the predefined variables that follow from where a project lives
+(`$CI_PROJECT_NAMESPACE`, `$CI_PROJECT_ROOT_NAMESPACE`, `$CI_SERVER_HOST`, …)
+are expanded; a value that still holds any other variable is left alone
+rather than guessed at.
+
+### The index (`gitty index`)
+
+```bash
+gitty index
+```
+
+```text
+index acme/app new
+link acme/app ci-include acme/ci-templates .gitlab-ci.yml:2
+link acme/app depends acme/lib go.mod:12
+unresolved acme/app acme/old-lib go.mod:14
+index acme/ci-templates new
+index acme/lib unchanged
+summary projects=42 checkouts=3 scanned=2 links=2 unresolved=1 errors=0
+```
+
+It lists the projects of the workspace's group from the API (so a link can
+point at a project you have not cloned), reads the checkouts, and writes one
+file: **`.gitty/index.json` at the workspace root**. There is one index per
+workspace, whichever directory the command is run in — `sync --groups` leaves
+a config in every group directory, and the index sits beside the outermost
+one, so links between groups are seen from anywhere.
+
+It is incremental: a checkout is read again only when the commit it is at has
+moved, so a second run on an unchanged workspace reads nothing. `--rescan`
+reads everything again, which is how edits that are not committed yet get
+picked up.
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--dry-run` | `false` | Report the same events (index lines prefixed `plan`) without writing the index. |
+| `--rescan` | `false` | Read every checkout again, not only those whose commit moved. |
+| `--archived` | `false` | Also ask archived projects what they use. They are always indexed as something others may use. |
+| `--exclude` | `""` | Namespace path or glob to leave out of this run, on top of the workspace's `exclude` list. Excluded projects are neither read nor linked to. |
+| `--jobs` | `4` | Checkouts read concurrently (1-16). |
+| `--token`, `--anon` | | As for `sync`. Indexing always asks the instance which projects exist. |
+| `--verbose` | `false` | Print each git invocation to stderr. |
+
+The index is a cache: everything in it can be recomputed, it holds no token,
+and deleting it is always safe. Nothing is ever written inside a repository.
+
+### What a project uses, and what uses it (`gitty related`)
+
+```bash
+gitty related                 # the project this directory is a checkout of
+gitty related acme/app        # a project by its path
+gitty related ../lib          # or by its directory
+gitty related --direction=used-by
+```
+
+```text
+related acme/app ci-include acme/ci-templates .gitlab-ci.yml:2
+related acme/app depends acme/lib go.mod:12
+unresolved acme/app acme/old-lib go.mod:14
+related-by acme/app depends acme/web package.json:21
+summary uses=2 used-by=1 unresolved=1
+```
+
+`related` lines are projects the subject uses; `related-by` lines are
+projects that use it. The evidence is in the project that holds the
+reference: the subject for `related`, the other project for `related-by`.
+Run in a group's directory (or given a group path), it reports on the group:
+the links among its projects and the ones crossing its edge.
+
+It answers from the index, bringing it up to date first — checkouts whose
+commit moved are reread, and the project being asked about is always reread,
+so an uncommitted edit to it shows. With an index in place that needs **no
+network and no token**; the instance is only contacted when there is no index
+yet, or a checkout appears that the index has never heard of.
+
+---
+
 ## Plugins
 
 A command gitty does not have built in is looked up as an executable named

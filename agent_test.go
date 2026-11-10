@@ -104,3 +104,26 @@ func TestAgentSchemaRendersValidJSON(t *testing.T) {
 		t.Error("expected literal flag-style hint '--<name>' in schema output")
 	}
 }
+
+// TestAgentSchemaCoversEveryCommand: a command an agent could run but cannot
+// read about is one it will guess at. The schema describes every command in
+// the table except the one that prints the schema.
+func TestAgentSchemaCoversEveryCommand(t *testing.T) {
+	s := buildAgentSchema()
+	for _, c := range commands {
+		if c.name == "agent" {
+			continue
+		}
+		tool, ok := findTool(s, c.name)
+		if !ok {
+			t.Errorf("the agent schema has no tool for the %q command", c.name)
+			continue
+		}
+		// Every flag the command declares is described, under its own name.
+		for _, f := range commandFlags(c) {
+			if _, ok := tool.InputSchema.Properties[f.name]; !ok && f.name != "path" && f.name != "http" {
+				t.Errorf("tool %q does not describe the --%s flag", c.name, f.name)
+			}
+		}
+	}
+}

@@ -74,79 +74,110 @@ links, built from CI configuration, manifests and the API.
 
 ### Fake GitLab
 
-- [ ] T001 [US3] Extend `apiProject` in `e2e_test.go` with `description`,
-      `topics`, `forked_from_project.path_with_namespace`,
-      `container_registry_image_prefix`; have `f.project()` fill sensible
-      defaults; serve them from the project listing and `GET /projects/:id`.
+- [x] T001 [US3] Extend `apiProject` in `e2e_test.go` with `description`,
+      `topics`, `web_url`, `forked_from_project.path_with_namespace`,
+      `container_registry_image_prefix`; a `simple=true` listing leaves out
+      what GitLab's trimmed representation leaves out (`simplified()`), so
+      gitty cannot quietly rely on it; `GET /projects/:path`; projects
+      shared with a group, dropped by `with_shared=false`.
 
 ### Index
 
-- [ ] T002 [P] [US3] `index.go`: the index model is `contract.Index` and
-      friends (T041), used directly — no second set of types; `indexVersion
-      = contract.Schema`; `indexPath(workspaceDir)`.
-- [ ] T003 [P] [US3] `index.go`: `loadIndex(dir) (*Index, error)` — missing
-      file → empty index; version mismatch → empty index with a note;
-      `saveIndex(dir, *Index)` — temp file + rename; never stores a token
-      (test asserts the file never contains the credential used).
-- [ ] T004 [US3] `index.go`: staleness — `headOf(dir)` via `git rev-parse
-      HEAD`; `(*Index).stale(project, head) bool`; drop links `from` a project
-      being rescanned before re-adding.
-- [ ] T005 [P] [US3] `index_test.go`: round-trip, version mismatch, atomic
-      write survives a simulated failure (temp left, original intact), stale
-      detection.
+- [x] T002 [P] [US3] `index.go`: the index model is `contract.Index` and
+      friends (T041), used directly — no second set of types;
+      `indexPath(root)`; `newIndex(cfg)`.
+- [x] T003 [P] [US3] `index.go`: `loadIndex(root, cfg)` — missing file,
+      another format version, another instance or root → nil with a reason
+      (it is rebuilt); `saveIndex(root, idx)` — temp file + rename, sorted;
+      never stores a token (e2e asserts the file never contains the
+      credential used).
+- [x] T004 [US3] `index.go`: staleness — `headOf(dir)` read from git's own
+      files (HEAD, the loose or packed ref), falling back to `git rev-parse`
+      for worktrees and anything else; a checkout is reread when its HEAD
+      moved, when it is new, when the scanner version or the exclude list in
+      effect changed, or when asked (`Rescan`); what a reread checkout
+      contributed is replaced; `reconcile` promotes unresolved references
+      whose target appeared and demotes links whose target is gone.
+- [x] T005 [P] [US3] `index_test.go`: round-trip, version/instance/root
+      mismatch, atomic write (no debris after a failed rename, previous index
+      intact after a failed encode, stray temp file ignored), `headOf` in
+      every ref layout, `applyListing`, `rebuildAPILinks`, `reconcile`, and
+      `refreshIndex` offline, with archived projects, and with a vanished
+      checkout.
 
 ### Resolution
 
-- [ ] T006 [P] [US3] `resolve.go`: `resolver` built from the index's project
-      paths + instance host + registry prefixes; `resolve(candidate) (path,
-      ok)` handling: `https://host/g/p[.git][/-/…]`, `host/g/p[/sub]` (Go
-      module paths), `git@host:g/p.git`, `ssh://git@host/g/p`, registry
-      prefixes → project, bare `g/p` paths; longest-prefix match at `/`
-      boundaries; `looksLikeInstanceRef(candidate)` for the unresolved list.
-- [ ] T007 [P] [US3] `resolve_test.go`: table over every form; `acme/lib-tools`
+- [x] T006 [P] [US3] `resolve.go`: `resolver` built from the index's project
+      paths and ids, the instance host, the workspace's `clone_hosts` and the
+      hosts the API advertises; `resolveToken` for
+      `https://host/g/p[.git][/-/…]`, `host/g/p[/sub]` (Go module paths),
+      `git@host:g/p.git`, `ssh://git@host/g/p`, `api/v4/projects/<id|path>`;
+      `resolvePath` for bare `g/p` (exact); `resolveComponent`;
+      longest-prefix match at `/` boundaries; references to excluded
+      projects are passed over; an instance under a sub-path.
+- [x] T007 [P] [US3] `resolve_test.go`: table over every form; `acme/lib-tools`
       vs `acme/lib`; `host/acme/lib/v2` → `acme/lib`; foreign hosts → no.
 
 ### Scanner
 
-- [ ] T008 [US3] `scan.go`: `scanCheckout(ctx, git, dir, instance, resolver)
-      (links, unresolved, docs, summary, err)` — `git ls-files -z`, name
-      filter, ≤ 1 MiB per file, extractors in order; README first-paragraph
-      summary; root `*.md` doc list.
-- [ ] T009 [P] [US3] `scan.go`: CI extractor — `.gitlab-ci.yml`,
-      `.gitlab/ci/**/*.yml`, `*.gitlab-ci.yml`; tracks the current `include:`
-      / `trigger:` block by indentation; `project:` → `ci-include` /
-      `ci-trigger`; `component:` → `ci-component` (strip `@version` and the
-      component name).
-- [ ] T010 [P] [US3] `scan.go`: manifest extractor — file list per plan;
-      tokens containing the instance host, or Go module paths starting with
-      it; strip `.git`, `/-/…`, version suffixes; → `depends`.
-- [ ] T011 [P] [US3] `scan_test.go`: fixture trees under `testdata/scan/`
-      (a CI file with include/trigger/component; go.mod; package.json with a
-      git URL; requirements with `git+https`; a Dockerfile — expected to yield
-      nothing in phase 1); exact evidence lines asserted.
-- [ ] T012 [US3] `index.go`: `buildIndex(ctx, s *syncer, target, nested)`
-      — list projects with full metadata (concurrent pager; add a
-      `ProjectsDetailed` to `gitlabSource`), fork edges from the API, scan
-      changed checkouts honouring `exclude`/archived, merge, save.
+- [x] T008 [US3] `scan.go`: `(*scanner).scan(ctx, dir, project, links)` —
+      `git ls-files -z`, name filter, regular files ≤ 1 MiB that are not
+      binary, vendored and fixture directories skipped; README
+      first-paragraph summary; root-level doc list.
+- [x] T009 [P] [US3] `scan.go`: CI extractor — `.gitlab-ci.yml`,
+      `.gitlab/ci/**/*.yml`, `*.gitlab-ci.yml`; tracks the enclosing
+      `include:` / `trigger:` / `needs:` block by indentation and reads
+      nothing inside `script:` / `variables:` as a key; `project:` →
+      `ci-include` / `ci-trigger` (`depends` under `needs:`); `component:` →
+      `ci-component` (strip `@version` and the component name); `remote:` and
+      plain URLs under `include:`; the short `trigger: g/p` form; predefined
+      CI variables that follow from the project's path are expanded.
+- [x] T010 [P] [US3] `scan.go`: manifest extractor — file list per plan plus
+      `.npmrc`, `go.work`, `setup.py`/`setup.cfg`, `Pipfile`, `*.gemspec`;
+      every token naming the instance host; `.git`, `/-/…`, `//subdir`,
+      version, query and fragment stripped; → `depends`. CI files get the
+      same pass, so a clone URL in a script is a dependency.
+- [x] T011 [P] [US3] `scan_test.go`: a full CI fixture with exact evidence
+      lines; CI shapes (same-indent lists, short forms, CRLF, self
+      references); go.mod, package.json, requirements, Terraform, `.npmrc`;
+      a real git checkout with untracked, vendored, oversized, binary and
+      symlinked files that must not be read.
+- [x] T012 [US3] `index.go`: `(*workspace).refreshIndex(ctx, opts)` — list
+      the namespace's projects (`NamespaceProjects`: the trimmed listing,
+      archived included, without projects merely shared with the group),
+      look each checkout up once for its fork origin and the registry host
+      (`Project`), scan changed checkouts honouring `exclude`/archived,
+      merge, save. `workspace.go`: `openWorkspace` — the workspace root (the
+      outermost config), where the command was started, and the project or
+      group that is.
 
 ### `gitty index`, `gitty related`
 
-- [ ] T013 [US3] `indexcmd.go`: `runIndex(ctx, opts)` — events `index
-      <path> new|changed|unchanged`, `link <from> <kind> <to> <evidence>`,
-      `unresolved <from> <ref> <evidence>`, `summary projects=N scanned=N
-      links=N unresolved=N`; `--dry-run` prints `plan index <path>` per
-      changed project and writes nothing; `--nested`, `--archived`,
-      `--exclude`, `--jobs`, `--verbose`, `--anon`, `--token`.
-- [ ] T014 [P] [US3] `related.go`: `runRelated(ctx, opts)` — `related <p>
+- [x] T013 [US3] `indexcmd.go`: `runIndex(ctx, opts)` — events `index
+      <path> new|changed|unchanged|removed`, `link <from> <kind> <to>
+      <evidence>`, `unresolved <from> <ref> <evidence>`, `skip <path>
+      excluded`, `summary projects=N checkouts=N scanned=N links=N
+      unresolved=N errors=N`; `--dry-run` prints the same with `plan index`
+      and writes nothing; `--rescan`, `--archived`, `--exclude`, `--jobs`,
+      `--verbose`, `--anon`, `--token`. No `--nested`: the index always
+      covers the whole workspace.
+- [x] T014 [P] [US3] `related.go`: `runRelated(ctx, opts)` — `related <p>
       <kind> <to> <evidence>`, `related-by <p> <kind> <from> <evidence>`,
-      summary; `--direction`; builds/refreshes the index first when stale.
-- [ ] T015 [US3] `commands.go`: add `index` and `related` to the command
-      table with flags (completion follows); `main.go` dispatch; `agent.go`
-      schema entries; `eventLineRe` in tests gains the new prefixes.
-- [ ] T016 [US3] `e2e_test.go`: `TestE2EIndexAndRelated` — three repos with
-      a CI include and a go.mod dependency; index events and file; second run
-      all `unchanged`; `related` both directions; `--dry-run` writes nothing;
-      excluded project absent.
+      `unresolved …`, summary; `--direction`; subject by namespace path
+      (relative to the current group first), by directory, or by where the
+      command runs; a group as subject; brings the index up to date first,
+      always rereading the subject.
+- [x] T015 [US3] `commands.go`: `index` and `related` in the command table
+      with flags (completion follows); `main.go` dispatch; `agent.go` schema
+      entries, with a test that every command and flag is described.
+- [x] T016 [US3] `context_e2e_test.go`: `TestE2EIndexAndRelated` — four
+      projects with a CI include, a manifest dependency, a dangling
+      reference and a fork; index events and file; second run all
+      `unchanged`; `related` in both directions, by path, by directory, for
+      a group, with no token and no instance; an uncommitted edit seen; a
+      moved commit; `--rescan`; `--dry-run` writes nothing; an excluded
+      project absent; plus tests for no index and no credential, the token
+      never stored, and one index per workspace across group configs.
 
 **Checkpoint**: `gitty index && gitty related acme/app` answers correctly on
 the fake instance and on a real one.
