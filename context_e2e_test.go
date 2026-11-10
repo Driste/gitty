@@ -440,3 +440,390 @@ func TestE2EIndexIsOnePerWorkspace(t *testing.T) {
 		"summary uses=0 used-by=1 unresolved=0",
 	)
 }
+
+// cloneInto checks a fixture project out by hand, where a sync would put it.
+func cloneInto(t *testing.T, f *fakeGitLab, ws string, projects ...string) {
+	t.Helper()
+	for _, p := range projects {
+		gitRun(t, ws, "clone", "-q", filepath.Join(f.gitRoot, filepath.FromSlash(p)+".git"), filepath.FromSlash(p))
+	}
+}
+
+func TestE2EContext(t *testing.T) {
+	skipIfShort(t)
+	fx := newLinkedFixture(t)
+	f := fx.f
+	ws := initWorkspace(t, f)
+	cloneInto(t, f, ws, "acme/app")
+	appDir := filepath.Join(ws, "acme", "app")
+
+	t.Log("without --fetch: absent projects are named with the command that fetches them")
+	stdout, _ := mustGitty(t, appDir, nil, "context", "--anon")
+	wantLines(t, "context", stdout,
+		"# acme/app — Customer-facing API",
+		"127.0.0.1 · `.` · main · topics: go, api · docs: README.md",
+		"",
+		"Customer-facing API.",
+		"",
+		"## Uses (2)",
+		"- **acme/ci-templates** — Pipeline templates · *not checked out* (`gitty fetch acme/ci-templates`) · ci-include (.gitlab-ci.yml:2)",
+		"- **acme/lib** — Shared domain types · *not checked out* (`gitty fetch acme/lib`) · depends (package.json:4)",
+		"",
+		// An empty side is said to be empty, and the blind spot is named.
+		"## Used by (0)",
+		"- No checked-out project refers to it.",
+		"",
+		"## References that are not projects here (1)",
+		"- acme/old-lib (package.json:5)",
+		"",
+		"## Notes",
+		"- Only checked-out projects are read for links: 1 of 4 here. \"Used by\" may be incomplete.",
+	)
+	for _, p := range []string{"ci-templates", "lib"} {
+		if _, err := os.Stat(filepath.Join(ws, "acme", p)); !os.IsNotExist(err) {
+			t.Errorf("context without --fetch created acme/%s", p)
+		}
+	}
+
+	t.Log("--fetch clones what the project uses, where a sync would put it")
+	stdout, stderr := mustGitty(t, filepath.Join(appDir, "src"), nil, "context", "--fetch", "--anon")
+	wantLines(t, "context --fetch", stdout,
+		"# acme/app — Customer-facing API",
+		"127.0.0.1 · `..` · main · topics: go, api · docs: README.md",
+		"",
+		"Customer-facing API.",
+		"",
+		"## Uses (2)",
+		"- **acme/ci-templates** — Pipeline templates · `../../ci-templates` (fetched) · ci-include (.gitlab-ci.yml:2)",
+		"- **acme/lib** — Shared domain types · `../../lib` (fetched) · depends (package.json:4)",
+		"",
+		"## Used by (0)",
+		"- No checked-out project refers to it.",
+		"",
+		"## References that are not projects here (1)",
+		"- acme/old-lib (package.json:5)",
+		"",
+		"## Where to read next",
+		"- acme/ci-templates: ../../ci-templates/README.md",
+		"- acme/lib: ../../lib/AGENTS.md, ../../lib/README.md",
+		"",
+		"## Notes",
+		"- Only checked-out projects are read for links: 3 of 4 here. \"Used by\" may be incomplete.",
+	)
+	// What fetching did is reported with the diagnostics, not in the briefing.
+	for _, want := range []string{"clone acme/ci-templates\n", "clone acme/lib\n"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr missing %q:\n%s", want, stderr)
+		}
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "lib", "lib.txt")); got != "needle in the library\n" {
+		t.Errorf("fetched lib.txt = %q", got)
+	}
+	// Exactly what was named: the fork is related to nothing the app uses.
+	if _, err := os.Stat(filepath.Join(ws, "acme", "app-fork")); !os.IsNotExist(err) {
+		t.Error("context --fetch cloned a project the subject does not use")
+	}
+
+	t.Log("a second --fetch finds everything in place and touches nothing")
+	hits := f.gitHits.Load()
+	f.requireToken = "nobody-has-this" // and needs no instance either
+	stdout, _ = mustGitty(t, appDir, nil, "context", "--fetch")
+	if strings.Contains(stdout, "(fetched)") || !strings.Contains(stdout, "· `../lib` · depends (package.json:4)") {
+		t.Errorf("second --fetch:\n%s", stdout)
+	}
+	if f.gitHits.Load() != hits {
+		t.Errorf("second --fetch contacted the git server (%d requests)", f.gitHits.Load()-hits)
+	}
+
+	t.Log("the other side: what uses a project")
+	stdout, _ = mustGitty(t, filepath.Join(ws, "acme", "lib"), nil, "context")
+	wantLines(t, "context (lib)", stdout,
+		"# acme/lib — Shared domain types",
+		"127.0.0.1 · `.` · main · docs: AGENTS.md, README.md",
+		"",
+		"Shared domain types.",
+		"",
+		"## Uses (0)",
+		"- Nothing in its pipeline configuration or manifests refers to another project of the instance.",
+		"",
+		"## Used by (1)",
+		"- **acme/app** — Customer-facing API · `../app` · depends (package.json:4)",
+		"",
+		"## Where to read next",
+		"- acme/app: ../app/README.md",
+		"",
+		"## Notes",
+		"- Only checked-out projects are read for links: 3 of 4 here. \"Used by\" may be incomplete.",
+	)
+	stdout, _ = mustGitty(t, ws, nil, "context", "acme/lib", "--direction=uses")
+	if strings.Contains(stdout, "Used by") || !strings.Contains(stdout, "## Uses (0)\n") {
+		t.Errorf("--direction=uses should print that side and nothing about the other:\n%s", stdout)
+	}
+
+	t.Log("--format=json is the same briefing as data")
+	stdout, _ = mustGitty(t, appDir, nil, "context", "--format=json")
+	var b contract.Briefing
+	if err := json.Unmarshal([]byte(stdout), &b); err != nil {
+		t.Fatalf("decoding the briefing: %v\n%s", err, stdout)
+	}
+	if b.Schema != contract.Schema || b.Instance != f.srv.URL || b.Workspace != realDir(t, ws) && b.Workspace != ws {
+		t.Errorf("header: schema %d, instance %q, workspace %q", b.Schema, b.Instance, b.Workspace)
+	}
+	if b.Subject.Kind != "project" || b.Subject.Project != "acme/app" || !b.Subject.Present ||
+		b.Subject.RelativePath != "." || !filepath.IsAbs(b.Subject.Path) || b.Subject.DefaultBranch != "main" {
+		t.Errorf("subject = %+v", b.Subject)
+	}
+	if b.UsesTotal != 2 || len(b.Uses) != 2 || b.UsedByTotal != 0 || b.UsedBy == nil {
+		t.Fatalf("uses %d/%d, used by %d (%v)", len(b.Uses), b.UsesTotal, b.UsedByTotal, b.UsedBy)
+	}
+	lib := b.Uses[1]
+	if lib.Project != "acme/lib" || !lib.Present || lib.Fetched || lib.RelativePath != "../lib" ||
+		lib.Description != "Shared domain types" || strings.Join(lib.Docs, ",") != "AGENTS.md,README.md" ||
+		len(lib.Links) != 1 || lib.Links[0].Kind != contract.KindDepends || lib.Links[0].Evidence != "package.json:4" ||
+		lib.Links[0].From != "acme/app" || lib.FetchCommand != "" {
+		t.Errorf("acme/lib = %+v", lib)
+	}
+	if got := readFileT(t, filepath.Join(lib.Path, "lib.txt")); got != "needle in the library\n" {
+		t.Errorf("the path a briefing gives must lead to the project: %q", got)
+	}
+	if len(b.Unresolved) != 1 || b.Unresolved[0].Ref != "acme/old-lib" {
+		t.Errorf("unresolved = %+v", b.Unresolved)
+	}
+
+	t.Log("a group: its projects, the links among them, and what crosses its edge")
+	stdout, _ = mustGitty(t, filepath.Join(ws, "acme"), nil, "context")
+	for _, want := range []string{
+		"# acme (group)\n",
+		"127.0.0.1 · `.` · 4 projects, 3 checked out\n",
+		"## Projects (4)\n",
+		"- **acme/app** — Customer-facing API · `app`\n",
+		"- **acme/app-fork** · *not checked out*\n",
+		"## Links within the group (2)\n",
+		"- acme/app → acme/ci-templates · ci-include (.gitlab-ci.yml:2)\n",
+		"- acme/app → acme/lib · depends (package.json:4)\n",
+		"## References that are not projects here (1)\n- acme/old-lib (acme/app: package.json:5)\n",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("group briefing missing %q:\n%s", want, stdout)
+		}
+	}
+
+	t.Log("a fetch that fails leaves the project in the briefing, absent, with the reason")
+	f.requireToken = ""
+	if err := os.RemoveAll(filepath.Join(ws, "acme", "lib")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(f.gitRoot, "acme", "lib.git"), filepath.Join(f.gitRoot, "acme", "lib.gone")); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runGitty(t, appDir, nil, "context", "--fetch", "--anon")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1: the briefing is complete but not everything asked for was done\n%s", code, stderr)
+	}
+	for _, want := range []string{
+		"- **acme/ci-templates** — Pipeline templates · `../ci-templates` · ci-include (.gitlab-ci.yml:2)\n",
+		"- **acme/lib** — Shared domain types · *not checked out* (`gitty fetch acme/lib`) · depends (package.json:4)\n  - fetching it failed: git fetch failed\n",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("briefing after a failed fetch missing %q:\n%s", want, stdout)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "lib")); !os.IsNotExist(err) {
+		t.Error("a failed fetch left a half-made checkout behind")
+	}
+
+	t.Log("no credential: the briefing still answers, and says what it could not do")
+	stdout, _, code = runGitty(t, appDir, nil, "context", "--fetch", "--format=json")
+	if err := json.Unmarshal([]byte(stdout), &b); err != nil {
+		t.Fatalf("decoding the briefing: %v\n%s", err, stdout)
+	}
+	if code != 1 || len(b.Uses) != 2 || b.Uses[1].Present || !strings.Contains(b.Uses[1].FetchError, "--anon") {
+		t.Errorf("exit %d, acme/lib = %+v", code, b.Uses[1])
+	}
+
+	_, stderr, code = runGitty(t, appDir, nil, "context", "--format=yaml")
+	if code != 2 || !strings.Contains(stderr, "--format") {
+		t.Errorf("bad format: exit %d\n%s", code, stderr)
+	}
+	_, stderr, code = runGitty(t, appDir, nil, "context", "one", "two")
+	if code != 2 || !strings.Contains(stderr, "at most one") {
+		t.Errorf("two subjects: exit %d\n%s", code, stderr)
+	}
+}
+
+func TestE2EFetch(t *testing.T) {
+	skipIfShort(t)
+	fx := newLinkedFixture(t)
+	f := fx.f
+	ws := initWorkspace(t, f)
+	cloneInto(t, f, ws, "acme/app")
+	appSrc := filepath.Join(ws, "acme", "app", "src")
+
+	t.Log("an absent project is cloned where a sync would put it")
+	stdout, _ := mustGitty(t, appSrc, nil, "fetch", "acme/lib", "--anon")
+	assertContextEvents(t, stdout)
+	wantLines(t, "fetch acme/lib", stdout,
+		"clone acme/lib",
+		"summary cloned=1 present=0 errors=0",
+	)
+	if got := readFileT(t, filepath.Join(ws, "acme", "lib", "lib.txt")); got != "needle in the library\n" {
+		t.Errorf("lib.txt = %q", got)
+	}
+
+	t.Log("a present project is left exactly as it is; the report says which is which")
+	// A local commit a pull would have to merge with: fetch must not touch it.
+	libDir := filepath.Join(ws, "acme", "lib")
+	if err := os.WriteFile(filepath.Join(libDir, "local.txt"), []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	head := gitOut(t, libDir, "rev-parse", "HEAD")
+	hits := f.gitHits.Load()
+	stdout, stderr := mustGitty(t, ws, nil, "fetch", "/acme/lib/", "acme/ci-templates.git", "--anon", "--format=json")
+	var report contract.FetchReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("stdout must be the report and nothing else: %v\n%s", err, stdout)
+	}
+	if report.Schema != contract.Schema || len(report.Results) != 2 {
+		t.Fatalf("report = %+v", report)
+	}
+	lib, ci := report.Results[0], report.Results[1]
+	if lib.Project != "acme/lib" || !lib.Present || lib.Fetched || lib.Error != "" || lib.Path != filepath.Join(realDir(t, ws), "acme", "lib") && lib.Path != libDir {
+		t.Errorf("acme/lib = %+v", lib)
+	}
+	if ci.Project != "acme/ci-templates" || !ci.Present || !ci.Fetched || ci.Error != "" {
+		t.Errorf("acme/ci-templates = %+v", ci)
+	}
+	if !strings.Contains(stderr, "skip acme/lib present\n") || !strings.Contains(stderr, "clone acme/ci-templates\n") {
+		t.Errorf("with --format=json the events belong on stderr:\n%s", stderr)
+	}
+	if gitOut(t, libDir, "rev-parse", "HEAD") != head || readFileT(t, filepath.Join(libDir, "local.txt")) != "mine" {
+		t.Error("fetch changed a checkout that was already present")
+	}
+	_ = hits
+	// Nothing that was not named.
+	if _, err := os.Stat(filepath.Join(ws, "acme", "app-fork")); !os.IsNotExist(err) {
+		t.Error("fetch cloned a project that was not named")
+	}
+
+	t.Log("--dry-run plans the same and clones nothing")
+	stdout, _ = mustGitty(t, ws, nil, "fetch", "acme/app-fork", "acme/lib", "--anon", "--dry-run")
+	wantLines(t, "fetch --dry-run", stdout,
+		"skip acme/lib present",
+		"plan clone acme/app-fork",
+		"summary cloned=1 present=1 errors=0",
+	)
+	if _, err := os.Stat(filepath.Join(ws, "acme", "app-fork")); !os.IsNotExist(err) {
+		t.Error("--dry-run cloned")
+	}
+
+	t.Log("what cannot be fetched is an error for that project, not for the others")
+	stdout, stderr, code := runGitty(t, ws, nil, "fetch", "acme/nope", "acme/app-fork", "--anon")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1\n%s", code, stderr)
+	}
+	wantLines(t, "fetch with one unknown project", stdout,
+		"error acme/nope looking the project up failed",
+		"clone acme/app-fork",
+		"summary cloned=1 present=0 errors=1",
+	)
+	if !strings.Contains(stderr, "404") || !strings.Contains(stderr, "1 failed:") {
+		t.Errorf("stderr should carry the instance's answer and the recap:\n%s", stderr)
+	}
+
+	t.Log("the exclude list is honoured even for a project named outright")
+	stdout, _, code = runGitty(t, ws, nil, "fetch", "acme/ci-templates", "--anon", "--exclude=acme/ci-*")
+	if code != 1 || !strings.Contains(stdout, "skip acme/ci-templates excluded\n") {
+		t.Errorf("exit %d:\n%s", code, stdout)
+	}
+
+	t.Log("usage errors")
+	for name, args := range map[string][]string{
+		"no project":           {"fetch", "--anon"},
+		"not a namespace path": {"fetch", "lib", "--anon"},
+		"a path that climbs":   {"fetch", "acme/../../etc", "--anon"},
+		"bad format":           {"fetch", "acme/lib", "--anon", "--format=xml"},
+	} {
+		if _, stderr, code := runGitty(t, ws, nil, args...); code != 2 {
+			t.Errorf("%s: exit = %d, want 2\n%s", name, code, stderr)
+		}
+	}
+	// No credential, and something to clone: said once, before anything.
+	if err := os.RemoveAll(filepath.Join(ws, "acme", "app-fork")); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code = runGitty(t, ws, nil, "fetch", "acme/app-fork")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, "--anon") {
+		t.Errorf("no credential: exit %d, stdout %q\n%s", code, stdout, stderr)
+	}
+	// Everything named already here: nothing to ask the instance for.
+	stdout, _ = mustGitty(t, ws, nil, "fetch", "acme/lib")
+	wantLines(t, "fetch of a present project, no credential", stdout,
+		"skip acme/lib present",
+		"summary cloned=0 present=1 errors=0",
+	)
+}
+
+// TestE2EFetchStaysInsideTheWorkspace: a workspace rooted at a group has no
+// place for a project of another namespace, and fetch does not invent one.
+func TestE2EFetchStaysInsideTheWorkspace(t *testing.T) {
+	skipIfShort(t)
+	fx := newLinkedFixture(t)
+	ws := t.TempDir()
+	writeConfigAt(t, ws, Config{URL: fx.f.srv.URL, HTTP: true, RootPath: "acme"})
+
+	stdout, _, code := runGitty(t, ws, nil, "fetch", "partner/tool", "acme/lib", "--anon")
+	if code != 1 || !strings.Contains(stdout, "error partner/tool outside this workspace\n") || !strings.Contains(stdout, "clone acme/lib\n") {
+		t.Errorf("exit %d:\n%s", code, stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "lib", "lib.txt")); got != "needle in the library\n" {
+		t.Errorf("lib.txt = %q", got)
+	}
+	entries, err := os.ReadDir(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 { // .gitty and lib
+		t.Errorf("workspace root holds %v, want only .gitty and lib", entries)
+	}
+}
+
+// TestE2EChangeDirectory: `gitty -C <dir> <command>` behaves as if started in
+// <dir> — the way something that cannot choose its own working directory
+// says which workspace, and which project in it, it means.
+func TestE2EChangeDirectory(t *testing.T) {
+	skipIfShort(t)
+	fx := newLinkedFixture(t)
+	ws := initWorkspace(t, fx.f)
+	cloneInto(t, fx.f, ws, "acme/app", "acme/lib")
+	mustGitty(t, ws, nil, "index", "--anon")
+	elsewhere := t.TempDir()
+
+	stdout, _ := mustGitty(t, elsewhere, nil, "-C", filepath.Join(ws, "acme", "lib"), "related")
+	wantLines(t, "gitty -C <checkout> related", stdout,
+		"related-by acme/lib depends acme/app package.json:4",
+		"summary uses=0 used-by=1 unresolved=0",
+	)
+	// Several are applied in order, each relative to the one before.
+	stdout, _ = mustGitty(t, elsewhere, nil, "-C", ws, "-C", "acme/app", "related", "--direction=uses")
+	if !strings.Contains(stdout, "related acme/app depends acme/lib package.json:4\n") {
+		t.Errorf("gitty -C a -C b:\n%s", stdout)
+	}
+	// A plugin started this way starts there too, and is told so.
+	pathDir := filepath.Join(elsewhere, "bin")
+	writeStub(t, pathDir, "gitty-where", `echo "pwd=$(pwd)"; echo "group=$GITTY_GROUP"`)
+	stdout, _ = mustGitty(t, elsewhere, []string{"PATH=" + pathDir + string(os.PathListSeparator) + os.Getenv("PATH")},
+		"-C", filepath.Join(ws, "acme", "lib"), "where")
+	if !strings.Contains(stdout, "group=acme\n") || !strings.Contains(stdout, filepath.Join("acme", "lib")+"\n") {
+		t.Errorf("plugin after -C:\n%s", stdout)
+	}
+
+	for name, args := range map[string][]string{
+		"no directory":       {"-C"},
+		"not a directory":    {"-C", filepath.Join(elsewhere, "missing"), "related"},
+		"nothing after -C x": {"-C", ws},
+	} {
+		if _, stderr, code := runGitty(t, elsewhere, nil, args...); code != 2 {
+			t.Errorf("%s: exit = %d, want 2\n%s", name, code, stderr)
+		}
+	}
+}

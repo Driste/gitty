@@ -159,11 +159,24 @@ type Briefing struct {
 	// Within holds the links among a group subject's own projects.
 	Within []Link `json:"within,omitempty"`
 
+	// Coverage says what the answer rests on. Links are found by reading
+	// checkouts, so a project that is not checked out is known to exist (and
+	// can be something others use) but is not known to use anything: UsedBy
+	// is complete only as far as the workspace is.
+	Coverage Coverage `json:"coverage"`
+
 	Unresolved []Unresolved `json:"unresolved,omitempty"`
 	// Notes are things the reader should know about this answer: a list
 	// that was capped, an index that could not be refreshed.
 	Notes     []string  `json:"notes,omitempty"`
 	IndexedAt time.Time `json:"indexed_at"`
+}
+
+// Coverage is how much of the workspace's part of the instance has been
+// read for links.
+type Coverage struct {
+	Projects   int `json:"projects"`    // projects the index knows of
+	CheckedOut int `json:"checked_out"` // of those, checked out here and read
 }
 
 // Subject is what a briefing is about: a project, or a group of them.

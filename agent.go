@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.7.0"
+const AgentSchemaVersion = "3.8.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -298,6 +298,120 @@ func buildAgentSchema() AgentSchema {
 					Command:   "gitty",
 					BaseArgs:  []string{"ls"},
 					FlagStyle: "the 'path' argument is positional (gitty ls <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it",
+				},
+			},
+			{
+				Name:        "context",
+				Description: "Brief a project: which other projects of the GitLab instance it uses and which use it, each with its description, the absolute and relative path of its checkout on this machine (or the command that fetches it), the kind of link (depends, ci-include, ci-trigger, ci-component, image, submodule, fork, mentions) and the file and line that proves it. Use it before changing a project, to find the code it depends on and the code that depends on it. With fetch, the projects it uses that are not checked out are cloned first, into the places their namespace paths give them. The briefing is the only thing on stdout: Markdown by default, or with format=json one JSON document (fields: schema, instance, workspace, subject, uses[], used_by[], uses_total, used_by_total, within[], unresolved[], notes[]; each related project has project, description, present, fetched, path, relative_path, fetch_command, fetch_error, links[{from,to,kind,evidence}], docs[], summary). Answered from the workspace index, which is brought up to date first; the instance is only contacted to fetch, or if the index has to be built. Exit 1 means the briefing was printed but a fetch failed (see fetch_error).",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"project": {
+							Type:        "string",
+							Description: "The project (or group) to brief: a namespace path such as 'acme/app' (a leading '/' makes it absolute; otherwise it is tried relative to the current directory's group first), or a directory. Omitted: the project whose checkout the command runs in, or the group when run in a group's directory. Passed as a positional argument.",
+						},
+						"fetch": {
+							Type:        "boolean",
+							Description: "Clone the projects the subject uses that are not checked out yet (at most 25 per call). Projects already checked out are never pulled or otherwise touched.",
+							Default:     false,
+						},
+						"format": {
+							Type:        "string",
+							Description: "Output format: 'markdown' or 'json'. Pass 'json' when consuming this programmatically.",
+							Default:     "markdown",
+						},
+						"direction": {
+							Type:        "string",
+							Description: "Which side to brief: 'uses', 'used-by', or 'both'. The totals of both sides are always given.",
+							Default:     "both",
+						},
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token; needed to fetch, or when the index has to be built. Falls back to GITLAB_TOKEN or CI_JOB_TOKEN.",
+						},
+						"anon": {
+							Type:        "boolean",
+							Description: "Reach the instance anonymously when it is needed (public projects only).",
+							Default:     false,
+						},
+						"jobs": {
+							Type:        "integer",
+							Description: "Number of concurrent clones and checkout reads (1-16).",
+							Default:     4,
+						},
+						"accept-new-host-keys": {
+							Type:        "boolean",
+							Description: "With fetch over SSH, record unknown host keys without prompting.",
+							Default:     false,
+						},
+						"verbose": {
+							Type:        "boolean",
+							Description: "Print each git invocation and its output to stderr.",
+							Default:     false,
+						},
+					},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"context"},
+					FlagStyle: "the 'project' argument is positional (gitty context <project>); other arguments are --<name>=<value> for strings and integers, --<name> for booleans, and may appear on either side of it",
+				},
+			},
+			{
+				Name:        "fetch",
+				Description: "Make sure the named projects are checked out in the workspace, cloning the ones that are not into the directories their namespace paths give them (where a sync of their group would put them). Only the projects named are touched; one that is already checked out is left exactly as it is, never pulled. Prints one event per line: 'clone <project>', 'skip <project> present', 'skip <project> excluded', 'error <project> <reason>', then 'summary cloned=N present=N errors=N'. With format=json stdout is one JSON document instead ({schema, results[{project, path, present, fetched, error}]}) and the events go to stderr. Exit 1 when any project could not be fetched.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"projects": {
+							Type:        "string",
+							Description: "One or more projects, each by its full namespace path (e.g. 'acme/platform/lib'). Passed as positional arguments.",
+						},
+						"format": {
+							Type:        "string",
+							Description: "Output format: 'text' (event lines) or 'json'.",
+							Default:     "text",
+						},
+						"dry-run": {
+							Type:        "boolean",
+							Description: "Print what would be cloned ('plan clone <project>') without cloning anything.",
+							Default:     false,
+						},
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token. Falls back to GITLAB_TOKEN or CI_JOB_TOKEN. Required unless anon is set, or everything named is already checked out.",
+						},
+						"anon": {
+							Type:        "boolean",
+							Description: "Fetch public projects anonymously, without a token.",
+							Default:     false,
+						},
+						"exclude": {
+							Type:        "string",
+							Description: "Namespace path or glob never to fetch, on top of the workspace's exclude list. Repeatable, and also accepts a comma-separated list.",
+						},
+						"jobs": {
+							Type:        "integer",
+							Description: "Number of concurrent clones (1-16).",
+							Default:     4,
+						},
+						"accept-new-host-keys": {
+							Type:        "boolean",
+							Description: "For SSH clones, record unknown host keys without prompting.",
+							Default:     false,
+						},
+						"verbose": {
+							Type:        "boolean",
+							Description: "Print each git invocation and its output to stderr.",
+							Default:     false,
+						},
+					},
+					Required: []string{"projects"},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"fetch"},
+					FlagStyle: "the 'projects' are positional (gitty fetch <project>...); other arguments are --<name>=<value> for strings and integers, --<name> for booleans, and may appear on either side of them",
 				},
 			},
 			{

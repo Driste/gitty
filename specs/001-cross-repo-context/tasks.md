@@ -191,41 +191,56 @@ project and the reason it matters, with absent ones fetched into place.
 
 ### Briefing and fetching
 
-- [ ] T017 [P] [US1] `briefing.go`: `briefing` model (subject, uses, usedBy,
-      unresolved, readNext, fetchFailures) and `buildBriefing(idx, subject,
-      direction, caps)`; group subjects; `relative_path` from the caller's
-      directory; `docs` ordering (README last).
-- [ ] T018 [P] [US1] `fetch.go`: `fetchProjects(ctx, s *syncer, paths)
-      (results)` — resolves each path to a project (index, else API), skips
-      checked-out ones, runs the existing `bringUp` into the namespace path,
-      returns per-project outcome; honours `exclude`; never touches a project
-      that is not named.
-- [ ] T044 [US1] `fetch.go`: `runFetch(ctx, opts)` — `gitty fetch
-      <project>...`: events `clone`/`pull`/`skip`/`error` as sync, summary;
-      `--format=json` prints `[]contract.FetchResult` (`path`, `dir`,
-      `fetched`, `present`, `error`); `--dry-run` prints `plan clone <path>`
-      and writes nothing; `--jobs`, `--token`, `--anon`, `--exclude`.
-- [ ] T045 [US1] `commands.go` / `agent.go`: register `fetch`;
-      `e2e_test.go`: `TestE2EFetch` — two names, one present (pulled), one
-      absent (cloned), a sibling untouched; JSON round-trips; `--dry-run`
-      writes nothing.
-- [ ] T019 [US1] `index.go`: `ensureFresh(ctx, s, subject)` — build the index
-      if missing/mismatched, rescan the subject if its HEAD moved, rescan a
-      just-fetched project so its links appear.
-- [ ] T020 [P] [US1] `briefing_test.go`: uses/used-by split, caps, group
-      subject, unresolved listing, relative paths.
+- [x] T017 [P] [US1] `briefing.go`: `buildBriefing(idx, subject, direction)`
+      into `contract.Briefing` — subject, uses, used-by with the totals of
+      both, links within a group, unresolved, coverage, notes; one entry per
+      related project with every link that relates it; group subjects;
+      `relative_path` from the directory the command was started in; caps
+      with a pointer to `gitty related`. The Markdown renderer, with stable
+      headings, an explicit line for an empty side, and a note naming how
+      much of the namespace is checked out.
+- [x] T018 [P] [US1] `fetch.go`: `(*workspace).fetchProjects(ctx, paths)` —
+      looks each absent project up on the instance, refuses one that has
+      moved or has no place in the workspace, runs the existing bring-up
+      into the namespace path, returns the per-project outcome; honours
+      `exclude`; a project that is present is left as it is; never touches a
+      project that is not named.
+- [x] T044 [US1] `fetch.go`: `runFetch(ctx, opts)` — `gitty fetch
+      <project>...`: events `clone` / `skip <p> present` / `skip <p>
+      excluded` / `error`, `summary cloned=N present=N errors=N`;
+      `--format=json` prints `contract.FetchReport` (`project`, `path`,
+      `present`, `fetched`, `error`) with the events on stderr; `--dry-run`
+      prints `plan clone <path>` and writes nothing; `--jobs`, `--token`,
+      `--anon`, `--exclude`, `--accept-new-host-keys`.
+- [x] T045 [US1] `commands.go` / `agent.go`: register `fetch`;
+      `context_e2e_test.go`: `TestE2EFetch` — an absent project cloned, a
+      present one untouched (a local change survives), a sibling untouched;
+      JSON on stdout alone; `--dry-run` writes nothing; an unknown project
+      is an error for itself only; usage errors; no credential.
+- [x] T019 [US1] `related.go` / `context.go`: `ensureFresh(ctx, arg)` — build
+      the index if missing or mismatched, reread checkouts whose HEAD moved,
+      always reread the subject; `fetchForBriefing` rereads a just-fetched
+      project so its links appear.
+- [x] T020 [P] [US1] `briefing_test.go`: uses/used-by split, one entry for
+      two links to the same project, caps and their notes, group subject,
+      unresolved listing, relative paths, a subject that is excluded or
+      unknown, the rendering of every state a related project can be in.
 
 ### `gitty context`
 
-- [ ] T021 [US2] `context.go`: `runContext(ctx, opts)` — resolve the subject
-      like `ls` resolves its argument (checkout → its project; group →
-      group); `--fetch`; `--format=markdown|json`; Markdown renderer with the
-      stable headings from the plan; JSON renderer shares the MCP result type.
-- [ ] T022 [US2] `commands.go` / `agent.go`: register `context`.
-- [ ] T023 [US2] `e2e_test.go`: `TestE2EContext` — Markdown from inside a
-      checkout and from a group; `--fetch` clones the absent target and the
-      line shows `(fetched)`; without it the line names `gitty sync
-      --related`; `--format=json` round-trips.
+- [x] T021 [US2] `context.go`: `runContext(ctx, opts)` — the subject by
+      namespace path, by directory, or by where the command runs (checkout →
+      its project; group → group); `--fetch` (uses only, at most 25 per
+      run); `--format=markdown|json`; `--direction`. Exit 1 when the
+      briefing was printed but a fetch failed.
+- [x] T022 [US2] `commands.go` / `agent.go`: register `context`.
+- [x] T023 [US2] `context_e2e_test.go`: `TestE2EContext` — Markdown from
+      inside a checkout and for a group; `--fetch` clones the absent targets
+      and the lines show `(fetched)`; without it the line names `gitty fetch
+      <project>`; a second `--fetch` touches nothing and needs no instance;
+      `--format=json` decodes into `contract.Briefing` and its paths lead to
+      the projects; a failed fetch and a missing credential leave a complete
+      briefing. `TestE2EChangeDirectory`: `gitty -C <dir>`.
 
 ### `gitty-mcp` (the plugin, `cmd/gitty-mcp/`)
 

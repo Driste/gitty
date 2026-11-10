@@ -19,6 +19,12 @@ func main() {
 		return
 	}
 
+	// `gitty -C <dir> <command>` runs the command as if started in <dir>,
+	// as git's -C does. It is what lets something that cannot choose its own
+	// working directory — an agent host starting `gitty mcp`, a cron job —
+	// say which workspace it means.
+	exitOnError(changeDirectory())
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(2)
@@ -129,6 +135,48 @@ func main() {
 		})
 		stop()
 		exitOnError(err)
+	case "context":
+		fs := newFlagSet("context")
+		f := declareContextFlags(fs)
+		flagArgs, positional := splitFlagArgs(fs, os.Args[2:])
+		fs.Parse(flagArgs)
+		subject, err := singlePositional("context", "project or group", positional)
+		exitOnError(err)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err = runContext(ctx, contextOptions{
+			Subject:   subject,
+			Direction: *f.direction,
+			Format:    *f.format,
+			Fetch:     *f.fetch,
+			Token:     *f.token,
+			Anon:      *f.anon,
+			Verbose:   *f.verbose,
+			Jobs:      *f.jobs,
+
+			AcceptNewHostKeys: *f.acceptHostKeys,
+		})
+		stop()
+		exitOnError(err)
+	case "fetch":
+		fs := newFlagSet("fetch")
+		f := declareFetchFlags(fs)
+		flagArgs, positional := splitFlagArgs(fs, os.Args[2:])
+		fs.Parse(flagArgs)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err := runFetch(ctx, fetchOptions{
+			Projects: positional,
+			Format:   *f.format,
+			Token:    *f.token,
+			Anon:     *f.anon,
+			DryRun:   *f.dryRun,
+			Verbose:  *f.verbose,
+			Jobs:     *f.jobs,
+			Exclude:  f.exclude,
+
+			AcceptNewHostKeys: *f.acceptHostKeys,
+		})
+		stop()
+		exitOnError(err)
 	case "index":
 		fs := newFlagSet("index")
 		f := declareIndexFlags(fs)
@@ -182,6 +230,28 @@ func main() {
 		// Not built in: run the gitty-<command> plugin, if there is one.
 		os.Exit(runPluginCommand(os.Stderr, os.Args[1], os.Args[2:]))
 	}
+}
+
+// changeDirectory applies any leading `-C <dir>` options and removes them
+// from os.Args, so everything after sees an ordinary invocation. Several are
+// applied in order, each relative to the one before.
+func changeDirectory() error {
+	for len(os.Args) >= 2 && os.Args[1] == "-C" {
+		if len(os.Args) < 3 {
+			return usageErrf("-C needs a directory: gitty -C <dir> <command>")
+		}
+		if err := os.Chdir(os.Args[2]); err != nil {
+			return usageErrf("-C %s: %v", os.Args[2], err)
+		}
+		os.Args = append(os.Args[:1], os.Args[3:]...)
+	}
+	// Keep the logical working directory honest for anything gitty starts:
+	// a stale PWD would have a plugin's shell report the directory gitty
+	// was started in, not the one it was told to work in.
+	if wd, err := os.Getwd(); err == nil {
+		os.Setenv("PWD", wd)
+	}
+	return nil
 }
 
 // exitOnError reports a command error on stderr and exits with the taxonomy
@@ -258,7 +328,7 @@ func splitFlagArgs(fs *flag.FlagSet, args []string) (flagArgs, positional []stri
 // same table that drives dispatch and completion; plugins are whatever is
 // installed at the moment.
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "Usage: gitty <command> [flags]")
+	fmt.Fprintln(os.Stderr, "Usage: gitty [-C <dir>] <command> [flags]")
 	fmt.Fprintln(os.Stderr, "\nCommands:")
 	for _, c := range commands {
 		fmt.Fprintf(os.Stderr, "  %-11s %s\n", c.name, c.summary)

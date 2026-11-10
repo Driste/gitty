@@ -17,6 +17,8 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Excludes**: List the projects or subgroups you never want (`exclude = [...]` in the config, or `--exclude`) and every sync and listing leaves them out, reporting each skip.
 * **Orphans**: Checkouts whose project was deleted or moved upstream are reported by `sync` and `ls`; `sync --prune` moves them aside — never deletes.
 * **Shell Completion**: `gitty completion bash|zsh|fish` completes commands, flags, and group paths.
+* **Cross-Repository Context**: `gitty context` tells you — or a coding agent — which other projects a project uses and which use it, where each one is on disk, and the file and line that says so; `--fetch` clones the ones that are missing.
+* **Plugins**: `gitty <name>` runs an executable called `gitty-<name>`, the way git does.
 * **Live Namespace Only**: Projects and groups GitLab has archived are left out of `ls` and `sync` unless you ask for them with `--archived`.
 
 ---
@@ -157,6 +159,14 @@ cd ~/ws/tenant/images        && gitty sync                 # the current group: 
 cd ~/ws/tenant/images/app    && gitty sync                 # inside a checkout: still tenant/images
 cd ~/ws/tenant               && gitty sync images          # relative to the current group
 cd ~/ws/tenant/images        && gitty status               # only this subtree
+```
+
+`gitty -C <dir> <command>` runs any command as if it had been started in
+`<dir>`, as `git -C` does — for scripts, schedulers and agent hosts that
+cannot choose their own working directory:
+
+```bash
+gitty -C ~/ws/tenant/images sync
 ```
 
 ### Sync Flags
@@ -680,6 +690,100 @@ files the predefined variables that follow from where a project lives
 (`$CI_PROJECT_NAMESPACE`, `$CI_PROJECT_ROOT_NAMESPACE`, `$CI_SERVER_HOST`, …)
 are expanded; a value that still holds any other variable is left alone
 rather than guessed at.
+
+### A briefing (`gitty context`)
+
+```bash
+gitty context                # the project this directory is a checkout of
+gitty context acme/app       # a project by its path, or ../app by its directory
+gitty context --fetch        # first clone what it uses and is not here yet
+gitty context --format=json  # the same briefing as data
+```
+
+```markdown
+# acme/app — Customer-facing API
+gitlab.example.com · `.` · main · topics: go, api · docs: README.md, AGENTS.md
+
+## Uses (3)
+- **acme/ci-templates** — Pipeline templates · `../ci-templates` (fetched) · ci-include (.gitlab-ci.yml:2)
+- **acme/lib** — Shared domain types · `../lib` · depends (go.mod:12)
+- **acme/base-images** — Hardened base images · *not checked out* (`gitty fetch acme/base-images`) · depends (.gitlab-ci.yml:31)
+
+## Used by (1)
+- **acme/web** — Web frontend · `../web` · depends (package.json:21)
+
+## References that are not projects here (1)
+- acme/old-lib (go.mod:14)
+
+## Where to read next
+- acme/ci-templates: ../ci-templates/README.md
+- acme/lib: ../lib/AGENTS.md, ../lib/README.md
+
+## Notes
+- Only checked-out projects are read for links: 4 of 42 here. "Used by" may be incomplete.
+```
+
+One line per related project: what it is, **where it is on this machine**
+(relative to the directory you ran the command in), and **why it matters**
+(the kind of link and the file and line that proves it). "Where to read next"
+lists each related checkout's documentation, instructions written for agents
+first and the README last. The headings are stable, so the output can be
+searched as well as read.
+
+The briefing is the only thing on stdout. `--format=json` prints it as one
+JSON document with the same content — absolute `path` and `relative_path` for
+every project that is checked out, `links` with `kind` and `evidence`, `docs`,
+and the totals of both sides.
+
+**`--fetch`** clones the projects the subject *uses* that are not checked out
+yet, each into the directory its namespace path gives it — exactly where a
+`gitty sync` of its group would have put it — and marks them `(fetched)`. It
+only ever adds: a project that is already checked out is never pulled or
+touched, projects that merely use the subject are not fetched, and at most 25
+are cloned per run. What fetching does is reported on stderr. A fetch that
+fails leaves the project in the briefing, as not checked out, with the reason;
+the exit code is then 1.
+
+Two things the briefing is honest about. Links are found by reading
+checkouts, so **"Used by" only knows about projects that are checked out** —
+the note at the end says how much of the namespace that is. And a checkout is
+of the project's default branch, which is not necessarily the version another
+project pins: the evidence line is where to look for that.
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--fetch` | `false` | Clone the projects the subject uses that are not checked out yet. |
+| `--format` | `markdown` | `markdown` or `json`. |
+| `--direction` | `both` | `uses`, `used-by`, or `both`. The totals of both sides are always given. |
+| `--token`, `--anon` | | Needed to fetch, or when the index has to be built; otherwise the briefing needs no credential and no network. |
+| `--jobs` | `4` | Concurrent clones and checkout reads (1-16). |
+| `--accept-new-host-keys` | `false` | With `--fetch` over SSH, record unknown host keys without prompting. |
+| `--verbose` | `false` | Print each git invocation to stderr. |
+
+Run in a group's directory, or given a group, `gitty context` briefs the
+group: its projects, the links among them, and the ones that cross its edge.
+
+### Fetching a project (`gitty fetch`)
+
+```bash
+gitty fetch acme/lib acme/platform/base-images
+```
+
+```text
+clone acme/lib
+skip acme/platform/base-images present
+summary cloned=1 present=1 errors=0
+```
+
+Makes sure the named projects are checked out, cloning the ones that are not
+into their namespace paths. It is `gitty sync` narrowed to exactly what you
+name, by full path: nothing else is listed or touched, a project already
+checked out is left as it is (bringing checkouts up to date is `sync`'s job),
+the workspace's `exclude` list still applies, and a project of a namespace
+this workspace has no place for is refused rather than put somewhere
+arbitrary. `--dry-run` prints `plan clone` lines and clones nothing;
+`--format=json` prints one document on stdout (`project`, `path`, `present`,
+`fetched`, `error` per project) and sends the events to stderr.
 
 ### The index (`gitty index`)
 
