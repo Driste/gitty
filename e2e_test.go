@@ -32,6 +32,10 @@ import (
 
 var gittyBin string
 
+// e2eBinDir holds the binaries built for this test run; it is removed when
+// the run ends.
+var e2eBinDir string
+
 func TestMain(m *testing.M) {
 	code := func() int {
 		tmp, err := os.MkdirTemp("", "gitty-e2e-bin")
@@ -40,6 +44,7 @@ func TestMain(m *testing.M) {
 			return 1
 		}
 		defer os.RemoveAll(tmp)
+		e2eBinDir = tmp
 
 		gittyBin = filepath.Join(tmp, "gitty-e2e")
 		out, err := exec.Command("go", "build", "-o", gittyBin, ".").CombinedOutput()

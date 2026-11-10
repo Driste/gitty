@@ -30,7 +30,7 @@ const IndexVersion = 1
 // ScannerVersion identifies the rules links are extracted with. It is not a
 // format version: an index whose scanner is older reads fine, and gitty
 // rescans its checkouts so that links found by newer rules appear.
-const ScannerVersion = 1
+const ScannerVersion = 2
 
 // Supported reports whether a document of the given version can be read by
 // code built against this package, and if not, an error naming both sides —

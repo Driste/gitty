@@ -1,5 +1,7 @@
-# Builds gitty for every supported platform and publishes the binaries, with a
-# SHA256SUMS checksum file, to a GitHub Release.
+# Builds gitty and its MCP plugin, gitty-mcp, for every supported platform and
+# publishes the binaries, with a SHA256SUMS checksum file, to a GitHub Release.
+# The two are built from the same tag and published together, so the pair a
+# user downloads always agrees on the formats they exchange.
 #
 # Runs for both ways a release gets made:
 #   - pushing a version tag (v1.2.3 or bare 1.2.3), which creates the release
@@ -120,6 +122,15 @@ jobs:
               go build -trimpath \
                 -ldflags="-s -w -X main.version=${VERSION}" \
                 -o "dist/${output}${ext}" .
+
+            # The MCP plugin: a separate binary, never required by gitty,
+            # stamped with the same version.
+            plugin="gitty-mcp_${VERSION}_${os}_${arch}"
+            echo "Building ${plugin}${ext}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath \
+                -ldflags="-s -w -X main.version=${VERSION}" \
+                -o "dist/${plugin}${ext}" ./cmd/gitty-mcp
           done
 
       - name: Smoke test the built binary
@@ -136,12 +147,26 @@ jobs:
           fi
           # The binary must also be able to do its job, not just report a version.
           "$binary" agent schema > /dev/null
+
+          # The plugin, installed the way the README says: renamed, next to
+          # gitty. `gitty mcp` must find it there and run it.
+          installed="$(mktemp -d)"
+          cp "$binary" "$installed/gitty"
+          cp "dist/gitty-mcp_${VERSION}_linux_amd64" "$installed/gitty-mcp"
+          got="$("$installed/gitty" mcp --version)"
+          echo "gitty mcp --version -> $got"
+          if [ "$got" != "$VERSION" ]; then
+            echo "plugin version mismatch: 'gitty mcp --version' reports '$got', expected '$VERSION'"
+            exit 1
+          fi
+          "$installed/gitty" agent schema | grep -q '"gitty_context"' \
+            || { echo "agent schema does not list the installed plugin's tools"; exit 1; }
           echo "smoke test passed"
 
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum gitty_* > SHA256SUMS
+          sha256sum gitty_* gitty-mcp_* > SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish release assets
@@ -151,11 +176,11 @@ jobs:
         run: |
           if gh release view "$VERSION" > /dev/null 2>&1; then
             echo "Release $VERSION exists; uploading assets"
-            gh release upload "$VERSION" dist/gitty_* dist/SHA256SUMS --clobber
+            gh release upload "$VERSION" dist/gitty_* dist/gitty-mcp_* dist/SHA256SUMS --clobber
           else
             echo "Creating release $VERSION"
             gh release create "$VERSION" \
               --title "$VERSION" \
               --generate-notes \
-              dist/gitty_* dist/SHA256SUMS
+              dist/gitty_* dist/gitty-mcp_* dist/SHA256SUMS
           fi

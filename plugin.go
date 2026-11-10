@@ -85,17 +85,35 @@ func findPlugin(name, exe string) (string, bool) {
 	}
 	bin := pluginPrefix + name
 	for _, dir := range pluginDirs(exe) {
-		if p, err := exec.LookPath(filepath.Join(dir, bin)); err == nil {
+		if p, err := exec.LookPath(filepath.Join(dir, bin)); err == nil && !isSameFile(p, exe) {
 			return p, true
 		}
 	}
-	if p, err := exec.LookPath(bin); err == nil {
+	if p, err := exec.LookPath(bin); err == nil && !isSameFile(p, exe) {
 		if abs, err := filepath.Abs(p); err == nil {
 			p = abs
 		}
 		return p, true
 	}
 	return "", false
+}
+
+// isSameFile reports whether two paths are the same file. A gitty binary
+// kept under a name like gitty-dev is not a plugin of itself: running it as
+// one would start gitty again, with the same arguments, for ever.
+func isSameFile(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
 }
 
 // plugin is one installed plugin: the command it adds and the file behind it.

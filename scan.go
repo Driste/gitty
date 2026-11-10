@@ -195,9 +195,10 @@ type collector struct {
 
 	links      map[string]contract.Link
 	unresolved map[string]contract.Unresolved
-	// claimed records, per file line, the targets a specific extractor has
-	// already accounted for, so the general URL scan does not report the
-	// same reference a second time under a vaguer kind.
+	// claimed records the file lines a specific extractor has already
+	// accounted for, so the general URL scan does not report the same
+	// reference a second time under a vaguer kind — or, for a reference
+	// that resolves to nothing, a second time under a longer path.
 	claimed map[string]bool
 }
 
@@ -211,8 +212,8 @@ func newCollector(from string, r *resolver) *collector {
 	}
 }
 
-func (c *collector) claimKey(line int, target string) string {
-	return fmt.Sprintf("%s:%d:%s", c.file, line, strings.ToLower(target))
+func (c *collector) claimKey(line int) string {
+	return fmt.Sprintf("%s:%d", c.file, line)
 }
 
 // add records what a candidate turned out to be: a link, an unresolved
@@ -221,7 +222,7 @@ func (c *collector) add(kind string, x ref, line int) {
 	evidence := fmt.Sprintf("%s:%d", c.file, line)
 	switch {
 	case x.resolved():
-		c.claimed[c.claimKey(line, x.Project)] = true
+		c.claimed[c.claimKey(line)] = true
 		if x.Project == c.from {
 			return
 		}
@@ -230,7 +231,7 @@ func (c *collector) add(kind string, x ref, line int) {
 			c.links[key] = contract.Link{From: c.from, To: x.Project, Kind: kind, Evidence: evidence}
 		}
 	case x.unresolved():
-		c.claimed[c.claimKey(line, x.Path)] = true
+		c.claimed[c.claimKey(line)] = true
 		key := strings.ToLower(x.Path)
 		if _, seen := c.unresolved[key]; !seen {
 			c.unresolved[key] = contract.Unresolved{From: c.from, Ref: x.Path, Kind: kind, Evidence: evidence}
@@ -288,15 +289,16 @@ func (c *collector) scanTokens(lines []string, vars map[string]string) {
 }
 
 func (c *collector) scanTokensLine(line string, lineNo int) {
+	if c.claimed[c.claimKey(lineNo)] {
+		return // a more specific extractor has read this line
+	}
+	// Decide first, record after: recording claims the line, and a line may
+	// name more than one project.
+	var found []ref
 	for _, tok := range c.r.tokens(line) {
-		x := c.r.resolveToken(tok)
-		target := x.Project
-		if target == "" {
-			target = x.Path
-		}
-		if target == "" || c.claimed[c.claimKey(lineNo, target)] {
-			continue
-		}
+		found = append(found, c.r.resolveToken(tok))
+	}
+	for _, x := range found {
 		c.add(contract.KindDepends, x, lineNo)
 	}
 }

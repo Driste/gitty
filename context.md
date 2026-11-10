@@ -246,6 +246,84 @@ with `{"path": "tenant/images", "nested": true}` becomes:
 gitty sync --path=tenant/images --nested
 ```
 
+### Cross-repository context — what else matters to a project
+
+gitty knows which projects of the instance refer to which: it reads the
+checkouts it manages for references (CI `include:`/`trigger:`/`component:`,
+dependencies named in package manifests, clone URLs in CI scripts, forks) and
+keeps them in an index at `<workspace>/.gitty/index.json`. Use this before
+changing a project, to find the code it depends on and the code that depends
+on it.
+
+```bash
+gitty context                      # brief the project this directory is a checkout of
+gitty context acme/app --fetch     # ...first cloning what it uses and is not here yet
+gitty context --format=json        # the same briefing as one JSON document
+gitty related acme/lib             # just the links, as greppable lines
+gitty fetch acme/lib acme/tools    # make sure these projects are checked out
+gitty index                        # refresh project metadata from the instance
+```
+
+`gitty context --format=json` prints (abridged):
+
+```json
+{
+  "schema": 1,
+  "workspace": "/ws",
+  "subject": { "kind": "project", "project": "acme/app", "present": true, "path": "/ws/acme/app", "relative_path": "." },
+  "uses": [
+    {
+      "project": "acme/lib",
+      "description": "Shared domain types",
+      "present": true, "fetched": false,
+      "path": "/ws/acme/lib", "relative_path": "../lib",
+      "links": [ { "from": "acme/app", "to": "acme/lib", "kind": "depends", "evidence": "go.mod:12" } ],
+      "docs": ["AGENTS.md", "README.md"]
+    },
+    {
+      "project": "acme/base-images",
+      "present": false,
+      "fetch_command": "gitty fetch acme/base-images",
+      "links": [ { "from": "acme/app", "to": "acme/base-images", "kind": "ci-include", "evidence": ".gitlab-ci.yml:3" } ]
+    }
+  ],
+  "used_by": [ { "project": "acme/web", "present": true, "path": "/ws/acme/web", "links": [ { "from": "acme/web", "to": "acme/app", "kind": "depends", "evidence": "package.json:21" } ] } ],
+  "uses_total": 2, "used_by_total": 1,
+  "unresolved": [ { "from": "acme/app", "ref": "acme/old-lib", "kind": "depends", "evidence": "go.mod:14" } ],
+  "coverage": { "projects": 42, "checked_out": 4 }
+}
+```
+
+How to read it:
+
+- `path` is absolute and exists whenever `present` is true. `evidence` is
+  `file:line` inside the project named by the link's `from` — the subject for
+  `uses`, the other project for `used_by` — or `api:<field>`.
+- Link kinds: `depends`, `ci-include`, `ci-trigger`, `ci-component`, `image`,
+  `submodule`, `fork`, `mentions`.
+- **`used_by` is only as complete as the workspace.** Links are found by
+  reading checkouts; `coverage` says how many of the known projects are
+  checked out. Do not conclude "nothing else uses this" from an empty
+  `used_by` when `checked_out` is far below `projects`.
+- `unresolved` are references that point at the instance but match no known
+  project (moved, deleted, private, or outside the workspace's part of the
+  namespace). They are never guessed at.
+- A checkout is of the project's default branch, which is not necessarily the
+  version another project pins. The evidence line shows what is pinned.
+- `--fetch` only clones. A project that is present is never pulled or
+  modified. Exit code 1 with a briefing on stdout means a fetch failed; the
+  entry has `fetch_error`.
+- With an index in place `context` and `related` need no network and no
+  token. Building the index, and fetching, need `--token`/`GITLAB_TOKEN` or
+  `--anon`.
+
+If you are connected to gitty's MCP server (`gitty mcp`, a separate plugin
+binary `gitty-mcp`), the same things are tools: `gitty_context` (fetches by
+default), `gitty_related`, `gitty_projects`, `gitty_fetch`, `gitty_search`
+(git grep across the checkouts) and `gitty_read` (a tracked file from a
+checkout). Pass `project` as a namespace path or as the absolute path of your
+working directory.
+
 ## Typical agent workflow
 
 1. Run `gitty agent schema` to discover the available commands and arguments.
@@ -259,6 +337,9 @@ gitty sync --path=tenant/images --nested
    `--dry-run` first to preview the actions.
 6. Run `gitty status` afterwards (or later) to see which checkouts are dirty or
    behind; add `--fetch` for remote-accurate `behind` counts.
+7. Before changing a project, run `gitty context --format=json` in its
+   checkout (add `--fetch` to clone the projects it uses) and read the related
+   projects at the paths it returns.
 
 ## CI/CD example (GitLab)
 

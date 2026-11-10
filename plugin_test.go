@@ -109,6 +109,31 @@ func TestFindPlugin(t *testing.T) {
 			t.Errorf("findPlugin(here) = %q: picked a plugin up from the working directory", got)
 		}
 	})
+	t.Run("a gitty binary is never its own plugin", func(t *testing.T) {
+		// Someone keeps a second build around as gitty-dev, or links it.
+		dev := writeStub(t, beside, "gitty-dev", "exit 0")
+		if got, ok := findPlugin("dev", dev); ok {
+			t.Errorf("findPlugin(dev) from gitty-dev itself = %q: it would run itself", got)
+		}
+		link := filepath.Join(onPath, "gitty-linked")
+		if err := os.Symlink(dev, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		t.Setenv("PATH", onPath)
+		if got, ok := findPlugin("linked", dev); ok {
+			t.Errorf("findPlugin(linked) = %q: a link to the running binary is still the running binary", got)
+		}
+		// Seen from another gitty, it is a plugin like any other.
+		if got, ok := findPlugin("dev", exe); !ok || got != dev {
+			t.Errorf("findPlugin(dev) from another gitty = %q, %v", got, ok)
+		}
+		for _, p := range installedPlugins(dev) {
+			if p.Name == "dev" || p.Name == "linked" {
+				t.Errorf("installedPlugins lists the running binary as plugin %q", p.Name)
+			}
+		}
+	})
+
 	t.Run("a symlinked gitty finds plugins beside its target", func(t *testing.T) {
 		linkDir := filepath.Join(root, "links")
 		if err := os.MkdirAll(linkDir, 0o755); err != nil {

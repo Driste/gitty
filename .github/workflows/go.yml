@@ -68,8 +68,10 @@ jobs:
         go-version-file: go.mod
         cache: true
 
-    - name: Build gitty
-      run: go build -o gitty .
+    - name: Build gitty and its MCP plugin
+      run: |
+        go build -o gitty .
+        go build -o gitty-mcp ./cmd/gitty-mcp
 
     - name: Sync a small public GitLab group
       env:
@@ -78,3 +80,9 @@ jobs:
         GITLAB_TOKEN: ""
         CI_JOB_TOKEN: ""
       run: ./scripts/integration-test.sh
+
+    - name: Serve a real project's context over MCP
+      env:
+        GITLAB_TOKEN: ""
+        CI_JOB_TOKEN: ""
+      run: ./scripts/mcp-smoke.sh

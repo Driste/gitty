@@ -160,6 +160,11 @@ func TestScanCIShapes(t *testing.T) {
 			want: "",
 		},
 		{
+			name: "one reference on one line is reported once",
+			text: "include:\n  - component: gitlab.example.com/acme/components/sast@1.0\n  - remote: https://gitlab.example.com/acme/lib/-/raw/main/a.yml\n",
+			want: "ci-component acme/components ci.gitlab-ci.yml:2\nci-include acme/lib ci.gitlab-ci.yml:3",
+		},
+		{
 			name: "the same target in two ways is two links",
 			text: "include:\n  - project: acme/lib\n    file: a.yml\nx:\n  trigger:\n    project: acme/lib\n",
 			want: "ci-include acme/lib ci.gitlab-ci.yml:2\nci-trigger acme/lib ci.gitlab-ci.yml:6",
@@ -223,6 +228,22 @@ func TestScanManifests(t *testing.T) {
 				t.Errorf("unresolved:\n%s\n--- want:\n%s", got, tt.unre)
 			}
 		})
+	}
+}
+
+// A reference that resolves to nothing is reported once, as the project it
+// names — not a second time as the longer path it was written with.
+func TestScanCIUnresolvedOnce(t *testing.T) {
+	r := testResolver(t, "https://gitlab.example.com")
+	text := "include:\n  - component: $CI_SERVER_FQDN/catalog/sast/scan@1.0\n  - project: acme/missing\n    file: a.yml\n" +
+		"job:\n  script:\n    - git clone https://gitlab.example.com/acme/a.git && git clone https://gitlab.example.com/acme/b.git\n"
+	links, unresolved := scanLines(t, r, ".gitlab-ci.yml", text)
+	if len(links) != 0 {
+		t.Errorf("links: %s", linkSet(links))
+	}
+	want := "depends acme/a .gitlab-ci.yml:7\ndepends acme/b .gitlab-ci.yml:7\nci-include acme/missing .gitlab-ci.yml:3\nci-component catalog/sast .gitlab-ci.yml:2"
+	if got := unresolvedSet(unresolved); got != want {
+		t.Errorf("unresolved:\n%s\n--- want:\n%s", got, want)
 	}
 }
 

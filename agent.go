@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"sort"
+	"time"
 )
 
 // This file implements the `gitty agent schema` command. It emits a machine
@@ -19,6 +23,31 @@ type AgentSchema struct {
 	Description string            `json:"description"`
 	ExitCodes   map[string]string `json:"exitCodes,omitempty"`
 	Tools       []AgentTool       `json:"tools"`
+	// Plugins are the commands provided by gitty-<name> executables rather
+	// than by gitty itself: the ones installed on this machine, and the ones
+	// gitty's releases publish whether or not they are installed.
+	Plugins []AgentPlugin `json:"plugins,omitempty"`
+}
+
+// AgentPlugin describes one plugin command.
+type AgentPlugin struct {
+	Name        string `json:"name"` // run as `gitty <name>`
+	Installed   bool   `json:"installed"`
+	Path        string `json:"path,omitempty"`
+	Description string `json:"description,omitempty"`
+	// Install says how to get a plugin that is published but not installed.
+	Install string `json:"install,omitempty"`
+	// Command is the argv that starts it.
+	Command []string `json:"command"`
+	// Tools are what an MCP server plugin offers once it is running. They
+	// are called over the Model Context Protocol, not on a command line.
+	Tools []AgentPluginTool `json:"tools,omitempty"`
+}
+
+// AgentPluginTool is one tool served by a plugin.
+type AgentPluginTool struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 // AgentTool describes a single invokable gitty command in MCP "tool" form.
@@ -565,6 +594,8 @@ func buildAgentSchema() AgentSchema {
 // runAgentSchema prints the gitty agent schema as indented JSON to stdout.
 func runAgentSchema() {
 	schema := buildAgentSchema()
+	exe, _ := os.Executable()
+	schema.Plugins = describePlugins(exe)
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	// Keep '<' and '>' literal so the flag-style hints stay readable.
@@ -572,6 +603,57 @@ func runAgentSchema() {
 	if err := enc.Encode(schema); err != nil {
 		log.Fatalf("Failed to render agent schema: %v", err)
 	}
+}
+
+// describePlugins lists the plugin commands for the agent schema.
+//
+// A plugin gitty's own releases publish is asked what it serves (it prints
+// that with --describe); any other installed plugin is listed by name and
+// path only — gitty does not run a program it knows nothing about just to
+// describe it.
+func describePlugins(exe string) []AgentPlugin {
+	var out []AgentPlugin
+	seen := map[string]bool{}
+	for _, p := range installedPlugins(exe) {
+		seen[p.Name] = true
+		entry := AgentPlugin{Name: p.Name, Installed: true, Path: p.Path, Command: []string{"gitty", p.Name}}
+		if what, known := knownPlugins[p.Name]; known {
+			entry.Description = what
+			entry.Tools = pluginTools(p.Path)
+		}
+		out = append(out, entry)
+	}
+	for name, what := range knownPlugins {
+		if seen[name] {
+			continue
+		}
+		out = append(out, AgentPlugin{
+			Name:        name,
+			Description: what,
+			Install:     "not installed: download " + pluginPrefix + name + " from " + releasesURL + " and put it next to gitty, or anywhere on PATH",
+			Command:     []string{"gitty", name},
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// pluginTools asks a published plugin for the tools it serves. A plugin that
+// does not answer promptly, or not in the expected form, is listed without.
+func pluginTools(path string) []AgentPluginTool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "--describe").Output()
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Tools []AgentPluginTool `json:"tools"`
+	}
+	if json.Unmarshal(out, &doc) != nil {
+		return nil
+	}
+	return doc.Tools
 }
 
 // runAgent dispatches the `gitty agent <subcommand>` family.

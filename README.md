@@ -763,6 +763,101 @@ project pins: the evidence line is where to look for that.
 Run in a group's directory, or given a group, `gitty context` briefs the
 group: its projects, the links among them, and the ones that cross its edge.
 
+### For coding agents: the MCP server (`gitty mcp`)
+
+A coding agent working in one checkout sees one repository. `gitty mcp` is a
+[Model Context Protocol](https://modelcontextprotocol.io) server that lets it
+ask gitty the question above and get the answer in a form it can act on: for
+each related project, **the path to it on this machine** — cloned into place
+first if it was not there — **and the reason it matters**.
+
+It is a plugin, in a binary of its own, so a gitty that never serves an agent
+does not carry it. Every release publishes it next to gitty:
+
+```bash
+chmod +x gitty-mcp_v1.0.0_linux_amd64
+sudo mv gitty-mcp_v1.0.0_linux_amd64 /usr/local/bin/gitty-mcp   # next to gitty, or anywhere on PATH
+
+gitty mcp --version     # the plugin's version: the same tag as gitty's
+```
+
+Building from source: `go build -o gitty-mcp ./cmd/gitty-mcp`.
+
+**Registering it.** The server speaks MCP over stdin and stdout, and is
+started by whatever hosts the agent. A host needs three things: the command,
+its arguments, and — unless the instance is public — a token in the
+environment. Most hosts take them in a shape like this (where the file lives
+differs from host to host):
+
+```json
+{
+  "mcpServers": {
+    "gitty": {
+      "command": "gitty",
+      "args": ["-C", "/path/to/workspace/acme/app", "mcp"],
+      "env": { "GITLAB_TOKEN": "glpat-..." }
+    }
+  }
+}
+```
+
+The directory the server starts in decides which project a tool call is about
+when it does not name one. A host that starts its servers in the project the
+agent is working in needs only `["mcp"]`; for any other, `-C` says which
+directory is meant. Every tool also takes a `project` — a namespace path, or
+the absolute path of any directory in the workspace — so an agent can always
+name its own working directory.
+
+**The tools.**
+
+| Tool | What it answers |
+| :--- | :--- |
+| `gitty_context` | What a project uses and what uses it: each related project's description, absolute `path`, the `links` that relate them (`kind` and `evidence`), and its documentation files. Clones the projects it *uses* that are not checked out, so the paths exist when the call returns. |
+| `gitty_related` | The links only, in both directions. Never clones. |
+| `gitty_projects` | Finds projects of the instance by words in their path, description or topics, checked out or not. |
+| `gitty_fetch` | Makes sure the named projects are checked out, and returns their paths. |
+| `gitty_search` | Searches the tracked files of the checkouts (`git grep`): who calls a function, which pipelines include a template. |
+| `gitty_read` | Reads a tracked file from a checkout, whole or by line range — for agents that cannot open a sibling project's path themselves. |
+
+**What it will and will not do.**
+
+* *It clones, and nothing else.* Fetching is on by default because the point
+  is a path that exists. A project that is already checked out is never
+  pulled, reset or otherwise touched, and only the projects a subject *uses*
+  are fetched (at most 25 per call). Start it with **`--no-fetch`** for a
+  server that changes nothing at all: `gitty_fetch` is then not offered, and
+  projects that are not checked out are reported as absent, with the command
+  that would fetch them.
+* *It writes nothing inside a repository*, and nothing specific to any agent
+  or vendor. Its only files are the clones, where a `gitty sync` would have
+  put them, and the index beside the workspace config.
+* *It never handles a credential.* The server is thin: it runs `gitty context
+  --format=json`, `gitty fetch` and `gitty index`, and gitty resolves a token
+  from its environment the way it does on a command line. Nothing it returns
+  contains one. `--anon` makes it reach a public instance without a token.
+* *`gitty_read` reads tracked files only.* Not a path outside the checkout,
+  not through a symlink that leaves it, not an untracked file (a `.env`
+  someone left lying there), not anything under `.git`.
+* *"Used by" only knows what is checked out.* Every answer carries
+  `coverage` — how many of the namespace's projects are checked out and have
+  been read — so an agent weighing the impact of a change can tell a
+  complete list from a partial one.
+* *stdout is protocol and nothing else*; gitty's own account of what it did
+  (`clone acme/lib`) goes to stderr, where the host keeps server logs.
+
+| Flag | Description |
+| :--- | :--- |
+| `--no-fetch` | Read-only: never clone. |
+| `--anon` | Reach the instance anonymously (public projects only). |
+| `--jobs` | Concurrent clones and checkout reads gitty may use (1-16). |
+| `--version` | Print the plugin's version. |
+| `--describe` | Print the tools it offers, as JSON (this is what `gitty agent schema` shows under `plugins`). |
+
+The server answers protocol revisions 2024-11-05 through 2025-11-25, and
+offers the newest of those to a client that asks for anything else. Tool
+calls run concurrently and can be cancelled; a cancelled clone is left
+resumable, as an interrupted `gitty sync` leaves it.
+
 ### Fetching a project (`gitty fetch`)
 
 ```bash
@@ -871,7 +966,11 @@ a plugin is installed by putting a file in either place, and removed by
 deleting it. gitty ships none and needs none. The current directory is never
 searched, and a plugin can add a command but never replace a built-in one
 (`gitty-sync` on your `PATH` is ignored). `gitty` with no arguments lists the
-plugins it can see.
+plugins it can see, and `gitty agent schema` lists them under `plugins`. A
+`gitty` binary kept under a name like `gitty-dev` is never run as a plugin of
+itself.
+
+gitty's releases publish one plugin, [`gitty-mcp`](#for-coding-agents-the-mcp-server-gitty-mcp).
 
 The plugin starts in the directory you ran `gitty` in, with your stdin,
 stdout, stderr and environment; its exit code is the command's. On Linux and
