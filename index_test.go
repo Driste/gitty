@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -280,6 +281,7 @@ func TestApplyListing(t *testing.T) {
 	idx.Projects["acme/gone"] = &contract.Project{ID: 2, Description: "deleted upstream", Local: gone}
 	idx.Projects["acme/unlisted"] = &contract.Project{ID: 3} // never checked out, no longer listed
 
+	idx.Projects["other/tool"] = &contract.Project{ID: 70, Description: "found by asking for it"} // outside what is listed
 	applyListing(idx, cfg, []*gitlab.Project{
 		{
 			ID: 1, PathWithNamespace: "acme/app", Description: "  new words \n", DefaultBranch: "main",
@@ -290,7 +292,14 @@ func TestApplyListing(t *testing.T) {
 		},
 		{ID: 9, PathWithNamespace: "acme/new", WebURL: "https://gitlab.external.example/acme/new"},
 		nil,
-	})
+	}, []string{"acme"})
+	// A listing of acme says nothing about a project of another namespace.
+	if p := idx.Projects["other/tool"]; p == nil || p.ID != 70 || p.Description == "" {
+		t.Errorf("other/tool = %+v, want it left as it was", p)
+	}
+	if strings.Join(idx.Namespaces, ",") != "acme" {
+		t.Errorf("namespaces = %v", idx.Namespaces)
+	}
 
 	app := idx.Projects["acme/app"]
 	if app.Description != "new words" || !app.Archived || app.ForkedFrom != "acme/upstream" || app.Local != kept {
@@ -554,5 +563,196 @@ func TestNormalExcludes(t *testing.T) {
 	}
 	if normalExcludes(nil) != nil {
 		t.Error("no patterns should stay nil, so an index without excludes omits the field")
+	}
+}
+
+// TestLookUpRefs: a workspace lists the groups it holds, so a project in any
+// other group is invisible to the listing however real it is. References to
+// such projects are settled by asking the instance for each: found, it
+// becomes a link and a project of the index; moved, the move is recorded;
+// absent, that is remembered and not asked again.
+func TestLookUpRefs(t *testing.T) {
+	// A workspace anchored at the instance's top level, holding one group.
+	cfg := &Config{URL: "https://gitlab.example.com"}
+	var asked []string
+	projects := map[string][]*gitlab.Project{
+		"acme":   {{ID: 1, PathWithNamespace: "acme/app"}},
+		"shared": {{ID: 20, PathWithNamespace: "shared/ci-templates", Description: "Templates"}, {ID: 21, PathWithNamespace: "shared/lib"}},
+		"new":    {{ID: 30, PathWithNamespace: "new/name", Description: "Renamed"}},
+		"vendor": {{ID: 40, PathWithNamespace: "vendor/thing"}},
+	}
+	src := fakeSource{projects: projects, moved: map[string]string{"old/name": "new/name"}, lookups: &asked}
+	cfg.Exclude = []string{"vendor"}
+	w, _, _ := newTestWorkspace(t, cfg, src)
+	writeTree(t, filepath.Join(w.Root, "acme", "app"), map[string]string{
+		".gitlab-ci.yml": "include:\n  - project: shared/ci-templates\n    file: a.yml\n  - project: shared/missing\n    file: b.yml\n",
+		"go.mod": "module gitlab.example.com/acme/app\n\nrequire (\n" +
+			"\tgitlab.example.com/shared/lib/v2 v2.0.0\n" + // a module path: the project is its prefix
+			"\tgitlab.example.com/old/name v1.0.0\n" + // moved since
+			"\tgitlab.example.com/shared/nope/sub v1.0.0\n" + // nothing there
+			"\tgitlab.example.com/vendor/thing v1.0.0\n" + // excluded
+			")\n",
+	})
+	ctx := context.Background()
+	var events []string
+	record := func(ev indexEvent) {
+		switch ev.Kind {
+		case "link":
+			events = append(events, "link "+ev.Link.Kind+" "+ev.Link.To+" "+ev.Link.Evidence)
+		case "unresolved":
+			events = append(events, "unresolved "+ev.Unres.Ref+" "+ev.Unres.Evidence)
+		}
+	}
+
+	idx, _, err := w.refreshIndex(ctx, refreshOptions{List: true, Report: record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLinks := strings.Join([]string{
+		"depends new/name go.mod:5",
+		"ci-include shared/ci-templates .gitlab-ci.yml:2",
+		"depends shared/lib go.mod:4",
+	}, "\n")
+	if got := linkSet(idx.Links); got != wantLinks {
+		t.Errorf("links:\n%s\n--- want:\n%s", got, wantLinks)
+	}
+	wantUnresolved := "ci-include shared/missing .gitlab-ci.yml:4\ndepends shared/nope/sub go.mod:6"
+	if got := unresolvedSet(idx.Unresolved); got != wantUnresolved {
+		t.Errorf("unresolved:\n%s\n--- want:\n%s", got, wantUnresolved)
+	}
+	// What a refresh reports is what the index ends up saying.
+	wantEvents := strings.Join([]string{
+		"link depends new/name go.mod:5",
+		"link ci-include shared/ci-templates .gitlab-ci.yml:2",
+		"link depends shared/lib go.mod:4",
+		"unresolved shared/missing .gitlab-ci.yml:4",
+		"unresolved shared/nope/sub go.mod:6",
+	}, "\n")
+	if got := strings.Join(events, "\n"); got != wantEvents {
+		t.Errorf("events:\n%s\n--- want:\n%s", got, wantEvents)
+	}
+	if p := idx.Projects["shared/ci-templates"]; p == nil || p.ID != 20 || p.Description != "Templates" {
+		t.Errorf("shared/ci-templates = %+v, want it added with its metadata", p)
+	}
+	if idx.Moved["old/name"] != "new/name" || idx.Projects["new/name"] == nil {
+		t.Errorf("moved = %v", idx.Moved)
+	}
+	if got := strings.Join(idx.NotFound, ","); got != "shared/missing,shared/nope/sub" {
+		t.Errorf("not found = %q", got)
+	}
+	if strings.Join(idx.Namespaces, ",") != "acme" {
+		t.Errorf("namespaces = %v", idx.Namespaces)
+	}
+	// An excluded project is not even asked about.
+	for _, p := range asked {
+		if strings.HasPrefix(p, "vendor") {
+			t.Errorf("the instance was asked about excluded %s", p)
+		}
+	}
+	// A bare project path is asked for as written; a module path, and then
+	// its prefixes down to a namespace and a name.
+	askedSet := strings.Join(sortedCopy(asked), " ")
+	for _, want := range []string{"shared/missing", "shared/nope/sub", "shared/nope", "shared/lib/v2", "shared/lib", "old/name"} {
+		if !strings.Contains(" "+askedSet+" ", " "+want+" ") {
+			t.Errorf("the instance was not asked about %s (asked: %s)", want, askedSet)
+		}
+	}
+	if strings.Contains(" "+askedSet+" ", " shared ") {
+		t.Errorf("a bare namespace is not a project and should not be asked for (asked: %s)", askedSet)
+	}
+
+	t.Run("what was learned needs no instance afterwards", func(t *testing.T) {
+		asked = nil
+		w.s.src = fakeSource{projErr: context.DeadlineExceeded, lookupErr: context.DeadlineExceeded, lookups: &asked}
+		// Reread the checkout: the stale path resolves through the recorded
+		// move, and the path found empty is not asked about again.
+		idx, stats, err := w.refreshIndex(ctx, refreshOptions{Rescan: map[string]bool{"acme/app": true}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := linkSet(idx.Links); got != wantLinks || stats.Written {
+			t.Errorf("offline reread: written=%v, links:\n%s", stats.Written, got)
+		}
+		if len(asked) != 0 {
+			t.Errorf("the instance was asked about %v", asked)
+		}
+	})
+
+	t.Run("only an explicit refresh asks again", func(t *testing.T) {
+		// The missing project has been created; the moved one deleted.
+		grown := map[string][]*gitlab.Project{
+			"acme":   projects["acme"],
+			"shared": append(projects["shared"], &gitlab.Project{ID: 22, PathWithNamespace: "shared/missing"}),
+		}
+		asked = nil
+		w.s.src = fakeSource{projects: grown, lookups: &asked}
+
+		// Asked for a briefing-style top-up: the path found empty is not
+		// asked about again, so nothing changes.
+		if changed, err := w.settleRefs(ctx, idx, nil, 10); err != nil || changed || len(asked) != 0 {
+			t.Errorf("a top-up asked again: changed=%v err=%v asked=%v", changed, err, asked)
+		}
+
+		idx, _, err := w.refreshIndex(ctx, refreshOptions{List: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "ci-include shared/ci-templates .gitlab-ci.yml:2\ndepends shared/lib go.mod:4\nci-include shared/missing .gitlab-ci.yml:4"
+		if got := linkSet(idx.Links); got != want {
+			t.Errorf("after an explicit refresh:\n%s\n--- want:\n%s", got, want)
+		}
+		// The deleted project is gone from the index, and the reference to
+		// it is back to being unresolved, under the path it was written with
+		// or the one it led to.
+		if _, still := idx.Projects["new/name"]; still {
+			t.Error("a project deleted upstream stayed in the index")
+		}
+		if got := unresolvedSet(idx.Unresolved); !strings.Contains(got, "/name go.mod:5") || !strings.Contains(got, "shared/nope/sub") {
+			t.Errorf("unresolved after an explicit refresh:\n%s", got)
+		}
+	})
+
+	t.Run("an instance that stops answering does not spoil the refresh", func(t *testing.T) {
+		if err := os.Remove(indexPath(w.Root)); err != nil {
+			t.Fatal(err)
+		}
+		asked = nil
+		w.s.src = fakeSource{projects: projects, lookupErr: context.DeadlineExceeded, lookups: &asked}
+		idx, _, err := w.refreshIndex(ctx, refreshOptions{List: true})
+		if err != nil {
+			t.Fatalf("the listing worked; failing lookups must not fail the refresh: %v", err)
+		}
+		if len(idx.Links) != 0 || len(idx.NotFound) != 0 || len(idx.Unresolved) != 5 {
+			t.Errorf("links %d, not found %v, unresolved %d; want nothing concluded from no answer", len(idx.Links), idx.NotFound, len(idx.Unresolved))
+		}
+		// It gave up after the first failures rather than trying every path.
+		if len(asked) > listConcurrency {
+			t.Errorf("kept asking an instance that does not answer: %d lookups", len(asked))
+		}
+	})
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func TestRefCandidates(t *testing.T) {
+	for _, tt := range []struct {
+		kind, ref, want string
+	}{
+		{contract.KindCIInclude, "a/b/c", "a/b/c"},
+		{contract.KindCITrigger, "/a/b/", "a/b"},
+		{contract.KindFork, "a/b", "a/b"},
+		{contract.KindDepends, "a/b", "a/b"},
+		{contract.KindDepends, "a/b/c/d", "a/b/c/d a/b/c a/b"},
+		{contract.KindCIComponent, "a/b/c", "a/b/c a/b"},
+		{contract.KindDepends, "a/b/c/d/e/f/g/h/i", "a/b/c/d/e/f/g/h/i a/b/c/d/e/f/g/h a/b/c/d/e/f/g a/b/c/d/e/f a/b/c/d/e a/b/c/d"},
+	} {
+		got := strings.Join(refCandidates(contract.Unresolved{Ref: tt.ref, Kind: tt.kind}), " ")
+		if got != tt.want {
+			t.Errorf("refCandidates(%s %s) = %q, want %q", tt.kind, tt.ref, got, tt.want)
+		}
 	}
 }

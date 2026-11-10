@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -44,7 +45,10 @@ type gitlabSource interface {
 	NamespaceProjects(ctx context.Context, target string) ([]*gitlab.Project, error)
 	// Project returns the single project with the given namespace path, in
 	// GitLab's full representation: what a listing trims away (the fork
-	// origin, the container registry prefix) is here.
+	// origin, the container registry prefix) is here. When there is none it
+	// returns an error wrapping errProjectNotFound. GitLab answers for a
+	// path a project used to have, so the project returned may carry a
+	// different path than the one asked for.
 	Project(ctx context.Context, path string) (*gitlab.Project, error)
 }
 
@@ -1526,6 +1530,9 @@ func (s gitlabClientSource) NamespaceProjects(ctx context.Context, target string
 
 func (s gitlabClientSource) Project(ctx context.Context, path string) (*gitlab.Project, error) {
 	p, _, err := s.client.Projects.GetProject(path, nil, gitlab.WithContext(ctx))
+	if errors.Is(err, gitlab.ErrNotFound) {
+		return nil, fmt.Errorf("%s: %w", path, errProjectNotFound)
+	}
 	return p, err
 }
 

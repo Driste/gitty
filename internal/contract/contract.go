@@ -77,6 +77,19 @@ type Index struct {
 	// belongs to that project. Empty when the instance has none, or when no
 	// checkout has been looked up yet.
 	Registry string `json:"registry,omitempty"`
+	// Namespaces are the namespace paths whose projects were listed: for
+	// anything beneath them, Projects is the whole truth as of ListedAt. A
+	// project outside them is in Projects only because something referred
+	// to it and the instance was asked.
+	Namespaces []string `json:"namespaces,omitempty"`
+	// Moved maps a path that projects are still referred to by onto the path
+	// the project has now. GitLab keeps answering for the old one; this is
+	// how a reference to it is followed without asking again.
+	Moved map[string]string `json:"moved,omitempty"`
+	// NotFound are references to paths outside Namespaces that the instance
+	// was asked about and has no project for. They are not asked about again
+	// until the next `gitty index`.
+	NotFound []string `json:"not_found,omitempty"`
 	// Exclude is the exclude list in effect when the index was last brought
 	// up to date. No link in the index starts or ends at a project it
 	// covers; gitty rescans when the list in effect differs.

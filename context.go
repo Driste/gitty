@@ -16,6 +16,10 @@ import (
 // with the command that fetches it.
 const maxContextFetch = 25
 
+// maxContextLookups bounds how many of the subject's unsettled references
+// one `context --fetch` asks the instance about.
+const maxContextLookups = 20
+
 // contextOptions bundles the context command's flags.
 type contextOptions struct {
 	Subject           string
@@ -77,7 +81,7 @@ func runContext(ctx context.Context, opts contextOptions) error {
 	}
 
 	if opts.Fetch {
-		if b, err = w.fetchForBriefing(ctx, b, subj, direction, opts.Subject); err != nil {
+		if b, err = w.fetchForBriefing(ctx, idx, b, subj, direction, opts.Subject); err != nil {
 			return err
 		}
 	}
@@ -124,7 +128,22 @@ func runContext(ctx context.Context, opts contextOptions) error {
 //
 // A project that could not be fetched stays in the briefing as absent, with
 // the reason; one failure does not spoil the rest of the answer.
-func (w *workspace) fetchForBriefing(ctx context.Context, b *contract.Briefing, subj subject, direction, arg string) (*contract.Briefing, error) {
+func (w *workspace) fetchForBriefing(ctx context.Context, idx *contract.Index, b *contract.Briefing, subj subject, direction, arg string) (*contract.Briefing, error) {
+	// Fetching means the instance is within reach, so first ask it about
+	// what the subject refers to that the index could not place: a project
+	// in a group this workspace has never listed is as real as any other,
+	// and once known it is fetched with the rest.
+	if w.requireAPI() == nil {
+		learned, err := w.settleRefs(ctx, idx, func(u contract.Unresolved) bool { return subj.contains(u.From) }, maxContextLookups)
+		if err != nil {
+			return nil, err
+		}
+		if learned {
+			if b, err = w.buildBriefing(idx, subj, direction); err != nil {
+				return nil, err
+			}
+		}
+	}
 	absent := absentUses(b)
 	if len(absent) == 0 {
 		return b, nil

@@ -233,6 +233,14 @@ type fakeSource struct {
 	subErr    error
 	projErr   error
 	topErr    error
+
+	// moved maps a path a project used to have onto the one it has now: the
+	// instance answers for both, as GitLab does.
+	moved map[string]string
+	// lookupErr, when set, is what looking any single project up returns.
+	lookupErr error
+	// lookups, when set, records every path a single project was asked for.
+	lookups *[]string
 }
 
 func (f fakeSource) TopLevelGroups(ctx context.Context) ([]*gitlab.Group, error) {
@@ -284,6 +292,17 @@ func (f fakeSource) NamespaceProjects(ctx context.Context, target string) ([]*gi
 }
 
 func (f fakeSource) Project(ctx context.Context, path string) (*gitlab.Project, error) {
+	if f.lookups != nil {
+		fakeLookupMu.Lock()
+		*f.lookups = append(*f.lookups, path)
+		fakeLookupMu.Unlock()
+	}
+	if f.lookupErr != nil {
+		return nil, f.lookupErr
+	}
+	if now, ok := f.moved[path]; ok {
+		path = now
+	}
 	for _, projects := range f.projects {
 		for _, p := range projects {
 			if p.PathWithNamespace == path {
@@ -291,7 +310,7 @@ func (f fakeSource) Project(ctx context.Context, path string) (*gitlab.Project, 
 			}
 		}
 	}
-	return nil, fmt.Errorf("project %q not found", path)
+	return nil, fmt.Errorf("%s: %w", path, errProjectNotFound)
 }
 
 func (f fakeSource) Projects(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Project, error) {
@@ -321,6 +340,10 @@ func (f fakeSource) Projects(ctx context.Context, target string, nested, archive
 	}
 	return f.projects[target], nil
 }
+
+// fakeLookupMu guards the lookups a fakeSource records: they are made from
+// several goroutines.
+var fakeLookupMu sync.Mutex
 
 // recordingGit is a gitRunner that records invocations and can be told to fail
 // on matching commands. Safe for concurrent use.

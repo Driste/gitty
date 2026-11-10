@@ -726,8 +726,8 @@ func TestE2EFetch(t *testing.T) {
 		"clone acme/app-fork",
 		"summary cloned=1 present=0 errors=1",
 	)
-	if !strings.Contains(stderr, "404") || !strings.Contains(stderr, "1 failed:") {
-		t.Errorf("stderr should carry the instance's answer and the recap:\n%s", stderr)
+	if !strings.Contains(stderr, "no such project on the instance") || !strings.Contains(stderr, "1 failed:") {
+		t.Errorf("stderr should say why and carry the recap:\n%s", stderr)
 	}
 
 	t.Log("the exclude list is honoured even for a project named outright")
@@ -825,5 +825,75 @@ func TestE2EChangeDirectory(t *testing.T) {
 		if _, stderr, code := runGitty(t, elsewhere, nil, args...); code != 2 {
 			t.Errorf("%s: exit = %d, want 2\n%s", name, code, stderr)
 		}
+	}
+}
+
+// TestE2EContextReachesOtherGroups: a project in a group this workspace has
+// never cloned or listed is still a project. A pipeline that includes from
+// one gets it as a link — and, with --fetch, as a checkout — not as "a
+// reference that is not a project here".
+func TestE2EContextReachesOtherGroups(t *testing.T) {
+	skipIfShort(t)
+	f := newFakeGitLab(t)
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.groups["platform"] = apiGroup{ID: 2, FullPath: "platform"}
+	f.addRepo(t, "acme/app", map[string]string{
+		".gitlab-ci.yml": "include:\n  - project: platform/ci/templates\n    file: /build.yml\n  - project: platform/ci/gone\n    file: /x.yml\n",
+	})
+	f.addRepo(t, "platform/ci/templates", map[string]string{"README.md": "# templates\n\nPipeline templates for everyone.\n", "build.yml": "build:\n  script: [make]\n"})
+	f.projects["acme"] = []apiProject{f.project(1, "acme/app")}
+	tmpl := f.project(2, "platform/ci/templates")
+	tmpl.Description = "Shared pipeline templates"
+	f.projects["platform/ci"] = []apiProject{tmpl}
+
+	ws := initWorkspace(t, f)
+	cloneInto(t, f, ws, "acme/app")
+	appDir := filepath.Join(ws, "acme", "app")
+
+	// Only acme is listed: it is the only group the workspace holds. The
+	// other project is found by asking for it.
+	stdout, _ := mustGitty(t, ws, nil, "index", "--anon")
+	wantLines(t, "index", stdout,
+		"index acme/app new",
+		"link acme/app ci-include platform/ci/templates .gitlab-ci.yml:2",
+		"unresolved acme/app platform/ci/gone .gitlab-ci.yml:4",
+		"summary projects=2 checkouts=1 scanned=1 links=1 unresolved=1 errors=0",
+	)
+	idx := readIndex(t, ws)
+	if strings.Join(idx.Namespaces, ",") != "acme" || idx.Projects["platform/ci/templates"] == nil ||
+		idx.Projects["platform/ci/templates"].Description != "Shared pipeline templates" ||
+		strings.Join(idx.NotFound, ",") != "platform/ci/gone" {
+		t.Errorf("index: namespaces %v, not found %v, projects %v", idx.Namespaces, idx.NotFound, idx.Projects)
+	}
+
+	stdout, stderr := mustGitty(t, appDir, nil, "context", "--fetch", "--anon")
+	for _, want := range []string{
+		"- **platform/ci/templates** — Shared pipeline templates · `../../platform/ci/templates` (fetched) · ci-include (.gitlab-ci.yml:2)\n",
+		"## References that are not projects here (1)\n- platform/ci/gone (.gitlab-ci.yml:4)\n",
+		"- platform/ci/templates: ../../platform/ci/templates/README.md\n",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("briefing missing %q:\n%s\nstderr:\n%s", want, stdout, stderr)
+		}
+	}
+	if got := readFileT(t, filepath.Join(ws, "platform", "ci", "templates", "build.yml")); !strings.Contains(got, "make") {
+		t.Errorf("the included template was not fetched: %q", got)
+	}
+
+	// A reference written after the index was built, to a project the
+	// listing never covered: --fetch asks about it then and there.
+	f.addRepo(t, "platform/tools/lint", map[string]string{"README.md": "# lint\n"})
+	f.projects["platform/tools"] = []apiProject{f.project(3, "platform/tools/lint")}
+	ci := readFileT(t, filepath.Join(appDir, ".gitlab-ci.yml")) + "lint:\n  trigger:\n    project: platform/tools/lint\n"
+	if err := os.WriteFile(filepath.Join(appDir, ".gitlab-ci.yml"), []byte(ci), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _ = mustGitty(t, appDir, nil, "context", "--anon")
+	if !strings.Contains(stdout, "- platform/tools/lint (.gitlab-ci.yml:8)\n") {
+		t.Errorf("without --fetch there is no asking, so it is unresolved for now:\n%s", stdout)
+	}
+	stdout, _ = mustGitty(t, appDir, nil, "context", "--fetch", "--anon")
+	if !strings.Contains(stdout, "- **platform/tools/lint** · `../../platform/tools/lint` (fetched) · ci-trigger (.gitlab-ci.yml:8)\n") {
+		t.Errorf("--fetch should have found and fetched it:\n%s", stdout)
 	}
 }

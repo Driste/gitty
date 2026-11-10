@@ -30,6 +30,9 @@ type resolver struct {
 	// spells it. GitLab paths are unique regardless of case.
 	projects map[string]string
 	byID     map[int64]string
+	// moved maps a lower-cased path a project used to have onto its path
+	// now, for references that have not caught up.
+	moved map[string]string
 	// excluded says whether the workspace leaves a namespace path out. A
 	// reference to an excluded project is not a link and not unresolved
 	// either: the user asked gitty to leave it alone, so it is passed over.
@@ -53,6 +56,7 @@ func newResolver(idx *contract.Index, cfg *Config) *resolver {
 		hosts:    map[string]bool{},
 		projects: make(map[string]string, len(idx.Projects)),
 		byID:     make(map[int64]string, len(idx.Projects)),
+		moved:    idx.Moved,
 		excluded: cfg.Excluded,
 	}
 	addHost := func(raw string) {
@@ -124,7 +128,7 @@ func (x ref) unresolved() bool {
 func (r *resolver) lookup(p string) (string, bool) {
 	p = strings.ToLower(strings.Trim(p, "/"))
 	for p != "" {
-		if canonical, ok := r.projects[p]; ok {
+		if canonical, ok := r.at(p); ok {
 			return canonical, true
 		}
 		i := strings.LastIndex(p, "/")
@@ -138,8 +142,20 @@ func (r *resolver) lookup(p string) (string, bool) {
 
 // exact finds the project with exactly this path.
 func (r *resolver) exact(p string) (string, bool) {
-	canonical, ok := r.projects[strings.ToLower(strings.Trim(p, "/"))]
-	return canonical, ok
+	return r.at(strings.ToLower(strings.Trim(p, "/")))
+}
+
+// at finds the project at a lower-cased path: the one that has it, or the
+// one that used to and is known to have moved.
+func (r *resolver) at(p string) (string, bool) {
+	if canonical, ok := r.projects[p]; ok {
+		return canonical, true
+	}
+	if now, ok := r.moved[p]; ok {
+		canonical, ok := r.projects[strings.ToLower(now)]
+		return canonical, ok
+	}
+	return "", false
 }
 
 // knows reports whether a namespace path is a project of the instance.

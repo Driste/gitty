@@ -256,6 +256,12 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 		idx = newIndex(cfg)
 		mustList, changed = true, true
 	}
+	// What the index held on the way in, to tell afterwards which links
+	// this refresh was the first to find.
+	initial := make(map[contract.Link]bool, len(idx.Links))
+	for _, l := range idx.Links {
+		initial[l] = true
+	}
 	rescanAll := opts.RescanAll
 	if idx.Scanner != contract.ScannerVersion {
 		idx.Scanner = contract.ScannerVersion
@@ -299,15 +305,24 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 	if unknown && !mustList && w.requireAPI() == nil {
 		mustList, optional = true, true
 	}
+	reachable := false // the instance answered during this refresh
 	if mustList {
 		err := w.requireAPI()
 		var listed []*gitlab.Project
+		var namespaces []string
 		if err == nil {
-			listed, err = w.listProjects(ctx)
+			listed, namespaces, err = w.listProjects(ctx)
 		}
 		switch {
 		case err == nil:
-			applyListing(idx, cfg, listed)
+			reachable = true
+			if opts.List {
+				// An explicit refresh learns again what earlier lookups
+				// taught: a project found outside the listed namespaces
+				// may be gone, a path that had nothing may have something.
+				forgetLookups(idx, namespaces)
+			}
+			applyListing(idx, cfg, listed, namespaces)
 			var known []string
 			for _, c := range checkouts {
 				if meta := idx.Projects[c.project]; meta != nil && meta.ID != 0 {
@@ -349,11 +364,12 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 	// Decide what to read.
 	type job struct {
 		checkout
-		head  string
-		state string
-		links bool
-		out   scanOutcome
-		err   error
+		head    string
+		state   string
+		links   bool
+		out     scanOutcome
+		err     error
+		scanned bool // read, and what it yielded is in the index
 	}
 	jobs := make([]*job, 0, len(checkouts))
 	var toScan []*job
@@ -405,12 +421,10 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 
 	for _, j := range jobs {
 		if j.state == "unchanged" {
-			report(indexEvent{Kind: "index", Project: j.project, Detail: "unchanged"})
 			continue
 		}
 		if j.err != nil {
 			stats.Errors++
-			report(indexEvent{Kind: "error", Project: j.project, Detail: "scanning failed"})
 			w.s.diagf("%s: %v", j.project, j.err)
 			continue
 		}
@@ -425,40 +439,62 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 			}
 		}
 		changed = changed || differs
-		report(indexEvent{Kind: "index", Project: j.project, Detail: state})
-		for _, l := range j.out.Links {
-			report(indexEvent{Kind: "link", Project: j.project, Link: l})
-		}
-		for _, u := range j.out.Unresolved {
-			report(indexEvent{Kind: "unresolved", Project: j.project, Unres: u})
-		}
+		j.state = state
+		j.scanned = true
 	}
 
-	// Fork edges come from metadata, not from a scan; report the ones this
-	// refresh is the first to record.
-	known := map[contract.Link]bool{}
-	for _, l := range idx.Links {
-		if strings.HasPrefix(l.Evidence, apiEvidence) {
-			known[l] = true
-		}
-	}
 	if rebuildAPILinks(idx, cfg) {
 		changed = true
-		for _, l := range idx.Links {
-			if strings.HasPrefix(l.Evidence, apiEvidence) && !known[l] {
-				report(indexEvent{Kind: "link", Project: l.From, Link: l})
-			}
-		}
 	}
 	if reconcile(idx, newResolver(idx, cfg)) {
 		changed = true
+	}
+	// With the instance within reach, ask it about the references the
+	// listing could not settle: projects in a namespace this workspace has
+	// never listed, and projects that have moved.
+	if reachable && w.lookUpRefs(ctx, idx, nil, maxRefLookups) {
+		reconcile(idx, newResolver(idx, cfg))
+		changed = true
+	}
+	if ctx.Err() != nil {
+		return nil, stats, errInterrupted
+	}
+	sortLinks(idx.Links)
+	sortUnresolved(idx.Unresolved)
+
+	// Report, now that the index says what it will say. A checkout that was
+	// read is followed by everything found in it; a link nobody had before
+	// that comes from elsewhere — a fork edge, a reference in an unread
+	// checkout whose target has only now turned up — is reported after.
+	reported := map[contract.Link]bool{}
+	for _, j := range jobs {
+		switch {
+		case j.err != nil:
+			report(indexEvent{Kind: "error", Project: j.project, Detail: "scanning failed"})
+		default:
+			report(indexEvent{Kind: "index", Project: j.project, Detail: j.state})
+		}
+		if !j.scanned {
+			continue
+		}
+		links, unresolved := scannedOf(idx, j.project)
+		for _, l := range links {
+			reported[l] = true
+			report(indexEvent{Kind: "link", Project: j.project, Link: l})
+		}
+		for _, u := range unresolved {
+			report(indexEvent{Kind: "unresolved", Project: j.project, Unres: u})
+		}
+	}
+	for _, l := range idx.Links {
+		if !initial[l] && !reported[l] {
+			report(indexEvent{Kind: "link", Project: l.From, Link: l})
+		}
 	}
 
 	stats.Projects = len(idx.Projects)
 	stats.Links = len(idx.Links)
 	stats.Unresolved = len(idx.Unresolved)
-	sortLinks(idx.Links)
-	sortUnresolved(idx.Unresolved)
 	if changed {
 		idx.GeneratedAt = time.Now().UTC().Truncate(time.Second)
 		if !opts.DryRun {
@@ -476,18 +512,18 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 // single group to ask about, so each top-level directory it holds is listed
 // as the group it stands for; one that is not a group (a user's namespace)
 // is noted and passed over.
-func (w *workspace) listProjects(ctx context.Context) ([]*gitlab.Project, error) {
+func (w *workspace) listProjects(ctx context.Context) (projects []*gitlab.Project, namespaces []string, err error) {
 	root := w.s.cfg.RootPath
 	if root != "" {
 		projects, err := w.s.src.NamespaceProjects(ctx, root)
 		if err != nil {
-			return nil, fmt.Errorf("listing projects for %s: %w", root, err)
+			return nil, nil, fmt.Errorf("listing projects for %s: %w", root, err)
 		}
-		return projects, nil
+		return projects, []string{root}, nil
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
-		return nil, fmt.Errorf("reading the workspace root: %w", err)
+		return nil, nil, fmt.Errorf("reading the workspace root: %w", err)
 	}
 	var all []*gitlab.Project
 	var firstErr error
@@ -503,7 +539,7 @@ func (w *workspace) listProjects(ctx context.Context) ([]*gitlab.Project, error)
 		projects, err := w.s.src.NamespaceProjects(ctx, name)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, errInterrupted
+				return nil, nil, errInterrupted
 			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("listing projects for %s: %w", name, err)
@@ -512,12 +548,13 @@ func (w *workspace) listProjects(ctx context.Context) ([]*gitlab.Project, error)
 			continue
 		}
 		listed++
+		namespaces = append(namespaces, name)
 		all = append(all, projects...)
 	}
 	if listed == 0 && firstErr != nil {
-		return nil, firstErr
+		return nil, nil, firstErr
 	}
-	return all, nil
+	return all, namespaces, nil
 }
 
 // lookUpCheckouts asks the instance about each checked-out project on its
@@ -565,22 +602,17 @@ func applyDetail(idx *contract.Index, project string, p *gitlab.Project) {
 
 // applyListing replaces the index's project metadata with a fresh listing,
 // keeping what is known about each project's checkout.
-func applyListing(idx *contract.Index, cfg *Config, listed []*gitlab.Project) {
+func applyListing(idx *contract.Index, cfg *Config, listed []*gitlab.Project, namespaces []string) {
 	old := idx.Projects
 	idx.Projects = make(map[string]*contract.Project, len(listed))
+	idx.Namespaces = append([]string(nil), namespaces...)
+	sort.Strings(idx.Namespaces)
 	hosts := map[string]bool{}
 	for _, p := range listed {
 		if p == nil || p.PathWithNamespace == "" {
 			continue
 		}
-		meta := &contract.Project{
-			ID:            p.ID,
-			Description:   strings.TrimSpace(p.Description),
-			DefaultBranch: p.DefaultBranch,
-			Topics:        p.Topics,
-			Archived:      p.Archived,
-			WebURL:        p.WebURL,
-		}
+		meta := projectMeta(p)
 		// What only a checkout or a per-project lookup knows is kept: the
 		// listing has no opinion on it.
 		if prev := old[p.PathWithNamespace]; prev != nil {
@@ -594,9 +626,18 @@ func applyListing(idx *contract.Index, cfg *Config, listed []*gitlab.Project) {
 			}
 		}
 	}
-	// A checkout whose project is no longer listed stays, as a checkout.
 	for project, prev := range old {
-		if _, still := idx.Projects[project]; !still && prev.Local != nil {
+		if _, still := idx.Projects[project]; still {
+			continue
+		}
+		switch {
+		case !within(idx.Namespaces, project):
+			// The listing did not cover it and so says nothing about it: a
+			// project some reference led to, found by asking for it.
+			idx.Projects[project] = prev
+		case prev.Local != nil:
+			// A checkout whose project is no longer listed stays, as a
+			// checkout.
 			idx.Projects[project] = &contract.Project{Local: prev.Local}
 		}
 	}
@@ -608,6 +649,202 @@ func applyListing(idx *contract.Index, cfg *Config, listed []*gitlab.Project) {
 	}
 	sort.Strings(idx.Hosts)
 	idx.ListedAt = time.Now().UTC().Truncate(time.Second)
+}
+
+// projectMeta is what the index records of a project from the API.
+func projectMeta(p *gitlab.Project) *contract.Project {
+	return &contract.Project{
+		ID:            p.ID,
+		Description:   strings.TrimSpace(p.Description),
+		DefaultBranch: p.DefaultBranch,
+		Topics:        p.Topics,
+		Archived:      p.Archived,
+		WebURL:        p.WebURL,
+	}
+}
+
+// within reports whether a namespace path is one of the given namespaces or
+// lies beneath one. Case does not matter, as it does not to GitLab.
+func within(namespaces []string, p string) bool {
+	p = strings.ToLower(p)
+	for _, ns := range namespaces {
+		ns = strings.ToLower(ns)
+		if p == ns || strings.HasPrefix(p, ns+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// maxRefLookups bounds how many unsettled references one refresh asks the
+// instance about. Each is a request or a few; the rest wait for the next.
+const maxRefLookups = 100
+
+// maxRefCandidates bounds how many paths are tried for one reference.
+const maxRefCandidates = 6
+
+// forgetLookups drops what earlier lookups taught, so that an explicit
+// refresh learns it again: projects outside the namespaces about to be
+// listed that are not checked out, the paths found empty, the moves.
+func forgetLookups(idx *contract.Index, namespaces []string) {
+	for project, meta := range idx.Projects {
+		if meta.Local == nil && !within(namespaces, project) {
+			delete(idx.Projects, project)
+		}
+	}
+	idx.NotFound, idx.Moved = nil, nil
+}
+
+// refCandidates lists the namespace paths an unresolved reference might
+// name, most specific first. A reference written as a bare project path
+// names exactly that; one that came out of a URL or a module path may run
+// on past the project, so its prefixes are candidates too.
+func refCandidates(u contract.Unresolved) []string {
+	p := strings.Trim(u.Ref, "/")
+	out := []string{p}
+	switch u.Kind {
+	case contract.KindDepends, contract.KindCIComponent, contract.KindMentions, contract.KindImage:
+		for len(out) < maxRefCandidates {
+			i := strings.LastIndex(p, "/")
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+			if !strings.Contains(p, "/") {
+				break // a project path has a namespace and a name
+			}
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// lookUpRefs asks the instance about unresolved references the listing does
+// not settle: those that point outside the namespaces that were listed.
+//
+// A workspace lists the groups it holds. A project in any other group is
+// invisible to that listing however real it is — and "the pipeline includes
+// a template from a group I have never cloned" is exactly the case this
+// feature exists for. So each such reference is asked about by path. A
+// project that turns up is added to the index, which makes the reference a
+// link and the project something that can be fetched; GitLab also answers
+// for a path a project used to have, and that move is recorded so the stale
+// reference keeps resolving. A path with nothing behind it is remembered,
+// and not asked about again until the next explicit refresh.
+//
+// want narrows which references are asked about; nil means all. It reports
+// whether the index changed. A failure to reach the instance ends the
+// asking quietly: this is an improvement to the answer, never a condition
+// of giving one.
+func (w *workspace) lookUpRefs(ctx context.Context, idx *contract.Index, want func(contract.Unresolved) bool, limit int) bool {
+	cfg := w.s.cfg
+	notFound := make(map[string]bool, len(idx.NotFound))
+	for _, p := range idx.NotFound {
+		notFound[p] = true
+	}
+	type ask struct {
+		candidates []string
+		matched    string
+		found      *gitlab.Project
+		settled    bool // every candidate was answered
+	}
+	asks := map[string]*ask{}
+	var order []string
+	skipped := 0
+	for _, u := range idx.Unresolved {
+		key := strings.ToLower(strings.Trim(u.Ref, "/"))
+		if (want != nil && !want(u)) || asks[key] != nil || notFound[key] || within(idx.Namespaces, u.Ref) {
+			continue
+		}
+		if len(order) >= limit {
+			skipped++
+			continue
+		}
+		asks[key] = &ask{candidates: refCandidates(u)}
+		order = append(order, key)
+	}
+	if len(order) == 0 {
+		return false
+	}
+
+	var mu sync.Mutex
+	unreachable := false
+	forEachConcurrent(ctx, listConcurrency, order, func(key string) {
+		a := asks[key]
+		for _, candidate := range a.candidates {
+			mu.Lock()
+			stop := unreachable
+			mu.Unlock()
+			if stop || ctx.Err() != nil {
+				return
+			}
+			p, err := w.s.src.Project(ctx, candidate)
+			switch {
+			case err == nil && p != nil && p.PathWithNamespace != "":
+				mu.Lock()
+				a.found, a.matched, a.settled = p, candidate, true
+				mu.Unlock()
+				return
+			case errors.Is(err, errProjectNotFound):
+				continue
+			default:
+				mu.Lock()
+				unreachable = true
+				mu.Unlock()
+				if w.s.verbose && ctx.Err() == nil {
+					w.s.diagf("%s: could not be looked up (%v)", candidate, err)
+				}
+				return
+			}
+		}
+		mu.Lock()
+		a.settled = true
+		mu.Unlock()
+	})
+
+	changed := false
+	for _, key := range order {
+		a := asks[key]
+		switch {
+		case a.found != nil:
+			project := a.found.PathWithNamespace
+			if cfg.Excluded(project) {
+				continue
+			}
+			if idx.Projects[project] == nil {
+				idx.Projects[project] = projectMeta(a.found)
+				applyDetail(idx, project, a.found)
+			}
+			if !strings.EqualFold(project, a.matched) {
+				if idx.Moved == nil {
+					idx.Moved = map[string]string{}
+				}
+				idx.Moved[strings.ToLower(a.matched)] = project
+			}
+			changed = true
+		case a.settled:
+			idx.NotFound = append(idx.NotFound, key)
+			changed = true
+		}
+	}
+	sort.Strings(idx.NotFound)
+	if skipped > 0 && w.s.verbose {
+		w.s.diagf("%d more unresolved references were not looked up this time", skipped)
+	}
+	return changed
+}
+
+// settleRefs is lookUpRefs for a caller holding an index that is otherwise
+// up to date: it asks, squares the links with what was learned, and saves.
+func (w *workspace) settleRefs(ctx context.Context, idx *contract.Index, want func(contract.Unresolved) bool, limit int) (bool, error) {
+	if !w.lookUpRefs(ctx, idx, want, limit) {
+		return false, nil
+	}
+	reconcile(idx, newResolver(idx, w.s.cfg))
+	sortLinks(idx.Links)
+	sortUnresolved(idx.Unresolved)
+	idx.GeneratedAt = time.Now().UTC().Truncate(time.Second)
+	return true, saveIndex(w.Root, idx)
 }
 
 // rebuildAPILinks recomputes the links that come from project metadata

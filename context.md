@@ -305,9 +305,12 @@ How to read it:
   reading checkouts; `coverage` says how many of the known projects are
   checked out. Do not conclude "nothing else uses this" from an empty
   `used_by` when `checked_out` is far below `projects`.
-- `unresolved` are references that point at the instance but match no known
-  project (moved, deleted, private, or outside the workspace's part of the
-  namespace). They are never guessed at.
+- `unresolved` are references that point at the instance but match no
+  project: deleted, private, or simply not asked about yet. gitty asks the
+  instance about each one when it is online (`gitty index`, `gitty context
+  --fetch`), which is how a project in a group the workspace has never
+  cloned, or one that has been renamed, still becomes a link. They are never
+  guessed at.
 - A checkout is of the project's default branch, which is not necessarily the
   version another project pins. The evidence line shows what is pinned.
 - `--fetch` only clones. A project that is present is never pulled or

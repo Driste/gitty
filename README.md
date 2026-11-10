@@ -680,6 +680,17 @@ becomes a link when it lands on a project that really exists in the
 workspace's part of the instance; one that points at the instance but matches
 nothing is reported as **unresolved**, never presented as a project.
 
+A workspace lists the groups it holds, so a project in any other group is
+invisible to that listing however real it is — and "this pipeline includes a
+template from a group I have never cloned" is exactly the case worth solving.
+Whenever gitty is talking to the instance anyway (`gitty index`, `gitty
+context --fetch`), it asks about each reference the listing could not place,
+by path. A project that turns up becomes a link, with its description, and
+can be fetched like any other. GitLab also answers for a path a project used
+to have, so a reference that never caught up with a rename is followed to
+where the project is now. A path with nothing behind it is remembered and
+not asked about again until the next `gitty index`.
+
 The scan is deliberately textual. gitty reads the files git tracks, picks the
 ones whose names say they declare dependencies or pipeline configuration, and
 looks at their lines. It does not evaluate build files, expand version ranges

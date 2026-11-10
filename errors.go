@@ -31,6 +31,11 @@ func usageErrf(format string, a ...any) error {
 	return &usageError{msg: fmt.Sprintf(format, a...)}
 }
 
+// errProjectNotFound is what looking a project up by its path returns when
+// the instance has none there — or none this credential may see, which
+// GitLab does not tell apart.
+var errProjectNotFound = errors.New("no such project on the instance, or not one this credential can see")
+
 // errNoWorkspace is the cause of the usage error workspace discovery returns
 // when there is simply no .gitty/config above the directory — as opposed to
 // one that exists but was refused or could not be read.
