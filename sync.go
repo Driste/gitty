@@ -874,6 +874,19 @@ func (s *syncer) bringUp(ctx context.Context, p *gitlab.Project, dest, url strin
 	// costs one more round trip and fails cleanly on an empty repository —
 	// which then stays unborn, as `git clone` leaves it.
 	branch := p.DefaultBranch
+	if branch != "" {
+		// The API names the default branch whether or not anything has been
+		// pushed to it. A project with an empty repository is not a failed
+		// checkout: it stays unborn, as `git clone` leaves it, and a later
+		// run finishes the job once there is something to check out.
+		if _, err := s.git(ctx, dest, nil, "show-ref", "--verify", "--quiet", "refs/remotes/origin/"+branch); err != nil {
+			if out, err := s.git(ctx, dest, nil, "for-each-ref", "--count=1", "refs/remotes/origin"); err == nil && strings.TrimSpace(string(out)) == "" {
+				s.diagf("%s: the repository is empty; nothing to check out yet", path)
+				return nil
+			}
+			branch = "" // the remote has branches, but not that one: ask it
+		}
+	}
 	if branch == "" {
 		if err := s.runGit(ctx, path, dest, env, "remote", "set-head", "origin", "--auto"); err != nil {
 			return nil

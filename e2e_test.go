@@ -2501,3 +2501,57 @@ func TestE2EOrphans(t *testing.T) {
 		t.Errorf("status should skip the aside dir and still see keep:\n%s", stdout)
 	}
 }
+
+// TestE2EEmptyRepositoryIsNotAFailure: a project nothing has been pushed to
+// still has a default branch as far as the API is concerned. Bringing it up
+// leaves an unborn repository, not an error on every run — and the run after
+// the first push checks it out.
+func TestE2EEmptyRepositoryIsNotAFailure(t *testing.T) {
+	skipIfShort(t)
+	f := newFakeGitLab(t)
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	bare := filepath.Join(f.gitRoot, "acme", "empty.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, bare, "init", "-q", "--bare", "-b", "main", ".")
+	gitRun(t, bare, "update-server-info")
+	f.addRepo(t, "acme/full", map[string]string{"README.md": "full"})
+	f.projects["acme"] = []apiProject{f.project(1, "acme/empty"), f.project(2, "acme/full")}
+	ws := initWorkspace(t, f)
+
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 || !strings.Contains(stdout, "clone acme/empty\n") || !strings.Contains(stdout, "errors=0") {
+		t.Fatalf("first sync: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "acme/empty: the repository is empty") {
+		t.Errorf("stderr should say why there is nothing in the checkout:\n%s", stderr)
+	}
+	if classifyDest(filepath.Join(ws, "acme", "empty")) != destRepo {
+		t.Error("the empty project should still be a repository on disk")
+	}
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 || !strings.Contains(stdout, "pull acme/empty\n") || !strings.Contains(stdout, "errors=0") {
+		t.Fatalf("second sync: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+
+	// Someone pushes the first commit.
+	work := t.TempDir()
+	gitRun(t, work, "init", "-q", "-b", "main", ".")
+	if err := os.WriteFile(filepath.Join(work, "first.txt"), []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, work, "add", ".")
+	gitRun(t, work, "commit", "-q", "-m", "first")
+	gitRun(t, work, "push", "-q", bare, "main")
+	gitRun(t, bare, "update-server-info")
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync after the first push: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "empty", "first.txt")); got != "first" {
+		t.Errorf("first.txt = %q", got)
+	}
+}
