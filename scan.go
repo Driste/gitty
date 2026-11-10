@@ -43,6 +43,7 @@ type scanOutcome struct {
 	Unresolved []contract.Unresolved
 	Docs       []string
 	Summary    string
+	Provides   []contract.Provided
 	Files      int // files whose lines were read
 }
 
@@ -56,6 +57,8 @@ const (
 	classImages               // a Dockerfile or a compose file
 	classSubmodules           // .gitmodules
 	classDocs                 // documentation
+	classDeploy               // deployment configuration: Helm values, a kustomization
+	classAgent                // a GitLab agent for Kubernetes' config.yaml
 )
 
 // manifestNames are the manifests recognised by exact file name.
@@ -105,6 +108,11 @@ func classifyFile(name string) fileClass {
 		return classCI // build.gitlab-ci.yml, the convention for split pipelines
 	case isYAML && strings.HasPrefix(name, ".gitlab/ci/"):
 		return classCI
+	case isYAML && strings.HasPrefix(name, ".gitlab/agents/") && strings.HasPrefix(lower, "config."):
+		return classAgent
+	case isYAML && (strings.HasPrefix(lower, "kustomization.") || strings.HasPrefix(lower, "helmfile.") ||
+		strings.HasPrefix(lower, "values.") || strings.HasPrefix(lower, "values-") || strings.Contains(lower, ".values.")):
+		return classDeploy
 	case manifestNames[base]:
 		return classManifest
 	}
@@ -172,12 +180,17 @@ func (sc *scanner) scan(ctx context.Context, dir, project string, links bool) (s
 			c.scanSubmodules(lines)
 		case classDocs:
 			c.scanMentions(lines)
+		case classDeploy:
+			c.scanDeploy(lines, false)
+		case classAgent:
+			c.scanDeploy(lines, true)
 		}
 	}
 
 	result.Links, result.Unresolved = c.result()
 	result.Docs = pickDocs(rootFiles)
 	result.Summary = readmeSummary(dir, rootFiles)
+	result.Provides = provides(dir, names)
 	return result, nil
 }
 
@@ -392,6 +405,34 @@ func (c *collector) scanImages(lines []string) {
 	for i, line := range lines {
 		c.scanImagesLine(line, i+1)
 		c.scanTokensLine(line, i+1)
+	}
+}
+
+// scanDeploy reads deployment configuration: Helm values, a kustomization, a
+// helmfile, a GitLab agent's config. What such a file names on the instance
+// — an image in its registry, a repository URL, and in an agent's config a
+// project by its path — is what it deploys, which is the one relationship
+// that is read from the far end: an application does not say who deploys it.
+func (c *collector) scanDeploy(lines []string, agent bool) {
+	for i, line := range lines {
+		lineNo := i + 1
+		var found []ref
+		for _, image := range c.r.images(line) {
+			found = append(found, c.r.resolveImage(image))
+		}
+		for _, tok := range c.r.tokens(line) {
+			found = append(found, c.r.resolveToken(tok))
+		}
+		if agent {
+			// ci_access, user_access and gitops all list projects as
+			//   - id: group/project
+			if key, value, ok := splitYAMLKey(strings.TrimPrefix(strings.TrimSpace(line), "- ")); ok && key == "id" {
+				found = append(found, c.r.resolvePath(cleanYAMLScalar(value)))
+			}
+		}
+		for _, x := range found {
+			c.add(contract.KindDeploys, x, lineNo)
+		}
 	}
 }
 

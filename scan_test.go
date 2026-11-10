@@ -27,6 +27,10 @@ func scanLines(t *testing.T, r *resolver, file, text string) ([]contract.Link, [
 		c.scanSubmodules(lines)
 	case classDocs:
 		c.scanMentions(lines)
+	case classDeploy:
+		c.scanDeploy(lines, false)
+	case classAgent:
+		c.scanDeploy(lines, true)
 	default:
 		t.Fatalf("%s is not a file the scanner reads", file)
 	}

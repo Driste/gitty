@@ -30,7 +30,7 @@ const IndexVersion = 1
 // ScannerVersion identifies the rules links are extracted with. It is not a
 // format version: an index whose scanner is older reads fine, and gitty
 // rescans its checkouts so that links found by newer rules appear.
-const ScannerVersion = 3
+const ScannerVersion = 4
 
 // Supported reports whether a document of the given version can be read by
 // code built against this package, and if not, an error naming both sides —
@@ -53,6 +53,10 @@ const (
 	KindSubmodule   = "submodule"    // it is a git submodule
 	KindFork        = "fork"         // the project was forked from it
 	KindMentions    = "mentions"     // documentation refers to it
+	// KindDeploys is the one kind that runs the other way round from use:
+	// From is deployment configuration (Helm values, a kustomization, a
+	// GitLab agent's config) and To is the project it deploys.
+	KindDeploys = "deploys"
 )
 
 // Index is the file <workspace>/.gitty/index.json: every project of the
@@ -130,6 +134,32 @@ type Local struct {
 	// first, relative to Dir: agent instructions first, the README last.
 	Docs    []string `json:"docs,omitempty"`
 	Summary string   `json:"summary,omitempty"` // the README's opening paragraph
+	// Provides is what the project offers others, as far as its files say.
+	Provides []Provided `json:"provides,omitempty"`
+}
+
+// The kinds of thing a project can be seen to provide.
+const (
+	ProvidesCIComponent = "ci-component"     // templates/<name>.yml with a spec: header
+	ProvidesCITemplate  = "ci-template"      // templates/<name>.yml without one
+	ProvidesPolicy      = "policy"           // a security policy in .gitlab/security-policies/policy.yml
+	ProvidesHelmChart   = "helm-chart"       // Chart.yaml
+	ProvidesTerraform   = "terraform-module" // *.tf at the root or under modules/
+	ProvidesImage       = "image"            // a Dockerfile at the root
+)
+
+// Provided is one thing a project offers: a CI component, a pipeline
+// template, a policy, a chart, a module, an image.
+type Provided struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	File string `json:"file"` // where it is defined, relative to the project
+	// About is what the file says the thing is, when it says so: a chart's
+	// description, a policy's type.
+	About string `json:"about,omitempty"`
+	// Inputs are the parameters it takes: a component's inputs, a module's
+	// variables.
+	Inputs []string `json:"inputs,omitempty"`
 }
 
 // Link is one evidenced reference from a project to another. From uses To.
@@ -282,4 +312,71 @@ type FetchResult struct {
 	Present bool   `json:"present"`        // checked out when the command finished
 	Fetched bool   `json:"fetched"`        // cloned by this command
 	Error   string `json:"error,omitempty"`
+}
+
+// --- gitty to gitty-up ---
+
+// HubSchema is the version of what gitty sends a hub and reads from it.
+const HubSchema = 1
+
+// Facts is what one project's repository says at one commit: what gitty
+// read from a clean checkout of its default branch, sent to a hub so that
+// the instance's picture is made of what repositories say and not of what
+// anyone remembers.
+type Facts struct {
+	Schema      int        `json:"schema"`
+	Scanner     int        `json:"scanner"`
+	Project     string     `json:"project"` // namespace path
+	ID          int64      `json:"id"`      // GitLab's project id
+	Commit      string     `json:"commit"`
+	CommittedAt time.Time  `json:"committed_at"`
+	Summary     string     `json:"summary,omitempty"` // the README's opening paragraph
+	Docs        []string   `json:"docs,omitempty"`
+	Provides    []Provided `json:"provides,omitempty"`
+	Links       []Link     `json:"links,omitempty"`
+	// Files are the blob ids of tracked files, abbreviated: enough to tell
+	// later whether a file someone cited has changed. Large repositories
+	// send only the files that were read.
+	Files map[string]string `json:"files,omitempty"`
+}
+
+// HubHead names a checkout gitty could send facts for.
+type HubHead struct {
+	Project string `json:"project"`
+	ID      int64  `json:"id"`
+	Commit  string `json:"commit"`
+}
+
+// HubWant asks a hub which of these it does not have yet.
+type HubWant struct {
+	Schema int       `json:"schema"`
+	Have   []HubHead `json:"have"`
+}
+
+// HubWanted is the answer: the projects to send, and why each of the others
+// is not wanted.
+type HubWanted struct {
+	Schema  int               `json:"schema"`
+	Want    []string          `json:"want"`
+	Skipped map[string]string `json:"skipped,omitempty"`
+}
+
+// HubReceipt is what a hub says about facts it was sent.
+type HubReceipt struct {
+	Schema  int    `json:"schema"`
+	Project string `json:"project"`
+	Stored  bool   `json:"stored"`
+	Reason  string `json:"reason,omitempty"` // why not, when not
+	Links   int    `json:"links"`            // links kept: those to projects the hub covers
+}
+
+// HubInfo is what a hub says about itself.
+type HubInfo struct {
+	Schema   int       `json:"schema"`
+	Name     string    `json:"name"`
+	Version  string    `json:"version"`
+	Instance string    `json:"instance"`
+	Projects int       `json:"projects"`
+	Groups   int       `json:"groups"`
+	ListedAt time.Time `json:"listed_at"`
 }

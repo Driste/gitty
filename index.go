@@ -994,7 +994,7 @@ func scannedOf(idx *contract.Index, project string) (links []contract.Link, unre
 // differs from what the index already held for it.
 func applyScan(idx *contract.Index, project, dir, head string, out scanOutcome) bool {
 	meta := idx.Projects[project]
-	local := &contract.Local{Dir: dir, Head: head, Docs: out.Docs, Summary: out.Summary}
+	local := &contract.Local{Dir: dir, Head: head, Docs: out.Docs, Summary: out.Summary, Provides: out.Provides}
 	oldLinks, oldUnresolved := scannedOf(idx, project)
 	same := meta.Local != nil && sameLocal(meta.Local, local) &&
 		equalLinks(oldLinks, out.Links) && equalUnresolved(oldUnresolved, out.Unresolved)
@@ -1011,7 +1011,17 @@ func applyScan(idx *contract.Index, project, dir, head string, out scanOutcome) 
 // sameLocal compares two descriptions of a checkout by content: a list that
 // is empty and one that is absent are the same thing once written to disk.
 func sameLocal(a, b *contract.Local) bool {
-	return a.Dir == b.Dir && a.Head == b.Head && a.Summary == b.Summary && equalStrings(a.Docs, b.Docs)
+	if a.Dir != b.Dir || a.Head != b.Head || a.Summary != b.Summary || !equalStrings(a.Docs, b.Docs) ||
+		len(a.Provides) != len(b.Provides) {
+		return false
+	}
+	for i := range a.Provides {
+		x, y := a.Provides[i], b.Provides[i]
+		if x.Kind != y.Kind || x.Name != y.Name || x.File != y.File || x.About != y.About || !equalStrings(x.Inputs, y.Inputs) {
+			return false
+		}
+	}
+	return true
 }
 
 func equalLinks(a, b []contract.Link) bool {
