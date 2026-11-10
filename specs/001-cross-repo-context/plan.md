@@ -486,6 +486,11 @@ it out.
     the project directory.
 14. **Mentions are a kind of their own, listed last, never fetched.**
 
+15. **`gitty agent schema` and `context.md` are gone.** They predate this
+    feature and existed to tell an agent how to drive gitty. A hand-kept
+    description of every flag is not worth its upkeep next to `--help`, and
+    what an agent needs to know is moving into the server.
+
 ### Measured (gitlab.com, anonymous, from a cloud container)
 
 | What | Time |

@@ -225,8 +225,6 @@ func main() {
 		exitOnError(runCompletion(os.Stdout, os.Args[2:]))
 	case "version":
 		runVersion()
-	case "agent":
-		runAgent(os.Args[2:])
 	default:
 		// Not built in: run the gitty-<command> plugin, if there is one.
 		os.Exit(runPluginCommand(os.Stderr, os.Args[1], os.Args[2:]))

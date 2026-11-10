@@ -28,7 +28,6 @@ var commands = []command{
 	{"related", "List what a project uses and what uses it: gitty related [project] [flags]", true, func(fs *flag.FlagSet) { declareRelatedFlags(fs) }},
 	{"auth", "Check the token against the workspace's instance and report its scopes", false, func(fs *flag.FlagSet) { declareAuthFlags(fs) }},
 	{"completion", "Print a shell completion script: gitty completion bash|zsh|fish", false, nil},
-	{"agent", "Print an MCP-style schema describing how an LLM/agent should use gitty", false, nil},
 	{"version", "Print the gitty version", false, nil},
 }
 

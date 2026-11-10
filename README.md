@@ -874,7 +874,7 @@ name its own working directory.
 | `--anon` | Reach the instance anonymously (public projects only). |
 | `--jobs` | Concurrent clones and checkout reads gitty may use (1-16). |
 | `--version` | Print the plugin's version. |
-| `--describe` | Print the tools it offers, as JSON (this is what `gitty agent schema` shows under `plugins`). |
+| `--describe` | Print the tools it offers, as JSON. |
 
 The server answers protocol revisions 2024-11-05 through 2025-11-25, and
 offers the newest of those to a client that asks for anything else. Tool
@@ -1031,9 +1031,8 @@ a plugin is installed by putting a file in either place, and removed by
 deleting it. gitty ships none and needs none. The current directory is never
 searched, and a plugin can add a command but never replace a built-in one
 (`gitty-sync` on your `PATH` is ignored). `gitty` with no arguments lists the
-plugins it can see, and `gitty agent schema` lists them under `plugins`. A
-`gitty` binary kept under a name like `gitty-dev` is never run as a plugin of
-itself.
+plugins it can see. A `gitty` binary kept under a name like `gitty-dev` is
+never run as a plugin of itself.
 
 gitty's releases publish one plugin, [`gitty-mcp`](#for-coding-agents-the-mcp-server-gitty-mcp).
 
@@ -1063,54 +1062,6 @@ A plugin can be written in anything. A shell script is enough:
 # gitty-where: print the workspace this directory belongs to
 echo "${GITTY_WORKSPACE:-not in a workspace}"
 ```
-
----
-
-## Agent Schema (`gitty agent schema`)
-
-`gitty agent schema` prints a machine-readable, MCP-style JSON description of
-every gitty command — its purpose, arguments, defaults, and how to turn those
-arguments into a command line. Feed this to an LLM or agent so it knows how to
-drive `gitty` as a tool without you having to hand-write a tool definition.
-
-```bash
-gitty agent schema
-```
-
-The output is a single JSON document shaped like an MCP tool list:
-
-```json
-{
-  "name": "gitty",
-  "version": "3.2.0",
-  "description": "A configurable CLI to synchronize ... GitLab groups ...",
-  "exitCodes": { "0": "success", "1": "...", "2": "...", "130": "..." },
-  "tools": [
-    {
-      "name": "sync",
-      "description": "Sync a GitLab group. ... Works from anywhere inside a workspace ...",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "path":   { "type": "string",  "description": "GitLab group or subgroup path to sync, relative to the current directory's group ... Passed as a positional argument ..." },
-          "nested": { "type": "boolean", "description": "Recurse into nested subgroups ...", "default": false }
-        }
-      },
-      "invocation": {
-        "command": "gitty",
-        "baseArgs": ["sync"],
-        "flagStyle": "the 'path' argument is positional (gitty sync <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it"
-      }
-    }
-  ]
-}
-```
-
-(Abridged: the real output lists every command and flag.) Each tool's
-`inputSchema` is JSON Schema, and `invocation` tells the agent how to map the
-arguments onto an argv array (e.g. the `sync` tool with
-`{"path": "tenant/images", "nested": true}` becomes
-`gitty sync tenant/images --nested`).
 
 ---
 

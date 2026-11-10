@@ -75,7 +75,6 @@ func commandNames() []string {
 // subwords are the fixed arguments of the commands that take one.
 var subwords = map[string][]string{
 	"completion": completionShells,
-	"agent":      {"schema"},
 }
 
 // plainDescription makes a flag's usage text safe inside the quoting each

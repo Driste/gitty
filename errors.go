@@ -6,7 +6,7 @@ import (
 )
 
 // Exit-code taxonomy (part of the public CLI contract, documented in the
-// agent schema):
+// README):
 //
 //	0   clean run
 //	1   sync completed but one or more items failed

@@ -129,8 +129,8 @@ func newServer(bin, workspace string, noFetch bool, jobs int, errOut io.Writer) 
 	return &server{gittyBin: bin, workspace: workspace, dir: dir, noFetch: noFetch, jobs: jobs, errOut: errOut}, nil
 }
 
-// printDescription writes what this server offers, for `gitty agent schema`
-// and for anyone deciding whether to install it.
+// printDescription writes what this server offers, for anyone deciding
+// whether to install it.
 func printDescription(stdout, stderr io.Writer, noFetch bool) int {
 	s := &server{noFetch: noFetch}
 	type toolInfo struct {

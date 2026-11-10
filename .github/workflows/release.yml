@@ -146,7 +146,7 @@ jobs:
             exit 1
           fi
           # The binary must also be able to do its job, not just report a version.
-          "$binary" agent schema > /dev/null
+          "$binary" completion bash > /dev/null
 
           # The plugin, installed the way the README says: renamed, next to
           # gitty. `gitty mcp` must find it there and run it.
@@ -159,8 +159,8 @@ jobs:
             echo "plugin version mismatch: 'gitty mcp --version' reports '$got', expected '$VERSION'"
             exit 1
           fi
-          "$installed/gitty" agent schema | grep -q '"gitty_context"' \
-            || { echo "agent schema does not list the installed plugin's tools"; exit 1; }
+          "$installed/gitty" mcp --describe | grep -q '"gitty_context"' \
+            || { echo "the installed plugin does not describe its tools"; exit 1; }
           echo "smoke test passed"
 
       - name: Generate checksums

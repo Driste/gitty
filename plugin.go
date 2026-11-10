@@ -124,7 +124,7 @@ type plugin struct {
 
 // installedPlugins lists every plugin findPlugin could run, in name order.
 // Where two files provide the same command the one findPlugin would choose is
-// reported. It is what usage, the agent schema and shell completion show.
+// reported. It is what usage and shell completion show.
 func installedPlugins(exe string) []plugin {
 	dirs := append(pluginDirs(exe), filepath.SplitList(os.Getenv("PATH"))...)
 	seen := map[string]bool{}

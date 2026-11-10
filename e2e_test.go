@@ -946,30 +946,6 @@ func TestE2EVersionLdflagsContract(t *testing.T) {
 	}
 }
 
-func TestE2EAgentSchemaOutput(t *testing.T) {
-	skipIfShort(t)
-
-	stdout, stderr, code := runGitty(t, t.TempDir(), nil, "agent", "schema")
-	if code != 0 {
-		t.Fatalf("agent schema exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
-	}
-
-	var schema AgentSchema
-	if err := json.Unmarshal([]byte(stdout), &schema); err != nil {
-		t.Fatalf("agent schema stdout is not valid JSON: %v\n%s", err, stdout)
-	}
-	if schema.Name != "gitty" {
-		t.Errorf("schema name = %q, want gitty", schema.Name)
-	}
-	sync, ok := findTool(schema, "sync")
-	if !ok {
-		t.Fatal("schema missing sync tool")
-	}
-	if _, ok := sync.InputSchema.Properties["anon"]; !ok {
-		t.Error("sync tool schema missing 'anon' property")
-	}
-}
-
 func TestE2ECLIErrors(t *testing.T) {
 	skipIfShort(t)
 
