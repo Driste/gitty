@@ -57,9 +57,13 @@
   paths and commit ids; it sends no facts.
 - T130 also made the workspace index re-list the instance by itself once a
   day, since `gitty index` was the only thing that did.
-- T140: `scripts/hub-smoke.sh`, run in CI. Against gitlab.com, anonymous:
-  listing a group of 86 projects took 2 s; the script lists, shares a real
+- T140: `scripts/hub-smoke.sh`, run in CI: lists a real group, shares a real
   checkout, walks the tree in both protocol eras and records a note.
+  Measured against gitlab.com, anonymous: a group of 86 projects is listed
+  in 2 s; `gitlab-org` and `components` together, 3,878 projects in 850
+  groups, in 18 s once pages were fetched side by side (86 s one at a time).
+  The whole group tree of that listing is one answer of 31 KB, about 7,800
+  tokens. Sharing a workspace of six checkouts takes 0.6 s.
 - Not built: reading policy scopes, OAuth for MCP clients, private
   projects, verification on the hub's side that a commit it is sent is the
   default branch's (gitty checks this before sending; the hub trusts an

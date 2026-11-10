@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -92,9 +93,20 @@ const (
 )
 
 // get performs one GET as token (which may be empty) and decodes the JSON
-// answer into out. It returns the number of the next page, "" when there is
-// none.
-func (g *gitlab) get(ctx context.Context, token, path string, query url.Values, out any) (next string, err error) {
+// answer into out.
+func (g *gitlab) get(ctx context.Context, token, path string, query url.Values, out any) error {
+	_, err := g.getPage(ctx, token, path, query, out)
+	return err
+}
+
+// paging is what a listing's answer says about the rest of it.
+type paging struct {
+	next  string // the number of the next page, "" when there is none
+	total int    // how many pages there are, 0 when the instance does not say
+}
+
+// getPage is get for one page of a listing.
+func (g *gitlab) getPage(ctx context.Context, token, path string, query url.Values, out any) (paging, error) {
 	target := g.api + path
 	if len(query) > 0 {
 		target += "?" + query.Encode()
@@ -103,7 +115,7 @@ func (g *gitlab) get(ctx context.Context, token, path string, query url.Values, 
 	for {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
-			return "", err
+			return paging{}, err
 		}
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "gitty-up")
@@ -113,13 +125,13 @@ func (g *gitlab) get(ctx context.Context, token, path string, query url.Values, 
 		resp, err := g.http.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
-				return "", ctx.Err()
+				return paging{}, ctx.Err()
 			}
 			if faults++; faults > maxFaultRetries {
-				return "", fmt.Errorf("reaching %s: %w", g.host, scrub(err, token))
+				return paging{}, fmt.Errorf("reaching %s: %w", g.host, scrub(err, token))
 			}
 			if err := g.wait(ctx, time.Duration(faults)*time.Second); err != nil {
-				return "", err
+				return paging{}, err
 			}
 			continue
 		}
@@ -128,7 +140,7 @@ func (g *gitlab) get(ctx context.Context, token, path string, query url.Values, 
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests:
 			if throttled++; throttled > maxThrottleWaits {
-				return "", &apiError{Status: resp.StatusCode, Path: path, Body: "still throttled after waiting; giving up"}
+				return paging{}, &apiError{Status: resp.StatusCode, Path: path, Body: "still throttled after waiting; giving up"}
 			}
 			d := 5 * time.Second
 			if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && s > 0 {
@@ -139,29 +151,30 @@ func (g *gitlab) get(ctx context.Context, token, path string, query url.Values, 
 			}
 			g.logf("throttled by %s: waiting %s before asking again (%d of %d)", g.host, d, throttled, maxThrottleWaits)
 			if err := g.wait(ctx, d); err != nil {
-				return "", err
+				return paging{}, err
 			}
 			continue
 		case resp.StatusCode >= 500 || readErr != nil:
 			if faults++; faults > maxFaultRetries {
 				if readErr != nil {
-					return "", fmt.Errorf("reading the answer from %s: %w", g.host, readErr)
+					return paging{}, fmt.Errorf("reading the answer from %s: %w", g.host, readErr)
 				}
-				return "", &apiError{Status: resp.StatusCode, Path: path, Body: string(body)}
+				return paging{}, &apiError{Status: resp.StatusCode, Path: path, Body: string(body)}
 			}
 			if err := g.wait(ctx, time.Duration(faults)*time.Second); err != nil {
-				return "", err
+				return paging{}, err
 			}
 			continue
 		case resp.StatusCode < 200 || resp.StatusCode > 299:
-			return "", &apiError{Status: resp.StatusCode, Path: path, Body: string(body)}
+			return paging{}, &apiError{Status: resp.StatusCode, Path: path, Body: string(body)}
 		}
 		if out != nil {
 			if err := json.Unmarshal(body, out); err != nil {
-				return "", fmt.Errorf("%s answered something that is not the JSON expected for %s: %w", g.host, path, err)
+				return paging{}, fmt.Errorf("%s answered something that is not the JSON expected for %s: %w", g.host, path, err)
 			}
 		}
-		return resp.Header.Get("X-Next-Page"), nil
+		total, _ := strconv.Atoi(resp.Header.Get("X-Total-Pages"))
+		return paging{next: resp.Header.Get("X-Next-Page"), total: total}, nil
 	}
 }
 
@@ -174,23 +187,67 @@ func scrub(err error, token string) error {
 	return errors.New(strings.ReplaceAll(err.Error(), token, "[token]"))
 }
 
-// pages calls each with every page of a listing.
-func (g *gitlab) pages(ctx context.Context, path string, query url.Values, page any, each func()) error {
-	q := url.Values{}
-	for k, v := range query {
-		q[k] = v
-	}
-	q.Set("per_page", "100")
-	next := "1"
-	for next != "" {
-		q.Set("page", next)
-		var err error
-		if next, err = g.get(ctx, g.token, path, q, page); err != nil {
-			return err
+// listConcurrency is how many pages of one listing are asked for at once.
+// Enough that an instance of thousands of projects is listed in seconds;
+// few enough to stay well inside what an instance allows one client.
+const listConcurrency = 6
+
+// listAll reads every page of a listing, in order. When the instance says
+// how many pages there are, the rest are fetched several at a time; when it
+// does not — GitLab stops counting past ten thousand rows — they are
+// followed one after another.
+func listAll[T any](ctx context.Context, g *gitlab, path string, query url.Values) ([]T, error) {
+	page := func(n string) ([]T, paging, error) {
+		q := url.Values{}
+		for k, v := range query {
+			q[k] = v
 		}
-		each()
+		q.Set("per_page", "100")
+		q.Set("page", n)
+		var rows []T
+		pg, err := g.getPage(ctx, g.token, path, q, &rows)
+		return rows, pg, err
 	}
-	return nil
+	all, pg, err := page("1")
+	if err != nil {
+		return nil, err
+	}
+	if pg.total <= 1 {
+		for pg.next != "" {
+			var rows []T
+			if rows, pg, err = page(pg.next); err != nil {
+				return nil, err
+			}
+			all = append(all, rows...)
+		}
+		return all, nil
+	}
+
+	rest := make([][]T, pg.total+1)
+	errs := make([]error, pg.total+1)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, listConcurrency)
+	for n := 2; n <= pg.total; n++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			if ctx.Err() != nil {
+				errs[n] = ctx.Err()
+				return
+			}
+			rest[n], _, errs[n] = page(strconv.Itoa(n))
+		}(n)
+	}
+	wg.Wait()
+	for n := 2; n <= pg.total; n++ {
+		if errs[n] != nil {
+			return nil, errs[n]
+		}
+		all = append(all, rest[n]...)
+	}
+	return all, nil
 }
 
 // glGroup and glProject are the fields of GitLab's answers that are kept.
@@ -216,45 +273,30 @@ type glProject struct {
 
 // rootGroups lists the top-level groups the hub's token can see.
 func (g *gitlab) rootGroups(ctx context.Context) ([]glGroup, error) {
-	var all, page []glGroup
-	err := g.pages(ctx, "/groups", url.Values{"top_level_only": {"true"}, "all_available": {"true"}}, &page, func() {
-		all = append(all, page...)
-		page = nil
-	})
-	return all, err
+	return listAll[glGroup](ctx, g, "/groups", url.Values{"top_level_only": {"true"}, "all_available": {"true"}})
 }
 
 // group fetches one group by path.
 func (g *gitlab) group(ctx context.Context, path string) (glGroup, error) {
 	var out glGroup
-	_, err := g.get(ctx, g.token, "/groups/"+url.PathEscape(path), url.Values{"with_projects": {"false"}}, &out)
+	err := g.get(ctx, g.token, "/groups/"+url.PathEscape(path), url.Values{"with_projects": {"false"}}, &out)
 	return out, err
 }
 
 // descendants lists every group beneath one.
 func (g *gitlab) descendants(ctx context.Context, id int64) ([]glGroup, error) {
-	var all, page []glGroup
-	err := g.pages(ctx, fmt.Sprintf("/groups/%d/descendant_groups", id), nil, &page, func() {
-		all = append(all, page...)
-		page = nil
-	})
-	return all, err
+	return listAll[glGroup](ctx, g, fmt.Sprintf("/groups/%d/descendant_groups", id), nil)
 }
 
 // projects lists the projects beneath a group, in GitLab's trimmed form —
 // which carries everything the hub keeps except whether a project is
 // archived, so the two kinds are asked for apart.
 func (g *gitlab) projects(ctx context.Context, id int64, archived bool) ([]glProject, error) {
-	var all, page []glProject
 	q := url.Values{
 		"include_subgroups": {"true"}, "simple": {"true"}, "with_shared": {"false"},
 		"archived": {strconv.FormatBool(archived)}, "order_by": {"id"}, "sort": {"asc"},
 	}
-	err := g.pages(ctx, fmt.Sprintf("/groups/%d/projects", id), q, &page, func() {
-		all = append(all, page...)
-		page = nil
-	})
-	return all, err
+	return listAll[glProject](ctx, g, fmt.Sprintf("/groups/%d/projects", id), q)
 }
 
 // glUser is who a token belongs to.
@@ -268,7 +310,7 @@ type glUser struct {
 // whoIs asks the instance whose token this is.
 func (g *gitlab) whoIs(ctx context.Context, token string) (glUser, error) {
 	var u glUser
-	_, err := g.get(ctx, token, "/user", nil, &u)
+	err := g.get(ctx, token, "/user", nil, &u)
 	return u, err
 }
 
@@ -293,7 +335,7 @@ func (g *gitlab) projectAccess(ctx context.Context, token string, id int64) (lev
 			} `json:"group_access"`
 		} `json:"permissions"`
 	}
-	if _, err := g.get(ctx, token, fmt.Sprintf("/projects/%d", id), nil, &p); err != nil {
+	if err := g.get(ctx, token, fmt.Sprintf("/projects/%d", id), nil, &p); err != nil {
 		if s := statusOf(err); s == http.StatusNotFound || s == http.StatusForbidden {
 			return 0, false, nil
 		}
@@ -311,7 +353,7 @@ func (g *gitlab) projectAccess(ctx context.Context, token string, id int64) (lev
 // groupAccess is the same question about a group. Membership is asked about
 // separately, and not being a member is an answer, not a failure.
 func (g *gitlab) groupAccess(ctx context.Context, token string, id, userID int64) (level int, visible bool, err error) {
-	if _, err := g.get(ctx, token, fmt.Sprintf("/groups/%d", id), url.Values{"with_projects": {"false"}}, nil); err != nil {
+	if err := g.get(ctx, token, fmt.Sprintf("/groups/%d", id), url.Values{"with_projects": {"false"}}, nil); err != nil {
 		if s := statusOf(err); s == http.StatusNotFound || s == http.StatusForbidden {
 			return 0, false, nil
 		}
@@ -320,7 +362,7 @@ func (g *gitlab) groupAccess(ctx context.Context, token string, id, userID int64
 	var m struct {
 		AccessLevel int `json:"access_level"`
 	}
-	if _, err := g.get(ctx, token, fmt.Sprintf("/groups/%d/members/all/%d", id, userID), nil, &m); err != nil {
+	if err := g.get(ctx, token, fmt.Sprintf("/groups/%d/members/all/%d", id, userID), nil, &m); err != nil {
 		if s := statusOf(err); s >= 400 && s < 500 {
 			return 0, true, nil
 		}

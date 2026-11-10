@@ -43,6 +43,8 @@ type fakeGitLab struct {
 	throttle int
 	down     bool
 	pageSize int
+	// noTotals leaves out the page count, as GitLab does for long listings.
+	noTotals bool
 }
 
 func newFakeGitLab(t *testing.T) *fakeGitLab {
@@ -87,6 +89,9 @@ func (f *fakeGitLab) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		from = (p - 1) * f.pageSize
 		to = from + f.pageSize
+		if !f.noTotals {
+			w.Header().Set("X-Total-Pages", strconv.Itoa((n+f.pageSize-1)/f.pageSize))
+		}
 		if to >= n {
 			to = n
 		} else {
@@ -358,9 +363,25 @@ func (h *testHub) mustPut(t *testing.T, f *contract.Facts) contract.HubReceipt {
 // --- the listing ---
 
 func TestListingKeepsOnlyWhatIsOpen(t *testing.T) {
+	// Several pages of everything, read both ways: side by side when the
+	// instance says how many pages there are, one after another when not.
+	for _, noTotals := range []bool{false, true} {
+		f := newFakeGitLab(t)
+		f.seed()
+		f.pageSize, f.noTotals = 2, noTotals
+		h := openTestHub(t, f, t.TempDir(), true)
+		var paths []string
+		for _, p := range h.st.projects {
+			paths = append(paths, p.Path)
+		}
+		if len(paths) != 9 || len(h.st.groups) != 4 {
+			t.Errorf("paged listing (totals hidden: %t): %d projects in %d groups, want 9 in 4", noTotals, len(paths), len(h.st.groups))
+		}
+	}
+
 	f := newFakeGitLab(t)
 	f.seed()
-	f.pageSize = 3 // several pages of everything
+	f.pageSize = 3
 	h := openTestHub(t, f, t.TempDir(), true)
 	s := h.st
 	if len(s.projects) != 9 || len(s.groups) != 4 {

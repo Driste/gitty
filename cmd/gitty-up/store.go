@@ -529,12 +529,24 @@ func (s *store) list(ctx context.Context, gl *gitlab, rootPaths []string, now ti
 		for _, g := range below {
 			addGroup(g)
 		}
-		for _, archived := range []bool{false, true} {
-			ps, err := gl.projects(ctx, root.ID, archived)
-			if err != nil {
-				return fmt.Errorf("listing the projects beneath %s: %w", root.FullPath, err)
+		// Live and archived projects are two listings; they are asked for
+		// side by side.
+		var lists [2][]glProject
+		var errs [2]error
+		var wg sync.WaitGroup
+		for i, archived := range []bool{false, true} {
+			wg.Add(1)
+			go func(i int, archived bool) {
+				defer wg.Done()
+				lists[i], errs[i] = gl.projects(ctx, root.ID, archived)
+			}(i, archived)
+		}
+		wg.Wait()
+		for i, archived := range []bool{false, true} {
+			if errs[i] != nil {
+				return fmt.Errorf("listing the projects beneath %s: %w", root.FullPath, errs[i])
 			}
-			for _, p := range ps {
+			for _, p := range lists[i] {
 				if seenProject[p.ID] || !open(p.Visibility) {
 					continue
 				}
