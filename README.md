@@ -13,6 +13,10 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **CI/CD Ready**: Clones over HTTP(S) by default, authenticated with the same token gitty already uses for the API — no SSH keys to provision. Automatically detects `GITLAB_TOKEN` or `CI_JOB_TOKEN`, and exits non-zero when any group or repository fails to sync so a broken pipeline stage is never reported green.
 * **Safe Destinations**: Refuses to write outside the workspace (namespace paths containing `..` or absolute paths are skipped) and reports any repository advertised on a host other than the configured GitLab instance.
 * **Works From Anywhere**: `sync`, `status` and `ls` find the workspace from any directory inside it and act on that directory's group — `cd` into a subgroup and `gitty sync` syncs just that subgroup.
+* **Says What Failed**: A sync with errors ends with a recap of every failed item, and `gitty auth` checks your token any time with a real exit code.
+* **Excludes**: List the projects or subgroups you never want (`exclude = [...]` in the config, or `--exclude`) and every sync and listing leaves them out, reporting each skip.
+* **Orphans**: Checkouts whose project was deleted or moved upstream are reported by `sync` and `ls`; `sync --prune` moves them aside — never deletes.
+* **Shell Completion**: `gitty completion bash|zsh|fish` completes commands, flags, and group paths.
 * **Live Namespace Only**: Projects and groups GitLab has archived are left out of `ls` and `sync` unless you ask for them with `--archived`.
 
 ---
@@ -61,7 +65,8 @@ release or a local build.
 
 Releases are built and published by
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which runs
-when a `v*` tag is pushed **or** a GitHub Release is published:
+when a version tag is pushed — `v1.0.0` or bare `1.0.0`, both work — **or** a
+GitHub Release is published:
 
 ```bash
 git tag v1.0.0
@@ -160,6 +165,8 @@ cd ~/ws/tenant/images        && gitty status               # only this subtree
 | `[group]` | | The GitLab group or subgroup to sync (e.g., `tenant/images`), relative to the current directory's group, as a positional argument. Omitted, the current group is synced — so at the workspace root it is required. |
 | `--path` | `""` | The same, as a flag (deprecated; kept for existing scripts). Not together with the positional form. |
 | `--archived` | `false` | Include projects and groups GitLab has archived. Left out by default. |
+| `--exclude` | `""` | Namespace path or glob to leave out — `acme/vendor` (and everything beneath it), `'acme/*-mirror'`. Repeatable, or comma-separated. Adds to the workspace's `exclude` list (see below). |
+| `--prune` | `false` | Move checkouts that no longer exist upstream aside as `<dir>.gitty-orphan-<n>`. Never deletes anything. Without it, orphans are only reported. |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
 | `--anon` | `false` | Sync public groups and repositories anonymously. Any `GITLAB_TOKEN` / `CI_JOB_TOKEN` in the environment is ignored, so a stale token cannot turn an anonymous run into a 401. Conflicts with `--token`. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
@@ -171,6 +178,54 @@ cd ~/ws/tenant/images        && gitty status               # only this subtree
 | `--reclone-broken` | `false` | When a destination exists but is not a usable git repo (e.g. a wedged partial clone), move it aside (renamed to `<dir>.gitty-broken-<n>`, never deleted) and clone fresh. |
 | `--accept-new-host-keys` | `false` | For SSH clones, record unknown host keys without prompting (ssh `StrictHostKeyChecking=accept-new`). A *changed* host key is still refused. |
 | `--allow-clone-host` | `""` | Record an extra host this run expects to clone from, silencing the note about it. Repeatable, or comma-separated. Adds to whatever `init` stored. |
+
+### Leaving things out (`exclude`)
+
+Some projects you never want on disk — a monorepo measured in gigabytes, a
+vendored mirror, a subgroup that belongs to another team. List them once in
+`.gitty/config` and every `sync` and `ls` leaves them out:
+
+```toml
+url = "https://gitlab.example.com"
+http = true
+root_path = ""
+exclude = ["acme/vendor", "acme/*-mirror", "acme/platform/monorepo"]
+```
+
+An entry is a full GitLab path, which also covers everything beneath it, or a
+glob in Go's `path.Match` syntax (`*` does not cross `/`). `--exclude` adds
+patterns for one run. Excluded items are reported rather than silently dropped
+— `sync` emits `skip <path> excluded` for each and counts them in the summary's
+`skipped=` — and the list is inherited by the subgroup directories `--groups`
+creates. An excluded project that is already checked out is left alone.
+
+### Checkouts that no longer exist upstream (orphans)
+
+Projects get deleted, moved to another namespace, or transferred away. The
+checkouts they left behind in your workspace are **orphans**: `sync` reports
+each one after it has synced the rest —
+
+```
+orphan tenant/images/old no project upstream
+```
+
+— and `ls` lists them as `orphan` (red in the tree), so you can see what a sync
+will not touch. Archived projects are not orphans (they still exist; they are
+just not synced by default), and neither is anything you have excluded.
+
+Nothing is removed on your behalf. `sync --prune` moves each orphan aside as
+`<dir>.gitty-orphan-<n>` — contents intact, out of the way of future syncs and
+`status` — and reports it as `prune <path>`. A `--dry-run` shows `plan prune`.
+Without `--nested`, only the target group's own directory is examined, matching
+what the sync itself covered.
+
+### Progress on a terminal
+
+When stderr is a terminal, `sync` keeps a single status line at the bottom
+while it works — `[12/97] cloning acme/platform/api` — and redraws it around
+every event and diagnostic so nothing is torn. Piped or redirected output never
+sees it, so scripts and logs get exactly the event lines and diagnostics
+documented above.
 
 ### Your git config is respected
 
@@ -321,15 +376,30 @@ clone tenant/images/app        # repo cloned
 pull tenant/images/app         # repo fast-forwarded (git pull --ff-only)
 group tenant/images            # group dir + nested config ensured
 reclone tenant/images/app      # broken checkout moved aside and re-cloned
+skip tenant/images/vendor excluded          # matched an exclude pattern
+orphan tenant/images/old no project upstream   # local checkout, nothing upstream (see --prune)
+prune tenant/images/old        # --prune: moved aside as old.gitty-orphan-1
 error tenant/images/app git pull failed
 error tenant/images/lib git fetch failed   # a clone that failed (the fetch is its network step)
 plan clone tenant/images/app   # --dry-run: "plan " + the exact action line
 summary cloned=3 pulled=12 skipped=0 errors=1   # always the last line
 ```
 
+When a run finds orphans the summary line also carries `orphans=N pruned=M`;
+on a clean run it is exactly the line above.
+
 Exit codes: `0` success · `1` completed with per-item failures · `2` usage or
 configuration error · `130` interrupted (Ctrl-C; git is signalled cleanly and
 a re-run recovers the workspace).
+
+A run with failures ends with a recap of them on stderr, so you never have to
+scroll back through a long sync to find what went wrong:
+
+```
+2 failed:
+  tenant/images/app git pull failed
+  tenant/images/lib git fetch failed
+```
 
 ### `init` checks your token
 
@@ -354,6 +424,22 @@ created either way — takes well under a second, and never blocks: pass
 enough to support token introspection; where it is unavailable gitty says so
 rather than guessing. CI job tokens cannot be introspected and are reported
 as such.
+
+### Re-checking your token (`gitty auth`)
+
+The same check is available on demand for an existing workspace — after
+rotating a token, before a long sync, or when a sync just failed with an
+authentication error:
+
+```bash
+gitty auth            # uses GITLAB_TOKEN / CI_JOB_TOKEN
+gitty auth --token=…  # verify a specific token (never stored)
+```
+
+It prints the instance and transport, then the report above, and unlike at
+`init` it has a verdict: exit `0` when the token works, `2` when it is missing,
+rejected, revoked or lacks a scope this workspace needs, `1` when the instance
+could not be reached. Works from any directory inside the workspace.
 
 ### Token scopes
 
@@ -482,8 +568,9 @@ unknowable rather than zero.
 ## Browsing (`gitty ls`)
 
 Lists the remote groups and projects under a target, nesting subgroups and
-marking each project `present` (already checked out) or `new` (a sync would
-clone it). It never invokes git and never writes to the workspace.
+marking each project `present` (already checked out), `new` (a sync would
+clone it) or `orphan` (checked out locally, but no longer upstream). It never
+invokes git and never writes to the workspace.
 
 `ls` takes its target as a positional argument and resolves it the way a shell
 resolves a directory, against the group of the directory you are standing in
@@ -530,11 +617,31 @@ colour**, so scripts keep parsing stable output. Override either with
 | `--anon` | `false` | List public groups and projects anonymously. |
 | `--nested` | `false` | Recurse into nested subgroups. Per-group project counts are only complete in this mode. |
 | `--archived` | `false` | Include projects and groups GitLab has archived, marking each archived project (`archived` on its event line, `, archived` in the tree). Left out by default, matching what `sync` would clone. |
+| `--exclude` | `""` | Namespace path or glob to leave out for this listing. Repeatable. Adds to the workspace's `exclude` list. |
 | `--format` | `auto` | `auto` (tree on a terminal, `text` when piped), `tree`, `text`, or `json`. |
 | `--color` | `auto` | `auto` (only on a terminal), `always`, or `never`. |
 
 `--path` still works in place of the positional argument, but the two cannot be
 combined.
+
+---
+
+## Shell completion (`gitty completion`)
+
+```bash
+# bash
+gitty completion bash > ~/.local/share/bash-completion/completions/gitty
+# zsh
+gitty completion zsh > "${fpath[1]}/_gitty"      # then restart the shell
+# fish
+gitty completion fish > ~/.config/fish/completions/gitty.fish
+```
+
+Completes commands, every command's flags, and — for `sync` and `ls` — the
+group argument as a directory, since inside a workspace groups *are*
+directories and the argument is relative to the one you are in. The scripts
+are generated from the same table that drives the binary, so a new flag is
+completed as soon as it exists.
 
 ---
 
@@ -621,4 +728,4 @@ go build -o gitty . && ./scripts/integration-test.sh
 - [x] Async pull down repos (`--jobs`)
 - [x] Show repos current branches and if they are out of date, maybe a cache (`gitty status`, with `--fetch`)
 - [x] Show how many projects are in each group (`gitty ls`)
-- [ ] Show the current groups/projects and which will be removed or added when doing a subsequent run (`gitty ls` covers *added*; *removed* still needs orphan detection)
+- [x] Show the current groups/projects and which will be removed or added when doing a subsequent run (`gitty ls`: `new` is what a sync adds, `orphan` is what no longer exists upstream; `sync --prune` moves orphans aside)

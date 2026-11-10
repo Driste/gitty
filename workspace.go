@@ -127,7 +127,7 @@ const brokenAsideMarker = ".gitty-broken-"
 // findRepos walks root and returns every git checkout beneath it, as paths
 // relative to root using forward slashes. It does not descend into a repo once
 // found (submodules and vendored checkouts are part of their parent), and
-// skips gitty's own config dirs and moved-aside broken checkouts.
+// skips gitty's own config dirs and moved-aside (broken or orphaned) checkouts.
 func findRepos(root string) ([]string, error) {
 	var repos []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -137,7 +137,7 @@ func findRepos(root string) ([]string, error) {
 			return nil //nolint:nilerr
 		}
 		base := filepath.Base(path)
-		if path != root && (base == ConfigDir || strings.Contains(base, brokenAsideMarker)) {
+		if path != root && (base == ConfigDir || strings.Contains(base, brokenAsideMarker) || strings.Contains(base, orphanAsideMarker)) {
 			return filepath.SkipDir
 		}
 		if classifyDest(path) == destRepo {

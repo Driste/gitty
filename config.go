@@ -29,6 +29,35 @@ type Config struct {
 	// advertising repositories on another host (a split API/git deployment, or
 	// a mirror) is intended, which silences the note gitty otherwise prints.
 	CloneHosts []string `toml:"clone_hosts,omitempty"`
+
+	// Exclude lists namespace paths this workspace never syncs or lists: a
+	// huge monorepo, a vendored mirror, a subgroup that belongs to another
+	// team. Each entry is a full GitLab path ("acme/vendor") — which also
+	// covers everything beneath it — or a path.Match glob ("acme/*-mirror").
+	Exclude []string `toml:"exclude,omitempty"`
+}
+
+// AddExcludes adds a command's --exclude patterns to the workspace's own.
+func (c *Config) AddExcludes(patterns []string) {
+	c.Exclude = append(c.Exclude, patterns...)
+}
+
+// Excluded reports whether a namespace path is covered by an exclude entry:
+// equal to it, beneath it, or matching it as a glob.
+func (c *Config) Excluded(nsPath string) bool {
+	for _, pat := range c.Exclude {
+		pat = strings.Trim(strings.TrimSpace(pat), "/")
+		if pat == "" {
+			continue
+		}
+		if nsPath == pat || strings.HasPrefix(nsPath, pat+"/") {
+			return true
+		}
+		if ok, err := path.Match(pat, nsPath); err == nil && ok {
+			return true
+		}
+	}
+	return false
 }
 
 // AllowCloneHosts adds hosts from a command's --allow-clone-host flags to the
@@ -186,7 +215,7 @@ func contextBelow(cfgDir, wd string) (groupDir, below string) {
 	var parts []string
 	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
 		next := filepath.Join(groupDir, seg)
-		if seg == ConfigDir || strings.Contains(seg, brokenAsideMarker) || classifyDest(next) == destRepo {
+		if seg == ConfigDir || strings.Contains(seg, brokenAsideMarker) || strings.Contains(seg, orphanAsideMarker) || classifyDest(next) == destRepo {
 			break
 		}
 		groupDir = next

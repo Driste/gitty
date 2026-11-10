@@ -54,7 +54,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.2.0"
+const AgentSchemaVersion = "3.6.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -181,6 +181,15 @@ func buildAgentSchema() AgentSchema {
 							Description: "Include projects and groups GitLab has archived. They are left out by default, so a workspace mirrors the live namespace.",
 							Default:     false,
 						},
+						"exclude": {
+							Type:        "string",
+							Description: "Namespace path or glob to leave out, e.g. 'acme/vendor' (covers everything beneath it) or 'acme/*-mirror'. Repeatable, and also accepts a comma-separated list. Adds to the workspace's exclude list; excluded projects are reported as 'skip <path> excluded'.",
+						},
+						"prune": {
+							Type:        "boolean",
+							Description: "Move checkouts that no longer exist upstream (reported as 'orphan <path> no project upstream' without this flag) aside as <dir>.gitty-orphan-<n>, reported as 'prune <path>'. Nothing is ever deleted. Archived and excluded projects are never treated as orphans.",
+							Default:     false,
+						},
 						"allow-clone-host": {
 							Type:        "string",
 							Description: "Records an additional host this workspace expects to clone from, beyond the instance's own. Advisory: gitty never refuses a clone over the host, because the local git config (including url.<base>.insteadOf rules in conditional includes) has the final say on the URL. Listing a host only silences the note gitty prints when repositories come from somewhere other than the instance. Repeatable, and also accepts a comma-separated list.",
@@ -242,7 +251,7 @@ func buildAgentSchema() AgentSchema {
 			},
 			{
 				Name:        "ls",
-				Description: "List the remote groups and projects under a target, marking each project 'new' (a sync would clone it) or 'present' (already checked out). Read-only: it contacts the GitLab API but never invokes git or writes to the workspace.",
+				Description: "List the remote groups and projects under a target, marking each project 'new' (a sync would clone it), 'present' (already checked out) or 'orphan' (checked out locally but no longer upstream; a sync --prune would move it aside). Read-only: it contacts the GitLab API but never invokes git or writes to the workspace.",
 				InputSchema: InputSchema{
 					Type: "object",
 					Properties: map[string]SchemaProp{
@@ -269,6 +278,10 @@ func buildAgentSchema() AgentSchema {
 							Description: "Include projects and groups GitLab has archived, marking each archived project. Left out by default, matching what sync would clone.",
 							Default:     false,
 						},
+						"exclude": {
+							Type:        "string",
+							Description: "Namespace path or glob to leave out, e.g. 'acme/vendor' (covers everything beneath it) or 'acme/*-mirror'. Repeatable, and also accepts a comma-separated list. Adds to the workspace's exclude list; excluded items are simply omitted from the listing.",
+						},
 						"format": {
 							Type:        "string",
 							Description: "Output format: 'auto' (an indented tree on a terminal, greppable event lines when piped), 'tree', 'text', or 'json'. Always pass 'json' explicitly when consuming this programmatically rather than relying on auto-detection.",
@@ -285,6 +298,43 @@ func buildAgentSchema() AgentSchema {
 					Command:   "gitty",
 					BaseArgs:  []string{"ls"},
 					FlagStyle: "the 'path' argument is positional (gitty ls <path>); other arguments are --<name>=<value> for strings, --<name> for booleans, and may appear on either side of it",
+				},
+			},
+			{
+				Name:        "auth",
+				Description: "Check the configured token against the workspace's GitLab instance and report the authenticated user, the token's scopes, and any scope the workspace needs but the token lacks. Exit 0 when the token works, 2 when it is missing, rejected, revoked or under-scoped, 1 when the instance could not be reached. Run it after rotating a token or when a sync fails with an authentication error.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"token": {
+							Type:        "string",
+							Description: "GitLab access token to verify. Falls back to GITLAB_TOKEN or CI_JOB_TOKEN. Never stored.",
+						},
+					},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"auth"},
+					FlagStyle: "--<name>=<value> for strings",
+				},
+			},
+			{
+				Name:        "completion",
+				Description: "Print a shell completion script for bash, zsh or fish to stdout. Not useful to an agent directly; included so the command list is complete.",
+				InputSchema: InputSchema{
+					Type: "object",
+					Properties: map[string]SchemaProp{
+						"shell": {
+							Type:        "string",
+							Description: "One of bash, zsh, fish. Passed as a positional argument.",
+						},
+					},
+					Required: []string{"shell"},
+				},
+				Invocation: Invocation{
+					Command:   "gitty",
+					BaseArgs:  []string{"completion"},
+					FlagStyle: "the 'shell' argument is positional (gitty completion <shell>)",
 				},
 			},
 			{
