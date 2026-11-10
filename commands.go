@@ -22,11 +22,8 @@ var commands = []command{
 	{"sync", "Sync (clone/pull) a GitLab group: gitty sync [group] [flags]", true, func(fs *flag.FlagSet) { declareSyncFlags(fs) }},
 	{"status", "Report the branch and freshness of every checkout in the workspace", false, func(fs *flag.FlagSet) { declareStatusFlags(fs) }},
 	{"ls", "List the remote groups/projects for a target and what a sync would clone", true, func(fs *flag.FlagSet) { declareLsFlags(fs) }},
-	{"context", "Brief a project: what it uses, what uses it, and where each is: gitty context [project] [flags]", true, func(fs *flag.FlagSet) { declareContextFlags(fs) }},
 	{"fetch", "Make sure the named projects are checked out: gitty fetch <group/project>... [flags]", false, func(fs *flag.FlagSet) { declareFetchFlags(fs) }},
 	{"share", "Send the instance's hub what the checkouts here say", false, func(fs *flag.FlagSet) { declareShareFlags(fs) }},
-	{"index", "Index the workspace: project metadata, and the links between checkouts", false, func(fs *flag.FlagSet) { declareIndexFlags(fs) }},
-	{"related", "List what a project uses and what uses it: gitty related [project] [flags]", true, func(fs *flag.FlagSet) { declareRelatedFlags(fs) }},
 	{"auth", "Check the token against the workspace's instance and report its scopes", false, func(fs *flag.FlagSet) { declareAuthFlags(fs) }},
 	{"completion", "Print a shell completion script: gitty completion bash|zsh|fish", false, nil},
 	{"version", "Print the gitty version", false, nil},
@@ -178,72 +175,6 @@ func declareLsFlags(fs *flag.FlagSet) *lsFlags {
 	fs.Var(&f.exclude, "exclude", "Namespace path or glob to leave out (repeatable, or comma-separated; adds to the workspace's exclude list)")
 	f.format = fs.String("format", "auto", "Output format: auto, tree, text, or json")
 	f.color = fs.String("color", "auto", "Colorize output: auto, always, or never")
-	return f
-}
-
-type indexFlags struct {
-	token    *string
-	anon     *bool
-	dryRun   *bool
-	verbose  *bool
-	rescan   *bool
-	archived *bool
-	jobs     *int
-	exclude  stringList
-}
-
-func declareIndexFlags(fs *flag.FlagSet) *indexFlags {
-	f := &indexFlags{}
-	f.token = fs.String("token", "", "GitLab Access Token (falls back to env vars)")
-	f.anon = fs.Bool("anon", false, "Index public projects anonymously (no token required)")
-	f.dryRun = fs.Bool("dry-run", false, "Report what would be indexed without writing the index")
-	f.verbose = fs.Bool("verbose", false, "Print each git invocation and its output to stderr")
-	f.rescan = fs.Bool("rescan", false, "Read every checkout again, not only those whose commit moved (picks up uncommitted edits)")
-	f.archived = fs.Bool("archived", false, "Also ask archived projects what they use (they are always indexed as something others may use)")
-	f.jobs = fs.Int("jobs", 4, "Number of checkouts to read concurrently (1-16)")
-	fs.Var(&f.exclude, "exclude", "Namespace path or glob to leave out of this run (repeatable, or comma-separated; adds to the workspace's exclude list)")
-	return f
-}
-
-type relatedFlags struct {
-	direction *string
-	token     *string
-	anon      *bool
-	verbose   *bool
-	jobs      *int
-}
-
-func declareRelatedFlags(fs *flag.FlagSet) *relatedFlags {
-	f := &relatedFlags{}
-	f.direction = fs.String("direction", "both", "Which links to list: uses, used-by, or both")
-	f.token = fs.String("token", "", "GitLab Access Token (only needed when the index has to be built)")
-	f.anon = fs.Bool("anon", false, "If the index has to be built, list public projects anonymously")
-	f.verbose = fs.Bool("verbose", false, "Print each git invocation and its output to stderr")
-	f.jobs = fs.Int("jobs", 4, "Number of checkouts to read concurrently when the index is refreshed (1-16)")
-	return f
-}
-
-type contextFlags struct {
-	direction      *string
-	format         *string
-	fetch          *bool
-	token          *string
-	anon           *bool
-	verbose        *bool
-	jobs           *int
-	acceptHostKeys *bool
-}
-
-func declareContextFlags(fs *flag.FlagSet) *contextFlags {
-	f := &contextFlags{}
-	f.direction = fs.String("direction", "both", "Which side to brief: uses, used-by, or both")
-	f.format = fs.String("format", "markdown", "Output format: markdown or json")
-	f.fetch = fs.Bool("fetch", false, "Clone the projects this one uses that are not checked out yet, into their namespace paths")
-	f.token = fs.String("token", "", "GitLab Access Token (needed to fetch, or when the index has to be built)")
-	f.anon = fs.Bool("anon", false, "Reach the instance anonymously when it is needed (public projects only)")
-	f.verbose = fs.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
-	f.jobs = fs.Int("jobs", 4, "Number of concurrent clones and checkout reads (1-16)")
-	f.acceptHostKeys = fs.Bool("accept-new-host-keys", false, "With --fetch over SSH, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new)")
 	return f
 }
 

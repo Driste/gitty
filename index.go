@@ -204,6 +204,10 @@ type indexEvent struct {
 	Unres   contract.Unresolved
 }
 
+// listingMaxAge is how old the index's listing of the instance may get
+// before a refresh that can reach the instance takes it again.
+const listingMaxAge = 24 * time.Hour
+
 // refreshOptions say how far a refresh goes.
 type refreshOptions struct {
 	// List reads project metadata from the API. Without it the API is used
@@ -301,10 +305,18 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 	// A checkout the index has never heard of may be a project created
 	// upstream since the last listing. That is worth one listing to find
 	// out — but not worth failing over: offline, or without a token, the
-	// checkout is indexed as it stands and the next `gitty index` settles it.
+	// checkout is indexed as it stands and a later listing settles it.
 	optional := false
 	if unknown && !mustList && w.requireAPI() == nil {
 		mustList, optional = true, true
+	}
+	// A listing also goes stale by itself: projects are created, renamed
+	// and archived. Nothing asks for it to be taken again, so it is taken
+	// again when it is a day old and the instance can be asked — and, like
+	// the one above, never at the price of failing.
+	aged := false
+	if !mustList && !idx.ListedAt.IsZero() && time.Since(idx.ListedAt) > listingMaxAge && w.requireAPI() == nil {
+		mustList, optional, aged = true, true, true
 	}
 	reachable := false // the instance answered during this refresh
 	if mustList {
@@ -317,10 +329,11 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 		switch {
 		case err == nil:
 			reachable = true
-			if opts.List {
-				// An explicit refresh learns again what earlier lookups
-				// taught: a project found outside the listed namespaces
-				// may be gone, a path that had nothing may have something.
+			if opts.List || aged {
+				// A fresh listing is the moment to learn again what
+				// earlier lookups taught: a project found outside the
+				// listed namespaces may be gone, a path that had nothing
+				// may have something.
 				forgetLookups(idx, namespaces)
 			}
 			applyListing(idx, cfg, listed, namespaces)
@@ -333,7 +346,7 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 			w.lookUpCheckouts(ctx, idx, known)
 			changed = true
 		case optional:
-			w.s.diagf("note: project metadata was not refreshed (%v); checkouts unknown to the index are listed without it until 'gitty index' can reach the instance", err)
+			w.s.diagf("note: project metadata was not refreshed (%v); what the index knows of the instance is as it was", err)
 		default:
 			return nil, stats, err
 		}

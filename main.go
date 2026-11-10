@@ -22,7 +22,7 @@ func main() {
 
 	// `gitty -C <dir> <command>` runs the command as if started in <dir>,
 	// as git's -C does. It is what lets something that cannot choose its own
-	// working directory — an agent host starting `gitty mcp`, a cron job —
+	// working directory — a service manager starting `gitty up`, a cron job —
 	// say which workspace it means.
 	exitOnError(changeDirectory())
 
@@ -144,28 +144,6 @@ func main() {
 		})
 		stop()
 		exitOnError(err)
-	case "context":
-		fs := newFlagSet("context")
-		f := declareContextFlags(fs)
-		flagArgs, positional := splitFlagArgs(fs, os.Args[2:])
-		fs.Parse(flagArgs)
-		subject, err := singlePositional("context", "project or group", positional)
-		exitOnError(err)
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		err = runContext(ctx, contextOptions{
-			Subject:   subject,
-			Direction: *f.direction,
-			Format:    *f.format,
-			Fetch:     *f.fetch,
-			Token:     *f.token,
-			Anon:      *f.anon,
-			Verbose:   *f.verbose,
-			Jobs:      *f.jobs,
-
-			AcceptNewHostKeys: *f.acceptHostKeys,
-		})
-		stop()
-		exitOnError(err)
 	case "fetch":
 		fs := newFlagSet("fetch")
 		f := declareFetchFlags(fs)
@@ -205,44 +183,6 @@ func main() {
 			DryRun:  *f.dryRun,
 			Verbose: *f.verbose,
 			Jobs:    *f.jobs,
-		})
-		stop()
-		exitOnError(err)
-	case "index":
-		fs := newFlagSet("index")
-		f := declareIndexFlags(fs)
-		fs.Parse(os.Args[2:])
-		if fs.NArg() > 0 {
-			exitOnError(usageErrf("index takes no arguments: it always covers the whole workspace"))
-		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		err := runIndex(ctx, indexOptions{
-			Token:           *f.token,
-			Anon:            *f.anon,
-			DryRun:          *f.dryRun,
-			Verbose:         *f.verbose,
-			Jobs:            *f.jobs,
-			Rescan:          *f.rescan,
-			IncludeArchived: *f.archived,
-			Exclude:         f.exclude,
-		})
-		stop()
-		exitOnError(err)
-	case "related":
-		fs := newFlagSet("related")
-		f := declareRelatedFlags(fs)
-		flagArgs, positional := splitFlagArgs(fs, os.Args[2:])
-		fs.Parse(flagArgs)
-		subject, err := singlePositional("related", "project or group", positional)
-		exitOnError(err)
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		err = runRelated(ctx, relatedOptions{
-			Subject:   subject,
-			Direction: *f.direction,
-			Token:     *f.token,
-			Anon:      *f.anon,
-			Verbose:   *f.verbose,
-			Jobs:      *f.jobs,
 		})
 		stop()
 		exitOnError(err)

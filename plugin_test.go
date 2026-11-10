@@ -160,8 +160,8 @@ func TestInstalledPlugins(t *testing.T) {
 	onPath := filepath.Join(root, "path")
 	exe := filepath.Join(beside, "gitty")
 
-	writeStub(t, beside, "gitty-mcp", "exit 0")
-	writeStub(t, onPath, "gitty-mcp", "exit 0") // shadowed by the one beside gitty
+	writeStub(t, beside, "gitty-up", "exit 0")
+	writeStub(t, onPath, "gitty-up", "exit 0") // shadowed by the one beside gitty
 	writeStub(t, onPath, "gitty-audit", "exit 0")
 	writeStub(t, onPath, "gitty-sync", "exit 0")     // a built-in: never a plugin
 	writeStub(t, onPath, "gitty-notes.sh", "exit 0") // not a command name
@@ -173,7 +173,7 @@ func TestInstalledPlugins(t *testing.T) {
 	got := installedPlugins(exe)
 	want := []plugin{
 		{Name: "audit", Path: filepath.Join(onPath, "gitty-audit")},
-		{Name: "mcp", Path: filepath.Join(beside, "gitty-mcp")},
+		{Name: "up", Path: filepath.Join(beside, "gitty-up")},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("installedPlugins = %+v, want %+v", got, want)
@@ -460,12 +460,12 @@ exit 3`)
 		}
 	})
 
-	t.Run("mcp without its plugin says how to get it", func(t *testing.T) {
-		stdout, stderr, code := runGittyAt(t, gittyBin, root, "", withPath, "mcp")
+	t.Run("up without its plugin says how to get it", func(t *testing.T) {
+		stdout, stderr, code := runGittyAt(t, gittyBin, root, "", withPath, "up")
 		if code != 2 || stdout != "" {
 			t.Errorf("exit = %d, stdout = %q; want 2 and nothing on stdout", code, stdout)
 		}
-		for _, want := range []string{"gitty-mcp", "not installed", releasesURL, "next to gitty"} {
+		for _, want := range []string{"gitty-up", "not installed", releasesURL, "next to gitty"} {
 			if !strings.Contains(stderr, want) {
 				t.Errorf("stderr missing %q:\n%s", want, stderr)
 			}

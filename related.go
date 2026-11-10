@@ -6,13 +6,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"gitty/internal/contract"
 )
 
-// subject is what `gitty related` and `gitty context` report on: one
+// subject is what `gitty sync --related` starts from: one
 // project, or a group — every project beneath a namespace path.
 type subject struct {
 	Group bool
@@ -122,7 +121,7 @@ func (w *workspace) resolveSubject(idx *contract.Index, arg string) (subject, er
 			}
 		}
 	}
-	return subject{}, usageErrf("no project or group %q in this workspace's index ('gitty index' refreshes it from the instance)", arg)
+	return subject{}, usageErrf("no project or group %q is known in this workspace", arg)
 }
 
 // rescanHints names the projects a subject argument might turn out to be,
@@ -162,36 +161,6 @@ func (w *workspace) ensureFresh(ctx context.Context, arg string) (*contract.Inde
 	return idx, nil
 }
 
-// subjectLinks splits the index's links by how they touch a subject: uses
-// (from it, to outside), usedBy (from outside, to it) and, for a group,
-// within (between two of its own projects).
-func subjectLinks(idx *contract.Index, s subject) (uses, usedBy, within []contract.Link) {
-	for _, l := range idx.Links {
-		from, to := s.contains(l.From), s.contains(l.To)
-		switch {
-		case from && to:
-			within = append(within, l)
-		case from:
-			uses = append(uses, l)
-		case to:
-			usedBy = append(usedBy, l)
-		}
-	}
-	sortLinks(uses)
-	sortLinks(within)
-	sort.Slice(usedBy, func(i, j int) bool {
-		a, b := usedBy[i], usedBy[j]
-		if a.To != b.To {
-			return a.To < b.To
-		}
-		if a.From != b.From {
-			return a.From < b.From
-		}
-		return a.Kind < b.Kind
-	})
-	return uses, usedBy, within
-}
-
 // Directions a relationship can be asked about.
 const (
 	directionUses   = "uses"
@@ -199,7 +168,7 @@ const (
 	directionBoth   = "both"
 )
 
-// parseDirection validates a --direction value.
+// parseDirection validates a direction as written after --related=.
 func parseDirection(v string) (string, error) {
 	switch v {
 	case "", directionBoth:
@@ -207,75 +176,17 @@ func parseDirection(v string) (string, error) {
 	case directionUses, directionUsedBy:
 		return v, nil
 	}
-	return "", usageErrf("invalid --direction %q: choose %s, %s or %s", v, directionUses, directionUsedBy, directionBoth)
+	return "", usageErrf("invalid --related=%q: choose %s, %s or %s", v, directionUses, directionUsedBy, directionBoth)
 }
 
-// relatedOptions bundles the related command's flags.
-type relatedOptions struct {
-	Subject   string
-	Direction string
-	Token     string
-	Anon      bool
-	Verbose   bool
-	Jobs      int
-}
+// maxSubjectLookups bounds how many of a subject's unsettled references one
+// run asks the instance about.
+const maxSubjectLookups = 20
 
-// runRelated prints a project's links as greppable lines:
-//
-//	related <project> <kind> <target> <evidence>
-//	related-by <project> <kind> <source> <evidence>
-//	unresolved <project> <reference> <evidence>
-//	summary uses=N used-by=N unresolved=N
-//
-// `related` is a project the subject uses; `related-by` one that uses it.
-// The evidence is a file and line in whichever project holds the reference —
-// the first-named one for `related`, the source for `related-by`.
-func runRelated(ctx context.Context, opts relatedOptions) error {
-	direction, err := parseDirection(opts.Direction)
-	if err != nil {
-		return err
+// describeRoot names a workspace's root for a person.
+func describeRoot(rootPath string) string {
+	if rootPath == "" {
+		return "every group in this workspace"
 	}
-	if opts.Jobs < 1 || opts.Jobs > maxJobs {
-		return usageErrf("--jobs must be between 1 and %d, got %d", maxJobs, opts.Jobs)
-	}
-	w, err := openWorkspace(opts.Token, opts.Anon)
-	if err != nil {
-		return err
-	}
-	w.s.verbose = opts.Verbose
-	w.s.jobs = opts.Jobs
-
-	idx, err := w.ensureFresh(ctx, opts.Subject)
-	if err != nil {
-		return err
-	}
-	subj, err := w.resolveSubject(idx, opts.Subject)
-	if err != nil {
-		return err
-	}
-	uses, usedBy, within := subjectLinks(idx, subj)
-
-	out := w.s.out
-	nUses, nUsedBy, nUnresolved := 0, 0, 0
-	if direction != directionUsedBy {
-		// Links inside a group are its projects using each other.
-		for _, l := range append(within, uses...) {
-			fmt.Fprintf(out, "related %s %s %s %s\n", l.From, l.Kind, l.To, l.Evidence)
-			nUses++
-		}
-		for _, u := range idx.Unresolved {
-			if subj.contains(u.From) {
-				fmt.Fprintf(out, "unresolved %s %s %s\n", u.From, u.Ref, u.Evidence)
-				nUnresolved++
-			}
-		}
-	}
-	if direction != directionUses {
-		for _, l := range usedBy {
-			fmt.Fprintf(out, "related-by %s %s %s %s\n", l.To, l.Kind, l.From, l.Evidence)
-			nUsedBy++
-		}
-	}
-	fmt.Fprintf(out, "summary uses=%d used-by=%d unresolved=%d\n", nUses, nUsedBy, nUnresolved)
-	return nil
+	return "'" + rootPath + "'"
 }

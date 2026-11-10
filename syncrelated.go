@@ -19,9 +19,7 @@ import (
 // uses it, or both. Links are followed one step: what a newly cloned
 // project uses in turn is the business of the next run, from there.
 //
-// It is the shell counterpart of `gitty context --fetch`, with the one
-// difference that makes it a sync: it also brings what is already there up
-// to date. Events and the summary line are a sync's, and so is --dry-run.
+// Events and the summary line are a sync's, and so is --dry-run.
 //
 // A related project is synced whether or not it is archived: a sync leaves
 // archived projects out because nobody asked for them, and these were asked
@@ -88,10 +86,10 @@ func runSyncRelated(ctx context.Context, opts syncOptions) error {
 	// answers to itself.
 	unplaced := func(u contract.Unresolved) bool { return subj.contains(u.From) }
 	if opts.DryRun {
-		if w.lookUpRefs(ctx, idx, unplaced, maxContextLookups) {
+		if w.lookUpRefs(ctx, idx, unplaced, maxSubjectLookups) {
 			reconcile(idx, newResolver(idx, s.cfg))
 		}
-	} else if _, err := w.settleRefs(ctx, idx, unplaced, maxContextLookups); err != nil {
+	} else if _, err := w.settleRefs(ctx, idx, unplaced, maxSubjectLookups); err != nil {
 		return err
 	}
 	if ctx.Err() != nil {

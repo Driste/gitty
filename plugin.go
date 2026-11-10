@@ -47,7 +47,7 @@ var pluginNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 // knownPlugins are the plugins gitty's own releases publish. A missing one is
 // answered with what it is and where to get it, rather than "unknown command".
 var knownPlugins = map[string]string{
-	"mcp": "serves cross-repository context to coding agents over the Model Context Protocol",
+	"up": "is the instance's shared context: it serves what is known about its projects to coding agents, over the Model Context Protocol",
 }
 
 // releasesURL is where a plugin published with gitty is downloaded from.

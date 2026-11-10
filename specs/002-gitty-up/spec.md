@@ -2,7 +2,7 @@
 
 **Feature Branch**: `001-cross-repo-context` (continues there; see Open Decisions)
 **Created**: 2026-11-10
-**Status**: Draft — awaiting the answers under "Open Decisions"
+**Status**: Implemented. The defaults under "Decisions" were accepted as written ("Yup build it").
 **Input**: User description: "Another binary that can run as an MCP
 service/daemon … if the user asks 'let's add a pipeline for building an
 image', the server will say there's a component project here for doing that,
@@ -162,17 +162,20 @@ the commit it was read at.
 
 **Acceptance Scenarios**:
 
-1. **Given** a workspace whose config names a hub, **When** gitty clones or
-   fast-forwards a project, **Then** it submits what the checkout says and
-   prints one event line for it; with no hub configured nothing is sent.
+1. **Given** a workspace whose config names a hub, **When** a sync or a
+   fetch finishes, **Then** gitty submits what the checkouts say and says so
+   in a line on stderr, leaving the command's own output and exit code as
+   they were; `gitty share` does the same on its own with one event line per
+   checkout; with no hub configured nothing is sent.
 2. **Given** facts for a project at an older commit, **When** facts for a
    newer commit of its default branch arrive, **Then** they replace the old
    ones, links that are gone are gone, and notes are kept.
 3. **Given** a checkout that is not at a commit of the default branch, or
    has uncommitted changes, **When** gitty would submit, **Then** it does
    not: a branch in progress is not the project's account of itself.
-4. **Given** `--dry-run`, **When** gitty would submit, **Then** it prints
-   what it would send and sends nothing.
+4. **Given** `gitty share --dry-run`, **Then** the hub is asked what it has,
+   what would be sent is printed as `plan share` lines, and no facts are
+   sent. A sync or fetch run with `--dry-run` does not share at all.
 5. **Given** a repository's own words (its description, its README's first
    paragraph) and an agent's account of the same project, **When** the
    outline is composed, **Then** the repository's words come first and the
@@ -257,15 +260,18 @@ group, the service's outline names all three under the right headings.
   repository says, what GitLab says, what an agent noted.
 - **FR-007**: `gitty`, when its workspace config names a hub, MUST submit
   what it reads from a checkout — links with evidence, the README's account,
-  what the project provides — after it clones or fast-forwards it, with the
-  commit it was read at, and only for a clean checkout at a commit of the
-  default branch. It MUST honour `--dry-run`, print one event per
-  submission, and treat a hub that does not answer as a note, not an error.
+  what the project provides — with the commit it was read at, and only for a
+  clean checkout at the tip of its default branch. `gitty share` does this
+  with one event per checkout and `--dry-run` parity; `sync` and `fetch` do
+  it on their way out, report it on stderr, and treat a hub that does not
+  answer as a note, not an error. `--no-share` turns that off. gitty's token
+  MUST only be sent to a hub over https or on a loopback address.
 - **FR-008**: Facts for a project MUST be replaced as a whole by facts for a
   newer commit. "Used by" for a project MUST be the projects whose current
   facts link to it, each with file, line and commit.
 - **FR-009**: Ranking in listings and search MUST combine use (how many
-  projects' facts link to it) and upkeep (archived; what the project says
+  projects' facts link to it, other than by a mention or as deployment
+  configuration) and upkeep (archived; what the project says
   of itself; time since last activity, against a configurable period).
   Projects that fail on upkeep MUST be listed last under a stated reason and
   MUST NOT be offered first. Nothing known is hidden.
@@ -285,7 +291,10 @@ group, the service's outline names all three under the right headings.
   nothing is specific to one agent vendor.
 - **FR-015**: Once the hub answers them, `gitty context`, `gitty related`
   and `gitty index` MUST be removed from `gitty`. The scanner stays, as what
-  `gitty` submits from. `gitty fetch` and `gitty sync --related` stay.
+  `gitty` submits from. `gitty fetch` and `gitty sync --related` stay. With
+  no command left to refresh it, the workspace index MUST keep itself: it
+  lists the instance again when its listing is a day old and the instance
+  can be reached.
 
 ### Key Entities
 
@@ -339,9 +348,10 @@ group, the service's outline names all three under the right headings.
 - One hub per instance, one process, one directory. Availability beyond
   "restart it" is not this feature.
 
-## Open Decisions
+## Decisions
 
-Defaults are what will be built unless answered otherwise.
+These were put as open, each with a default; the defaults were accepted and
+are what was built.
 
 1. **Does `gitty` submit facts on its own when it syncs?** The request says
    agents create the context, and that the repositories are the authority.

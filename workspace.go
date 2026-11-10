@@ -75,7 +75,7 @@ func newSyncerFor(cfg *Config, tokenFlag string, anon, needToken bool) (*syncer,
 // moves to the workspace root, the syncer's root_path is the root's
 // namespace, and every path gitty computes is relative to that. Where the
 // user actually was is remembered, because it decides which project a bare
-// `gitty context` is about and what "relative path" means in its output.
+// `gitty sync --related` is about.
 type workspace struct {
 	s *syncer
 

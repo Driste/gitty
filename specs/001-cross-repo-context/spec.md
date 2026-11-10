@@ -2,7 +2,7 @@
 
 **Feature Branch**: `001-cross-repo-context`
 **Created**: 2026-11-06
-**Status**: Implemented (phases 0 to 3). Amended after implementation: see "What implementation changed" at the end.
+**Status**: Implemented, then partly superseded by [002-gitty-up](../002-gitty-up/spec.md): `gitty-mcp`, `gitty context`, `gitty related` and `gitty index` were removed in its favour. The plugin rule, the scanner, the workspace index, `gitty fetch`, `gitty sync --related` and `gitty -C` remain. What follows is the record of this feature as it was specified and built.
 **Input**: User description: "Link context between many repos in a GitLab instance. Often you need an agent to know about other projects in order to program in another."
 
 ## Problem

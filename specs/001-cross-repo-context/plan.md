@@ -1,9 +1,11 @@
 # Implementation Plan: Cross-Repository Context
 
 **Branch**: `001-cross-repo-context` | **Date**: 2026-11-06 | **Spec**: [spec.md](spec.md)
-**Status**: Built, phases 0 to 3. This document describes the design as it
-stands; where building it changed the first plan, "Decisions Settled" says
-what changed and why.
+**Status**: Built, phases 0 to 3, then partly superseded by
+[002-gitty-up](../002-gitty-up/plan.md), which removed `gitty-mcp`, `gitty
+context`, `gitty related` and `gitty index`. This document is the record of
+the design as it was built; where building it changed the first plan,
+"Decisions Settled" says what changed and why.
 **Input**: Feature specification from `/specs/001-cross-repo-context/spec.md`
 
 ## Summary

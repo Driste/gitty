@@ -1,12 +1,11 @@
 // Package contract holds the JSON shapes gitty writes for other programs to
-// read: the workspace index file, and what `gitty context --format=json` and
-// `gitty fetch --format=json` print.
+// read: the workspace index file, what `gitty fetch --format=json` prints,
+// and what gitty sends a hub (gitty-up) and reads back from it.
 //
-// They are public interfaces. gitty's own plugins (gitty-mcp among them) are
-// built on nothing else — a plugin drives the gitty CLI and decodes these
-// types — so anything a plugin can do, a script can do too. The package has
-// no behaviour on purpose: what is shared between the CLI and a plugin is
-// vocabulary, never an implementation.
+// They are public interfaces. gitty-up is built on nothing else from gitty,
+// so anything it is told, a script could tell it too. The package has no
+// behaviour on purpose: what the two binaries share is vocabulary, never an
+// implementation.
 //
 // Compatibility: within one version number, fields are only ever added. A
 // reader must ignore fields it does not know and must refuse a version it
@@ -18,8 +17,8 @@ import (
 	"time"
 )
 
-// Schema is the version of the documents gitty prints on stdout: Briefing
-// and FetchReport. It changes only when an existing field changes meaning or
+// Schema is the version of the documents gitty prints on stdout:
+// FetchReport. It changes only when an existing field changes meaning or
 // goes away.
 const Schema = 1
 
@@ -61,7 +60,8 @@ const (
 
 // Index is the file <workspace>/.gitty/index.json: every project of the
 // workspace's part of the instance, and every reference found between them.
-// `gitty index` writes it; `gitty context` and `gitty related` keep it fresh.
+// gitty keeps it by itself: `gitty sync --related` and `gitty share` bring it
+// up to date before they read it.
 //
 // Nothing in it depends on where the workspace is on disk — directories are
 // relative to the workspace root — and it never holds a credential.
@@ -92,7 +92,7 @@ type Index struct {
 	Moved map[string]string `json:"moved,omitempty"`
 	// NotFound are references to paths outside Namespaces that the instance
 	// was asked about and has no project for. They are not asked about again
-	// until the next `gitty index`.
+	// until the instance is next listed.
 	NotFound []string `json:"not_found,omitempty"`
 	// Exclude is the exclude list in effect when the index was last brought
 	// up to date. No link in the index starts or ends at a project it
@@ -185,118 +185,6 @@ type Unresolved struct {
 	Kind     string `json:"kind"` // the kind of link it would have been
 	Evidence string `json:"evidence"`
 	Target   string `json:"target,omitempty"` // as Link.Target
-}
-
-// Briefing is what `gitty context --format=json` prints: one project (or
-// group) and the projects it is linked to, each with where it is on this
-// machine and why it matters.
-type Briefing struct {
-	Schema    int     `json:"schema"`
-	Instance  string  `json:"instance"`
-	Workspace string  `json:"workspace"` // absolute path of the workspace root
-	Subject   Subject `json:"subject"`
-
-	// Uses are the projects the subject refers to; UsedBy the ones that
-	// refer to it. Either list may be capped: the totals say how many
-	// there are in all.
-	Uses        []Related `json:"uses"`
-	UsedBy      []Related `json:"used_by"`
-	UsesTotal   int       `json:"uses_total"`
-	UsedByTotal int       `json:"used_by_total"`
-
-	// Within holds the links among a group subject's own projects.
-	Within []Link `json:"within,omitempty"`
-
-	// Coverage says what the answer rests on. Links are found by reading
-	// checkouts, so a project that is not checked out is known to exist (and
-	// can be something others use) but is not known to use anything: UsedBy
-	// is complete only as far as the workspace is.
-	Coverage Coverage `json:"coverage"`
-
-	Unresolved []Unresolved `json:"unresolved,omitempty"`
-	// Notes are things the reader should know about this answer: a list
-	// that was capped, an index that could not be refreshed.
-	Notes     []string  `json:"notes,omitempty"`
-	IndexedAt time.Time `json:"indexed_at"`
-}
-
-// Coverage is how much of the workspace's part of the instance has been
-// read for links.
-type Coverage struct {
-	Projects   int `json:"projects"`    // projects the index knows of
-	CheckedOut int `json:"checked_out"` // of those, checked out here and read
-}
-
-// Subject is what a briefing is about: a project, or a group of them.
-type Subject struct {
-	Kind string `json:"kind"` // "project" or "group"
-	// Project is the subject's namespace path when it is a project; Group
-	// when it is a group.
-	Project string `json:"project,omitempty"`
-	Group   string `json:"group,omitempty"`
-
-	// Present says whether it exists on this machine; Path is where
-	// (absolute) and RelativePath the same from where the command ran.
-	Present      bool   `json:"present"`
-	Path         string `json:"path,omitempty"`
-	RelativePath string `json:"relative_path,omitempty"`
-
-	// For a project.
-	Description   string   `json:"description,omitempty"`
-	DefaultBranch string   `json:"default_branch,omitempty"`
-	Topics        []string `json:"topics,omitempty"`
-	Archived      bool     `json:"archived,omitempty"`
-	WebURL        string   `json:"web_url,omitempty"`
-	Docs          []string `json:"docs,omitempty"` // relative to Path
-	Summary       string   `json:"summary,omitempty"`
-	// LocalOnly marks a checkout whose project is not known upstream.
-	LocalOnly bool `json:"local_only,omitempty"`
-
-	// For a group: its projects.
-	Projects []Member `json:"projects,omitempty"`
-}
-
-// Member is one project of a group subject.
-type Member struct {
-	Project      string `json:"project"`
-	Description  string `json:"description,omitempty"`
-	Archived     bool   `json:"archived,omitempty"`
-	Present      bool   `json:"present"`
-	Path         string `json:"path,omitempty"`
-	RelativePath string `json:"relative_path,omitempty"`
-}
-
-// Related is one project linked to the subject.
-type Related struct {
-	Project     string `json:"project"` // namespace path
-	Description string `json:"description,omitempty"`
-	Archived    bool   `json:"archived,omitempty"`
-	WebURL      string `json:"web_url,omitempty"`
-
-	// Present says whether the project is checked out on this machine; when
-	// it is, Path is where (absolute) and RelativePath the same from where
-	// the command ran. Fetched is true when this very call cloned it.
-	Present      bool   `json:"present"`
-	Fetched      bool   `json:"fetched"`
-	Path         string `json:"path,omitempty"`
-	RelativePath string `json:"relative_path,omitempty"`
-
-	// When it is not present: the command that would fetch it and, if
-	// fetching was attempted and failed, why.
-	FetchCommand string `json:"fetch_command,omitempty"`
-	FetchError   string `json:"fetch_error,omitempty"`
-
-	// Links are the references that relate the two, each with its evidence.
-	// In Uses the evidence is in the subject's files; in UsedBy it is in
-	// this project's.
-	Links []Link `json:"links"`
-
-	// Files are the files of this project that the links point at — the
-	// template a pipeline includes, the component it uses — and that exist
-	// in its checkout, relative to Path: where to look first.
-	Files   []string `json:"files,omitempty"`
-	Docs    []string `json:"docs,omitempty"` // relative to Path
-	Summary string   `json:"summary,omitempty"`
 }
 
 // FetchReport is what `gitty fetch --format=json` prints.
