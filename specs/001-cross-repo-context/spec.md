@@ -2,7 +2,7 @@
 
 **Feature Branch**: `001-cross-repo-context`
 **Created**: 2026-11-06
-**Status**: Clarified — ready for tasks
+**Status**: Implemented (phases 0 to 3). Amended after implementation: see "What implementation changed" at the end.
 **Input**: User description: "Link context between many repos in a GitLab instance. Often you need an agent to know about other projects in order to program in another."
 
 ## Problem
@@ -60,11 +60,12 @@ An agent is working in a checkout inside a gitty workspace. Its host has
 `gitty mcp` (which runs the `gitty-mcp` plugin) configured once. The agent calls `gitty_context` (no arguments:
 "the project I am in"). gitty works out which other projects of the instance
 this one uses and which use it — from its CI configuration, its manifests, and
-the API — **syncs any related project that is not yet checked out into its
+the API — **clones any project it uses that is not yet checked out into its
 namespace path**, and returns, for each related project: the absolute local
-path, the kind of relationship, the file and line that proves it, the
-project's description, and the documentation files worth reading there. The
-agent opens the paths and carries on.
+path, the kind of relationship, the file and line that proves it, what in
+that project the reference points at, the project's description, and the
+documentation files worth reading there. The agent opens the paths and
+carries on.
 
 **Why this priority**: This is the loop the feature exists for — "I need to
 know about B" becomes "B is at /ws/acme/lib, you depend on it via go.mod:12,
@@ -87,8 +88,8 @@ returns the same without cloning again.
    **Then** B is not fetched again and the result is unchanged.
 3. **Given** `fetch: false` on the call (or a server started with
    `--no-fetch`), **When** B is absent, **Then** B is listed as not checked
-   out, with the `gitty sync` invocation that would fetch it, and nothing is
-   cloned.
+   out, with the command that would fetch it (`gitty fetch <project>`), and
+   nothing is cloned.
 4. **Given** B references A, **When** the agent in A asks, **Then** B appears
    under *used by* with its evidence.
 5. **Given** A references a path that is not a project of the instance,
@@ -97,6 +98,13 @@ returns the same without cloning again.
 6. **Given** the agent then calls `gitty_read` for a file in B, or
    `gitty_search` for a symbol across the workspace, **Then** it gets the
    content or matches, confined to the workspace's checkouts.
+7. **Given** A references a project in a group the workspace has never
+   listed, **When** the agent asks with fetching on, **Then** gitty asks the
+   instance about that path, and the project is linked and fetched like any
+   other.
+8. **Given** only some of the namespace is checked out, **When** the agent
+   asks, **Then** the result says how many projects are known and how many
+   were read, so an empty *used by* is not mistaken for "nothing uses this".
 
 ---
 
@@ -167,22 +175,39 @@ in under a second for fifty checkouts.
 ### User Story 4 - Fetch what this project needs, from the shell (Priority: P4)
 
 `gitty sync --related` run inside a checkout clones exactly the projects this
-one links to (or that link to it, with `--related=both`) that are not yet
-checked out, into their namespace paths, and nothing else. Re-running pulls.
+one links to (or that link to it, with `--related=used-by` or
+`--related=both`) that are not yet checked out, into their namespace paths,
+fast-forwards the ones that are, and touches nothing else. Re-running pulls.
+In a group's directory the subject is every checkout of the group.
 
 **Why this priority**: The shell counterpart of what the MCP server does in
 US1; useful for scripts and for pre-warming a workspace before an agent runs.
 
 **Independent Test**: With A checked out and its link targets B and C absent,
 `gitty sync --related` from inside A clones B and C and no sibling, printing
-`clone` events; a second run prints `pull` events only.
+`clone` events; a second run prints `pull` events only; `--dry-run` prints
+the same events prefixed `plan` and writes nothing, the index included.
 
 ---
 
 ### Edge Cases
 
-- A reference points at a project that was moved or deleted upstream: reported
-  as unresolved with its evidence; never fabricated, never fetched.
+- A reference points at a project that was deleted upstream: reported as
+  unresolved with its evidence; never fabricated, never fetched. One that
+  was *moved* is followed: GitLab answers for a project's old path, and the
+  move is recorded so the stale reference resolves to where the project is
+  now. `gitty fetch` given the old path refuses and names the new one.
+- A reference points into a group the workspace has never listed: asked
+  about by path whenever gitty is talking to the instance anyway (`gitty
+  index`, `context --fetch`, `sync --related`), at most 100 per index run
+  and 20 per briefing; a path with nothing behind it is remembered and not
+  asked about again until the next `gitty index`.
+- A link leads to a project the workspace has no place for (a workspace
+  anchored at one group, a project in another): the briefing names it
+  without a fetch command, `gitty fetch` naming it is an error, and `sync
+  --related` passes over it with a `skip` event.
+- A project is only mentioned in documentation: a link of kind `mentions`,
+  listed after the others and never fetched on that account.
 - Two projects reference each other: both directions are listed; nothing
   recurses.
 - A project with hundreds of dependents: "used by" is capped with a count and
@@ -198,11 +223,19 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
 - A huge checkout: scanning is bounded by tracked-file name patterns and a
   per-file size cap, and reported per project.
 - No index and no network: `context` and the MCP tools report that the index
-  cannot be built (exit 2 / tool error); they never brief from nothing.
+  cannot be built (exit 1, or exit 2 when what is missing is a credential;
+  a tool error in the server); they never brief from nothing. With an index
+  in place neither network nor credential is needed.
+- A project is checked out after the index was built: it is read at the next
+  refresh, and looked up on the instance if a credential is at hand (that is
+  the only way to learn where it was forked from); an instance that does not
+  answer does not fail the refresh.
 - An index written by an older gitty: a version field makes it rebuilt.
-- Two MCP clients on the same workspace: the index file is written atomically;
-  a concurrent fetch of the same project is serialised by the existing
-  bring-up (an unborn repository is resumed, not clobbered).
+- Two MCP clients on the same workspace: the index file is written atomically.
+  Fetches are serialised within one server; two servers cloning the same
+  absent project at the same moment are not locked against each other — the
+  loser's clone fails and is reported, and the bring-up it interrupted is
+  resumable. Cross-process locking is not built.
 - `gitty mcp` with no `gitty-mcp` installed: exit 2 naming the binary looked
   for and where; nothing else happens.
 - `gitty-mcp` run with a `gitty` of another version: a JSON reply whose
@@ -242,8 +275,11 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
   incoming links; each related project with its absolute local path or its
   absence, the link kind, the evidence, the description and its documentation
   files. With `fetch` true (the default unless the server runs with
-  `--no-fetch`) it MUST first bring up every related project that is absent,
-  through the existing sync path.
+  `--no-fetch`) it MUST first clone the projects the subject *uses* that are
+  absent, through the existing sync path — at most 25 per call, never one
+  that is only mentioned in documentation, and never touching a project
+  that is already checked out. Projects that use the subject are not
+  fetched.
 - **FR-003**: `gitty context [project]` MUST print the same content as
   Markdown with stable headings, or as JSON with `--format=json`; `--fetch`
   MUST do what `fetch: true` does.
@@ -254,30 +290,45 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
   `.gitmodules`; the API's fork origin; documentation mentions.
 - **FR-005**: Every link MUST carry a kind from the fixed set `depends`,
   `ci-include`, `ci-trigger`, `ci-component`, `image`, `submodule`, `fork`,
-  `mentions`, and evidence (`file:line`, or the API field).
+  `mentions`, and evidence (`file:line`, or the API field). Where the
+  reference names something inside the other project — included files, a
+  component, a module directory — the link carries it as its `target`, and a
+  briefing lists the targets that exist in the checkout as `files`.
 - **FR-006**: A reference becomes a link only when it resolves to a project of
   the instance by namespace path; unresolved references are returned as such.
+  A project counts as known when the listing of the workspace's groups
+  returned it, or when the instance answered for its path on being asked.
 - **FR-007**: The index MUST live at `<workspace>/.gitty/index.json`, carry a
   schema version, be written atomically, and contain no token or credential.
 - **FR-008**: Indexing MUST be incremental by HEAD commit: an unchanged
   checkout is not rescanned and keeps its links.
 - **FR-009**: `gitty index` MUST honour `--dry-run`, the workspace `exclude`
   list and `--exclude`, and MUST emit one greppable event per project and per
-  link.
+  link. `--rescan` reads every checkout again whatever its commit. A change
+  to the exclude list, or a newer scanner, makes the next refresh read
+  everything again by itself.
 - **FR-010**: `gitty related <project>` MUST print `related <project> <kind>
   <target> <evidence>` for outgoing and `related-by <project> <kind> <source>
   <evidence>` for incoming links, closing with a summary line.
 - **FR-011**: `gitty_read` and `gitty_search` MUST be confined to local
   checkouts of the workspace: `..`, absolute paths and symlinks escaping a
   checkout are refused.
-- **FR-012**: `gitty sync --related[=uses|used-by|both]` MUST clone only link
-  targets (and/or sources) of the current project that are absent, via the
-  existing sync machinery with its dry-run parity.
+- **FR-012**: `gitty sync --related[=uses|used-by|both]` MUST sync exactly the
+  link targets (and/or sources) of the subject — the current project, the
+  current group's checkouts, or the project named as the argument — cloning
+  the absent ones and fast-forwarding the present ones, via the existing
+  sync machinery with its events, summary, exit codes and dry-run parity.
+  Mention-only projects are left out; a project outside the namespace the
+  workspace holds is skipped; `--groups`, `--nested` and `--prune` are
+  refused with it.
 - **FR-013**: Nothing in this feature writes inside a repository, and nothing
   is specific to one agent vendor.
 - **FR-014**: All commands and tools MUST work from any directory inside the
   workspace via the existing discovery; the MCP server MUST discover the
-  workspace from its working directory at start.
+  workspace from its working directory at start. `gitty -C <dir> <command>`
+  MUST behave as if started in `<dir>`, for hosts that cannot choose a
+  server's working directory, and every tool MUST accept the project as a
+  namespace path or as an absolute directory.
 - **FR-015**: `gitty_context` and `gitty context` MUST build or refresh the
   index when it is missing, versioned differently, or when the current
   project's HEAD has moved since it was indexed.
@@ -288,9 +339,18 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
   rather than guessing.
 - **FR-017**: `gitty fetch <project>...` MUST bring up exactly the named
   projects (namespace paths) into their namespace paths through the existing
-  sync machinery — nothing else is touched — printing the usual events, and
-  with `--format=json` one record per project: path, directory, `fetched`,
-  `present`, error. It MUST honour `--dry-run` and `exclude`.
+  sync machinery — nothing else is touched, and a project that is already
+  checked out is left as it is, not pulled — printing the usual events, and
+  with `--format=json` one record per project: `project`, `path`, `present`,
+  `fetched`, `error`. It MUST honour `--dry-run` and `exclude`, and MUST
+  refuse a project that has moved or that the workspace has no place for.
+- **FR-018**: Every briefing MUST say how much it rests on: the number of
+  projects known and the number checked out and read (`coverage`), with a
+  note when *used by* may be incomplete; a side with nothing on it is said
+  to be empty, not omitted.
+- **FR-019**: With an index in place, `gitty context` and `gitty related`
+  MUST need neither network nor credential. The MCP server MUST be able to
+  run against a public instance without a token (`--anon`).
 
 ### Key Entities
 
@@ -299,13 +359,15 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
   registry prefix; when checked out: local directory, HEAD at last scan,
   documentation files (README, any `*.md` at the root naming agent
   instructions), README summary.
-- **Link**: directed, from one project to another — kind, evidence, found at
-  which index run.
-- **Index**: all projects and links for one workspace; schema version,
-  instance URL, generation time.
+- **Link**: directed, from one project to another — kind, evidence, and the
+  target inside the other project where the reference names one.
+- **Index**: all projects and links for one workspace; schema and scanner
+  versions, instance URL and the hosts and registry it answers on, the
+  namespaces that were listed, projects that moved, paths found to hold
+  nothing, the exclude list in effect, generation and listing times.
 - **Briefing**: the per-project (or per-group) view of the index: the subject,
-  its outgoing and incoming links, related projects' descriptions, paths and
-  docs, unresolved references.
+  its outgoing and incoming links, related projects' descriptions, paths,
+  linked files and docs, unresolved references, coverage and notes.
 
 ## Success Criteria *(mandatory)*
 
@@ -368,3 +430,43 @@ US1; useful for scripts and for pre-warming a workspace before an agent runs.
   separation.
 - An HTTP transport, authentication of agents to the server, multi-workspace
   indexes and index merging belong to that later feature.
+- **"Used by" for projects that are not checked out.** Links are found by
+  reading checkouts, so who uses a project is only known among what is on
+  this disk. Answering it for the whole instance needs every project read
+  somewhere, which is what the shared server above is for. Until then the
+  coverage note says how partial the answer is.
+- **The pinned version.** A checkout is of the default branch; the version
+  another project pins is visible in the evidence line and is not checked
+  out, compared or resolved.
+- **Following links more than one step**, shallow clones, progress
+  notifications for long fetches, and locking between two servers on one
+  workspace.
+
+## What implementation changed
+
+Decisions taken while building, where they differ from the text first
+agreed. Each is reflected above.
+
+- **The fetch command is `gitty fetch <project>`**, a command of its own,
+  not a `gitty sync` invocation: a briefing needs one command per absent
+  project that touches nothing else.
+- **Fetching is narrower than "every related project"**: only what the
+  subject uses, at most 25, never a mention, never pulling. An agent may be
+  in the middle of work that a moving dependency would disturb.
+  `gitty sync --related` is the explicit way to also update.
+- **Listing is by the workspace's groups, trimmed, plus one lookup per
+  checkout.** A full listing of a large namespace was slow and brought in
+  projects shared from elsewhere. Fork origins and the registry host come
+  from the per-checkout lookups, so fork links exist only for checked-out
+  projects.
+- **References outside the listed groups are asked about by path.** The
+  first live run showed the commonest real case, a pipeline including a
+  component from a group never cloned, coming out unresolved.
+- **Coverage is stated.** "Used by (0)" in a workspace holding 6 of 3,878
+  projects is not a fact about the project.
+- **`gitty -C <dir>`** was added because agent hosts do not all start a
+  server in the project directory.
+- **Links carry a target, and briefings the files it names.** "It includes
+  CI from that project" was not enough to act on; "this file" is.
+- **An empty repository is left unborn rather than failed on** by every
+  sync, found on the same live run. It is a fix to `sync` itself.

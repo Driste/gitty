@@ -52,7 +52,7 @@ release ships two binaries. Nothing MCP-specific yet.
       `Member`, `Related`, `FetchReport`, `FetchResult` with JSON tags; the
       link kinds as constants; `Supported` for version checks. (The root
       package uses these types directly in T002/T017/T044.)
-- [ ] T042 [P] `.github/workflows/release.yml`: build
+- [x] T042 [P] `.github/workflows/release.yml`: build
       `gitty-mcp_${VERSION}_${os}_${arch}` from `./cmd/gitty-mcp` in the same
       loop; checksum and upload `gitty-mcp_*` too; smoke: `gitty-mcp
       --version` reports the tag. CI's `go vet ./...` / `go test ./...`

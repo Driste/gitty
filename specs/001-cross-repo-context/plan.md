@@ -1,6 +1,9 @@
 # Implementation Plan: Cross-Repository Context
 
 **Branch**: `001-cross-repo-context` | **Date**: 2026-11-06 | **Spec**: [spec.md](spec.md)
+**Status**: Built, phases 0 to 3. This document describes the design as it
+stands; where building it changed the first plan, "Decisions Settled" says
+what changed and why.
 **Input**: Feature specification from `/specs/001-cross-repo-context/spec.md`
 
 ## Summary
@@ -10,11 +13,12 @@ matters to the project it is working in — and puts it within reach. gitty
 already knows the namespace, holds the checkouts and knows their paths; this
 feature adds **linking**: a workspace index of project metadata and the
 evidenced references between projects, and an **MCP server** that, asked for
-a project's context, resolves its related projects, **syncs the missing ones
-into their namespace paths**, and returns to the agent each project's path and
-the reason it matters. The same content renders as a Markdown briefing
-(`gitty context`) and as greppable lines (`gitty related`); `gitty index`
-refreshes the cache on demand and `sync --related` fetches from the shell.
+a project's context, resolves its related projects, **clones the ones it
+uses that are missing into their namespace paths**, and returns to the agent
+each project's path and the reason it matters. The same content renders as a
+Markdown briefing (`gitty context`) and as greppable lines (`gitty related`);
+`gitty index` refreshes the cache on demand, `gitty fetch` clones projects by
+name and `sync --related` syncs a project's surroundings from the shell.
 
 Nothing is agent-vendor-specific and nothing is written inside a repository:
 the index lives beside the workspace config, and the only side effect of a
@@ -82,37 +86,63 @@ been `.gitty/config` for some time — a wording amendment for a separate PR.
 ```json
 {
   "version": 1,
+  "scanner": 3,
   "instance": "https://gitlab.example.com",
+  "root": "",
+  "hosts": ["ssh.gitlab.example.com"],
+  "registry": "registry.gitlab.example.com",
+  "namespaces": ["acme"],
+  "moved": { "acme/old-name": "acme/lib" },
+  "not_found": ["acme/old-lib"],
+  "exclude": ["acme/vendor"],
   "generated_at": "2026-11-06T10:12:03Z",
+  "listed_at": "2026-11-06T10:11:58Z",
   "projects": {
     "acme/app": {
       "id": 1201,
       "description": "Customer-facing API",
       "default_branch": "main",
       "topics": ["go", "api"],
-      "archived": false,
-      "forked_from": "",
-      "registry_prefix": "registry.gitlab.example.com/acme/app",
-      "local": { "dir": "acme/app", "head": "4e0f9c7…", "docs": ["README.md", "AGENTS.md"], "summary": "First paragraph of the README…" }
+      "web_url": "https://gitlab.example.com/acme/app",
+      "local": { "dir": "acme/app", "head": "4e0f9c7…", "docs": ["AGENTS.md", "README.md"], "summary": "First paragraph of the README…" }
     }
   },
   "links": [
-    { "from": "acme/app", "to": "acme/ci-templates", "kind": "ci-include", "evidence": ".gitlab-ci.yml:3" },
+    { "from": "acme/app", "to": "acme/ci-templates", "kind": "ci-include", "evidence": ".gitlab-ci.yml:3", "target": "templates/build.yml" },
     { "from": "acme/app", "to": "acme/lib", "kind": "depends", "evidence": "go.mod:12" }
   ],
   "unresolved": [
-    { "from": "acme/app", "ref": "acme/old-lib", "evidence": "go.mod:14" }
+    { "from": "acme/app", "ref": "acme/old-lib", "kind": "depends", "evidence": "go.mod:14" }
   ]
 }
 ```
 
+- One per workspace, beside the **outermost** config: `sync --groups` writes
+  a config into every group directory, and the index sits above them all so
+  that links between groups are seen from anywhere.
 - Keyed by namespace path; `local` absent for projects known only from the
-  API. `head` drives incrementality: `git rev-parse HEAD` equal to the record
-  means no rescan and links kept.
-- Written to a temp file and renamed; a `version` mismatch means rebuild.
-- Project metadata for the whole target group comes from the listings gitty
-  already does (one `simple=true` pass does not carry description/topics, so
-  the index pass lists with full fields — bounded by the same parallel pager).
+  API, `id` absent for a checkout with no project upstream. `head` drives
+  incrementality — it is read from git's own files, falling back to `git
+  rev-parse` — and the subject of a question is always read again, so an
+  uncommitted edit to it shows.
+- `scanner` and `exclude` record what the links were found with: a newer
+  scanner or a different exclude list makes the next refresh read everything
+  again. A `version` mismatch means rebuild.
+- Written to a temp file and renamed. No token, no absolute path.
+- **Where the projects come from.** The workspace's groups are listed with
+  the trimmed representation (`simple=true`, shared projects left out), once
+  for live and once for archived projects, since the trimmed form does not
+  say which a project is. Each *checked-out* project is then asked about on
+  its own, which is where fork origins and the registry host come from. A
+  project checked out after the listing is asked about at the next refresh.
+- **What the listing cannot see.** A reference into a group the workspace
+  does not hold stays unresolved after a listing however real the project
+  is. So whenever the instance is being talked to anyway, each such
+  reference is asked about by path (`lookUpRefs`): a project that answers is
+  added, a project that answers from a new path is recorded under `moved`,
+  and a path with nothing behind it goes to `not_found` and is not asked
+  about again until the next explicit `gitty index`. Bounded: 100 per index
+  run, 20 per briefing, at most 6 candidate paths per reference.
 
 ### Link discovery (the scanner)
 
@@ -123,18 +153,25 @@ yields `(kind, candidate, line)`; a candidate becomes a link only when
 
 | Phase | Source | Files | Extractor | Kind |
 |---|---|---|---|---|
-| 1 | GitLab CI | `.gitlab-ci.yml`, `.gitlab/ci/**/*.yml`, `*.gitlab-ci.yml` | `project: <path>` under `include:` → `ci-include`; under `trigger:` → `ci-trigger`; `component: <host>/<path>/<name>@<ver>` → `ci-component` | per column |
-| 1 | API | — | `forked_from_project.path_with_namespace` | `fork` |
-| 1 | Package manifests | `go.mod`, `package.json`, `pyproject.toml`, `requirements*.txt`, `Gemfile`, `Cargo.toml`, `pom.xml`, `build.gradle(.kts)`, `composer.json`, `*.tf`, `Chart.yaml` | any `<instance-host>/<group>/…/<project>` token (URL or Go module path), `.git` and `/-/…` stripped | `depends` |
-| 2 | Container images | `Dockerfile*`, `*.dockerfile`, `docker-compose*.yml`, `compose*.yml`, `.gitlab-ci.yml` (`image:`) | `FROM`/`image:` whose prefix matches a project's `registry_prefix` | `image` |
-| 2 | Submodules | `.gitmodules` | `url = …` → path on the instance host | `submodule` |
-| 2 | Documentation | `README*`, root `*.md`, `docs/**/*.md` | instance URLs, or bare `<group>/<project>` paths that resolve | `mentions` |
+| 1 | GitLab CI | `.gitlab-ci.yml`, `.gitlab/ci/**/*.yml`, `*.gitlab-ci.yml` | `project: <path>` under `include:` → `ci-include`, with its `file:` entries as the target; under `trigger:` → `ci-trigger`; `component: <host>/<path>/<name>@<ver>` → `ci-component`, with the component name as the target; `needs: project:` and clone URLs in scripts → `depends`. Predefined CI variables that follow from where the project lives are expanded; a value holding any other variable is left alone | per column |
+| 1 | API | — | `forked_from_project.path_with_namespace`, for checked-out projects | `fork` |
+| 1 | Package manifests | `go.mod`, `package.json`, `pyproject.toml`, `requirements*.txt`, `Gemfile`, `Cargo.toml`, `pom.xml`, `build.gradle(.kts)`, `composer.json`, `*.tf`, `Chart.yaml`, `.npmrc` | any `<instance-host>/<group>/…/<project>` token (URL or Go module path), `.git` and `/-/…` stripped; package-registry URLs naming a project by id or encoded path; a Terraform `//sub/dir` kept as the target | `depends` |
+| 3 | Container images | `Dockerfile*`, `Containerfile*`, `*.dockerfile`, `docker-compose*.yml`, `compose*.yml`, CI files (`image:`) | an image on the instance's registry host, matched to the longest project path | `image` |
+| 3 | Submodules | `.gitmodules` | `url = …`, absolute or relative to the project's own path | `submodule` |
+| 3 | Documentation | root `*.md`, `docs/**/*.md` (changelogs, licences and the like skipped) | instance URLs that resolve | `mentions` |
+
+One claim per line: a line that already yielded a reference to a project is
+not reported again by a weaker extractor.
 
 Resolution: candidates are normalised (scheme, host, `.git`, trailing `/-/…`,
 registry host → project path) and matched by the longest project path that is
 a prefix at a `/` boundary — `host/acme/lib/v2` → `acme/lib`; `acme/lib-tools`
 does not match `acme/lib`. Candidates that look like instance paths but
-resolve to nothing are kept under `unresolved`.
+resolve to nothing are kept under `unresolved`, with their kind and target,
+so that a later lookup turns them into exactly the link a scan would have
+produced. References to excluded projects are passed over, not reported.
+The instance answers on more than one name: its URL, the hosts its clone
+URLs use, `clone_hosts` from the config, and its registry.
 
 Deliberately not done: general YAML/TOML parsing, version-constraint
 evaluation, following `include: local:` chains beyond the tree. Evidence is a
@@ -180,9 +217,15 @@ own.
 
 A separate binary at `cmd/gitty-mcp/`, built from the same module, released
 from the same tag, required by nothing else. JSON-RPC 2.0 over stdio,
-newline-delimited, hand-written: `initialize`, `notifications/initialized`,
-`ping`, `tools/list`, `tools/call`. Protocol only on stdout; diagnostics on
-stderr. `--no-fetch` turns the server read-only.
+newline-delimited (a message up to 4 MiB), hand-written: `initialize`,
+`notifications/initialized`, `ping`, `tools/list`, `tools/call`,
+`notifications/cancelled`, batches. It answers protocol revisions 2024-11-05,
+2025-03-26, 2025-06-18 and 2025-11-25 and offers the newest of those to a
+client asking for any other. Tool calls run concurrently and can be
+cancelled; calls in flight when stdin closes are finished. Protocol only on
+stdout; diagnostics on stderr. `--no-fetch` turns the server read-only,
+`--anon` reaches a public instance without a token, `--describe` prints the
+tools as JSON for `gitty agent schema`.
 
 It is **thin by rule**: it owns the protocol, the tool schemas and the two
 tools that need nothing but a checkout (`gitty_search`, `gitty_read`).
@@ -195,29 +238,31 @@ Everything else is `gitty`:
 | `gitty_fetch` | `gitty fetch --format=json <project>...` |
 | `gitty_search`, `gitty_read` | `git grep` and file reads inside checkouts named by the index — local by nature |
 
-The split in that table is deliberate: the first three rows are
-**index-backed** and could be served by any process holding the index; the
-last row needs the caller's disk. The plugin keeps them as two interfaces
-(`indexTools`, `workspaceTools`) behind one stdio front end, so a remote
-server later replaces the first and proxies the second — see *Looking
-ahead*.
+The split in that table is deliberate: `gitty_context`, `gitty_related` and
+`gitty_projects` are **index-backed** and could be served by any process
+holding the index; `gitty_fetch`, `gitty_search` and `gitty_read` need the
+caller's disk. The plugin keeps the two kinds apart in `tools.go` behind one
+stdio front end, so a remote server later replaces the first and proxies the
+second — see *Looking ahead*.
 
 The tools, as the agent sees them:
 
 | Tool | Input | Does |
 |---|---|---|
-| `gitty_context` | `{project?, fetch?: bool, direction?: "uses"\|"used-by"\|"both"}` | Resolves the subject (default: the project of the working directory), refreshes its index entry if its HEAD moved, computes related projects, **fetches the absent ones** (unless `fetch:false` / `--no-fetch`), returns the briefing as structured data: subject, each related project with `path` (absolute), `relative_path`, `kind`, `evidence`, `description`, `docs`, `fetched` (true if cloned by this call), `archived`; plus `unresolved` and any fetch failures. |
-| `gitty_related` | `{project, direction?}` | The links only, no fetching. |
-| `gitty_projects` | `{query?}` | Projects of the index matching a substring (path, description), with local path if checked out. |
-| `gitty_fetch` | `{projects: [...]}` | Brings up the named projects (link targets or not) into their namespace paths; returns paths and per-project outcome. The explicit form of what `gitty_context` does implicitly. |
-| `gitty_search` | `{pattern, projects?, max?}` | `git grep -n` across local checkouts (or the named ones); results `project`, `file`, `line`, `text`; bounded. |
-| `gitty_read` | `{project, path, start?, end?}` | A file or line range from a local checkout; refuses `..`, absolute paths and symlinks that escape the checkout. |
+| `gitty_context` | `{project?, fetch?: bool, direction?: "uses"\|"used-by"\|"both"}` | Resolves the subject (default: the project of the working directory; `project` may be a namespace path or an absolute directory), refreshes its index entry, computes related projects, **clones the ones it uses that are absent** (unless `fetch:false` / `--no-fetch`; at most 25, never a mention), returns the briefing as structured data: subject, each related project with `path` (absolute), `relative_path`, `links` (`kind`, `evidence`, `target`), `files`, `description`, `docs`, `fetched` (true if cloned by this call), `archived`; plus `unresolved`, `coverage`, `notes` and any fetch failures. |
+| `gitty_related` | `{project?, direction?}` | The links only, no fetching. |
+| `gitty_projects` | `{query?, checked_out?, limit?}` | Projects of the index matching words in their path, description or topics, with the local path if checked out. |
+| `gitty_fetch` | `{projects: [...]}` | Brings up the named projects (link targets or not) into their namespace paths; returns paths and per-project outcome. Not offered with `--no-fetch`. |
+| `gitty_search` | `{pattern, fixed?, ignore_case?, projects?}` | `git grep -n` across local checkouts (or the named ones), tracked files only; results `project`, `file`, `line`, `text`; bounded. |
+| `gitty_read` | `{project, path, start?, end?}` | A tracked file or line range from a local checkout; refuses `..`, absolute paths, anything under `.git`, untracked files and symlinks that leave the checkout. |
 
 Fetching happens inside `gitty` (`context --fetch`, `fetch`), so it is the
 same `bringUp` as `sync`: credentials, host notes, interrupt handling, the
 unborn-resume logic and the events (the plugin relays them to stderr) are
-inherited. Concurrent clients are safe: the index is written atomically and
-an in-progress bring-up of the same project is resumed, not clobbered.
+inherited. The index is written atomically, and one server serialises its
+own fetches. Two servers cloning the same absent project at the same moment
+are not locked against each other: one clone fails and is reported, and what
+it left is resumable. Locking across processes is not built.
 
 Cost: one `gitty` process per `gitty_context` call — a few milliseconds of
 start-up plus the index load, within SC-002's 300 ms for a warm index. A
@@ -226,13 +271,19 @@ schema versions, never as a misread result.
 
 ### `gitty fetch <project>...`
 
-The explicit form of what `context --fetch` does: resolve each namespace
-path to a project (index first, API if unknown), skip the ones already
-checked out, feed the rest to the existing pool. Events as `sync`;
-`--format=json` prints one record per project (`path`, `dir`, `fetched`,
-`present`, `error`) for the plugin; `--dry-run` parity; `exclude` honoured;
-a project not named is never touched. `sync --related` and `gitty_fetch`
-are both this with a different way of choosing the list.
+The explicit form of what `context --fetch` does: look each namespace path
+up on the instance, skip the ones already checked out, feed the rest to the
+existing pool. It only ever adds: a project that is present is left exactly
+as it is, not pulled, because the caller may be an agent in the middle of
+work that a moving dependency would disturb. Events as `sync` (`clone`,
+`skip <project> present`, `error`); `--format=json` prints one record per
+project (`project`, `path`, `present`, `fetched`, `error`) for the plugin;
+`--dry-run` parity; `exclude` honoured; a project not named is never
+touched. A project that has moved is refused with its new path, and one the
+workspace has no place for is refused rather than put somewhere arbitrary.
+`context --fetch`, `gitty_fetch` and `sync --related` are all
+`fetchProjects` with a different way of choosing the list; only the last
+passes `update`, which also fast-forwards what is present.
 
 ### Looking ahead: a shared, remote `gitty-mcp` (not in this feature)
 
@@ -242,9 +293,12 @@ developers' agents share: an HTTP transport in front of the same
 indexes a project — a cache that gets better with use. What this feature
 does to keep that cheap, and nothing more:
 
-- `indexTools` and `workspaceTools` are separate interfaces behind one stdio
-  front end; the remote server implements the first and proxies the second
-  to the client's own `gitty-mcp`.
+- Index-backed and workspace-backed tools are kept apart behind one stdio
+  front end; the remote server implements the first kind and proxies the
+  second to the client's own `gitty-mcp`.
+- It is also the answer to the one thing a local index cannot know: who
+  uses a project among the projects nobody here has checked out. `coverage`
+  in every briefing is the honest placeholder until then.
 - Results identify projects by namespace path; local paths are an attribute
   computed from the caller's workspace, so a remote answer can be completed
   locally ("acme/lib is at /ws/acme/lib on *your* machine").
@@ -258,12 +312,12 @@ are that feature's questions, not this one's.
 
 ```markdown
 # acme/app — Customer-facing API
-gitlab.example.com · ./ · main · topics: go, api · docs: README.md, AGENTS.md
+gitlab.example.com · `.` · main · topics: go, api · docs: README.md, AGENTS.md
 
 ## Uses (3)
-- **acme/ci-templates** — Pipeline templates · `../ci-templates` (fetched) · ci-include (.gitlab-ci.yml:3)
+- **acme/ci-templates** — Pipeline templates · `../ci-templates` (fetched) · ci-include templates/build.yml (.gitlab-ci.yml:3)
 - **acme/lib** — Shared domain types · `../lib` · depends (go.mod:12)
-- **acme/base-images** — Hardened base images · *not checked out* (`gitty sync --related`) · image (Dockerfile:1)
+- **acme/base-images** — Hardened base images · *not checked out* (`gitty fetch acme/base-images`) · image (Dockerfile:1)
 
 ## Used by (2)
 - **acme/web** — Web frontend · `../web` · depends (package.json:21)
@@ -273,26 +327,49 @@ gitlab.example.com · ./ · main · topics: go, api · docs: README.md, AGENTS.m
 - acme/old-lib (go.mod:14)
 
 ## Where to read next
+- acme/ci-templates: ../ci-templates/templates/build.yml, ../ci-templates/README.md
 - acme/lib: ../lib/AGENTS.md, ../lib/README.md
+
+## Notes
+- Only checked-out projects are read for links: 4 of 42 here. "Used by" may be incomplete.
 ```
 
 Stable headings, capped lists, paths relative to the directory the command
-runs in. `--fetch` syncs the absent related projects first; `--format=json`
+runs in. A side with nothing on it is said to be empty rather than left out,
+and projects that are only mentioned in documentation come last. "Where to
+read next" names the files the links point at before the documentation.
+`--fetch` clones the absent projects the subject uses first; `--format=json`
 emits exactly what `gitty_context` returns. For a group, the briefing lists
 its projects and the links among them, then links out of the group.
 
+`gitty -C <dir> <command>` runs any command as if started in `<dir>`: an
+agent host that cannot choose where it starts a server says which project it
+means with `gitty -C /ws/acme/app mcp`.
+
 ### `gitty index`, `gitty related`
 
-`index` is the cache refresh made explicit: lists the target group with full
-metadata, scans changed checkouts, writes the index, emits `index`, `link`,
+`index` is the cache refresh made explicit: lists the workspace's groups,
+asks about each checkout and each reference the listing could not place,
+scans changed checkouts, writes the index, emits `index`, `link`,
 `unresolved` and `summary` events; `--dry-run` prints the plan and writes
-nothing. `related` prints a project's links as `related`/`related-by` lines.
+nothing; `--rescan` reads every checkout again. `related` prints a
+project's links as `related`/`related-by` lines. With an index in place
+`related` and `context` need no network and no credential.
 
 ### `sync --related`
 
-Resolves the current project's links (direction configurable), filters to
-targets not checked out, and feeds that project list to the existing pool —
-`syncOneRepo` unchanged — so everything about syncing is inherited.
+`runSync` hands over to `runSyncRelated` when the flag is set. The subject
+is resolved as `context` resolves it (the project of the working directory,
+the checkouts of the group it is, or the argument), the index is brought up
+to date, the subject's unplaced references are asked about, and the far side
+of its links — minus mention-only projects — goes to `fetchProjects` with
+`update`: absent projects are cloned and present ones fast-forwarded by
+`syncOneRepo`, unchanged, so events, summary, exit codes, `--reclone-broken`
+and interrupt handling are a sync's. `--dry-run` does the same reading and
+asking in memory and writes nothing, the index included. A related project
+is synced whether or not it is archived; one outside the namespace the
+workspace holds is `skip <project> outside-workspace`; `--exclude` narrows
+the run without being recorded in the index. Links are followed one step.
 
 ## Project Structure
 
@@ -316,9 +393,13 @@ context.go          # `gitty context`: Markdown and JSON renderers, --fetch
 related.go          # `gitty related` event lines
 indexcmd.go         # `gitty index`
 fetch.go            # `gitty fetch <project>...` and the bring-up-by-path it shares with context --fetch and sync --related
-plugin.go           # `gitty <cmd>` → `gitty-<cmd>`: lookup beside the binary / on PATH, env, exec
-sync.go             # + --related selection
-commands.go         # + context, related, index, fetch in the command table (flags, completion)
+syncrelated.go      # `gitty sync --related`: the subject's links as a sync's project list
+workspace.go        # the workspace as the context commands see it: root, subject directory, lazy API
+plugin.go           # `gitty <cmd>` → `gitty-<cmd>`: lookup beside the binary / on PATH, env
+plugin_unix.go, plugin_windows.go  # exec in place / run as a child
+sync.go             # + NamespaceProjects and Project on the source; hands --related over
+main.go             # + `-C <dir>`, plugin dispatch
+commands.go         # + context, related, index, fetch in the command table (flags, completion); --related
 agent.go            # + schema entries
 README.md, context.md  # user and agent docs
 
@@ -326,14 +407,18 @@ internal/contract/
 └── contract.go     # the JSON types gitty prints and gitty-mcp reads: Index, Briefing, FetchResult; Schema
 
 cmd/gitty-mcp/
-├── main.go         # flags (--no-fetch, --jobs, --version), environment from gitty, start/stop
-├── rpc.go          # JSON-RPC 2.0 over stdio: framing, dispatch, error objects
-├── tools.go        # tool registry and schemas; indexTools (run gitty, read the index) and workspaceTools (search, read)
-└── *_test.go       # driven over io.Pipe against a stub `gitty` on PATH
+├── main.go         # flags (--no-fetch, --anon, --jobs, --version, --describe), environment from gitty, start/stop
+├── rpc.go          # JSON-RPC 2.0 over stdio: framing, dispatch, cancellation, version negotiation
+├── tools.go        # tool registry and schemas; index-backed tools (run gitty, read the index) and workspace-backed ones (fetch, search, read)
+└── server_test.go  # driven over pipes against a stub `gitty`
 
-index_test.go, scan_test.go, resolve_test.go, briefing_test.go, plugin_test.go
-e2e_test.go         # + fake GitLab metadata; builds both binaries; MCP end to end over stdio
+index_test.go, scan_test.go, resolve_test.go, briefing_test.go, plugin_test.go, syncrelated_test.go
+e2e_test.go         # + fake GitLab metadata, trimmed listings, single-project lookups; builds both binaries
+context_e2e_test.go # index, related, context, fetch, -C, sync --related against the fake instance and real git
+mcp_e2e_test.go     # gitty mcp end to end over stdio, both real binaries
 
+scripts/mcp-smoke.sh           # a shell MCP client against gitlab.com, run in CI
+.github/workflows/go.yml       # + builds both binaries, runs the smoke test
 .github/workflows/release.yml  # + builds gitty-mcp_<version>_<os>_<arch> beside gitty
 ```
 
@@ -375,6 +460,52 @@ it out.
    the seam: index-backed and workspace-backed tools are separate
    interfaces, identity is the namespace path, the index holds no absolute
    paths.
+
+### Changed or added while building
+
+7. **`gitty fetch`, not `gitty sync --related`, is the fetch hint.** A
+   briefing needs one command per absent project that touches nothing else.
+8. **Fetching only adds, and only what the subject uses.** At most 25 per
+   call, never a mention, never a pull: the caller may be an agent mid-task.
+   `sync --related` is the explicit way to update as well.
+9. **Trimmed listing plus one lookup per checkout**, instead of a full
+   listing. Against gitlab.com the full listing of `gitlab-org` took 25 s
+   and brought in projects shared from other namespaces and 99 fork links
+   nobody asked about; the trimmed listing of `gitlab-org` and `components`
+   together, 3,878 projects, takes about 10 s. Fork links therefore exist
+   only for checked-out projects.
+10. **References outside the listed groups are asked about by path**, and
+    moved projects followed. The first live run left the commonest real
+    case — a pipeline using a component from a group never cloned —
+    unresolved.
+11. **Coverage is part of every answer.** "Used by (0)" with 6 of 3,878
+    projects read is not a fact about the project.
+12. **Links carry a target; briefings name the files.** Knowing which
+    project a pipeline includes from is half of knowing what to read.
+13. **`gitty -C <dir>`**, because agent hosts do not all start a server in
+    the project directory.
+14. **Mentions are a kind of their own, listed last, never fetched.**
+
+### Measured (gitlab.com, anonymous, from a cloud container)
+
+| What | Time |
+|---|---|
+| First index of a workspace holding `gitlab-org` and `components` (3,878 projects listed, 6 checked out) | 10.7 s |
+| `gitty context` on a warm index | about 30 ms |
+| `gitty context --fetch` cloning five dependencies, two from a group never listed | about 2 s |
+| `gitty sync --related` pulling the same five | 1.5 s |
+
+SC-002's 50-checkout figures were not measured on a laptop; the warm path
+does no network and one small file read per checkout.
+
+### Not built, and why it is safe to leave
+
+- Protocol revision 2026-07-28 of MCP exists and was not checked against;
+  the server offers 2025-11-25 to a client that asks for it, which the
+  protocol's negotiation allows.
+- No locking between two servers on one workspace, no progress
+  notifications during a long fetch, no shallow clones, no following of
+  links beyond one step, no pinned-version checkout.
 
 ## Complexity Tracking
 
