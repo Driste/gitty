@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -65,6 +66,7 @@ func main() {
 			Verify:     *f.verify,
 			Token:      *f.token,
 			CloneHosts: f.cloneHosts,
+			Hub:        *f.hub,
 		}))
 	case "sync":
 		// The group is a positional argument, relative to the current
@@ -96,6 +98,12 @@ func main() {
 			Prune:             *f.prune,
 			Related:           string(f.related),
 		})
+		// What was just brought up to date is worth telling the hub about,
+		// if the workspace has one. A run that never got going is not.
+		var failed *syncFailedError
+		if (err == nil || errors.As(err, &failed)) && !*f.dryRun && !*f.noShare {
+			shareAfter(ctx, *f.token, *f.anon, *f.verbose, *f.jobs)
+		}
 		stop()
 		exitOnError(err)
 	case "status":
@@ -175,6 +183,28 @@ func main() {
 			Exclude:  f.exclude,
 
 			AcceptNewHostKeys: *f.acceptHostKeys,
+		})
+		var failed *syncFailedError
+		if (err == nil || errors.As(err, &failed)) && !*f.dryRun && !*f.noShare {
+			shareAfter(ctx, *f.token, *f.anon, *f.verbose, *f.jobs)
+		}
+		stop()
+		exitOnError(err)
+	case "share":
+		fs := newFlagSet("share")
+		f := declareShareFlags(fs)
+		fs.Parse(os.Args[2:])
+		if fs.NArg() > 0 {
+			exitOnError(usageErrf("share takes no arguments: it covers every checkout of the workspace"))
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err := runShare(ctx, shareOptions{
+			Hub:     *f.hub,
+			Token:   *f.token,
+			Anon:    *f.anon,
+			DryRun:  *f.dryRun,
+			Verbose: *f.verbose,
+			Jobs:    *f.jobs,
 		})
 		stop()
 		exitOnError(err)

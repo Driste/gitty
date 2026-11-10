@@ -124,9 +124,11 @@ func gitRun(t *testing.T, dir string, args ...string) {
 // --- Fake GitLab (API + git-over-HTTP) ---
 
 type apiGroup struct {
-	ID       int    `json:"id"`
-	FullPath string `json:"full_path"`
-	Archived bool   `json:"archived,omitempty"`
+	ID          int    `json:"id"`
+	FullPath    string `json:"full_path"`
+	Archived    bool   `json:"archived,omitempty"`
+	Description string `json:"description,omitempty"`
+	Visibility  string `json:"visibility,omitempty"`
 }
 
 type apiProject struct {
@@ -138,6 +140,8 @@ type apiProject struct {
 	DefaultBranch     string   `json:"default_branch,omitempty"`
 	Description       string   `json:"description,omitempty"`
 	Topics            []string `json:"topics,omitempty"`
+	Visibility        string   `json:"visibility,omitempty"`
+	LastActivityAt    string   `json:"last_activity_at,omitempty"`
 
 	// Only GitLab's full project representation carries these; a listing
 	// asked for with simple=true leaves them out (see simplified).
@@ -303,11 +307,12 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A single project by its (URL-encoded, here already decoded) path.
+	// A single project by its (URL-encoded, here already decoded) path, or
+	// by its id.
 	if pathNS, ok := strings.CutPrefix(r.URL.Path, "/api/v4/projects/"); ok {
 		for _, projects := range f.projects {
 			for _, p := range projects {
-				if p.PathWithNamespace == pathNS {
+				if p.PathWithNamespace == pathNS || strconv.Itoa(p.ID) == pathNS {
 					writeJSON(w, http.StatusOK, p)
 					return
 				}
@@ -331,6 +336,17 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	notFound := func() {
 		writeJSON(w, http.StatusNotFound, map[string]string{"message": "404 Group Not Found"})
+	}
+	// A group may be named by its id as well as by its path.
+	if first, tail, _ := strings.Cut(rest, "/"); first != "" && strings.Trim(first, "0123456789") == "" {
+		for path, g := range f.groups {
+			if strconv.Itoa(g.ID) == first {
+				rest = path
+				if tail != "" {
+					rest += "/" + tail
+				}
+			}
+		}
 	}
 
 	switch {

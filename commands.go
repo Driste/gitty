@@ -24,6 +24,7 @@ var commands = []command{
 	{"ls", "List the remote groups/projects for a target and what a sync would clone", true, func(fs *flag.FlagSet) { declareLsFlags(fs) }},
 	{"context", "Brief a project: what it uses, what uses it, and where each is: gitty context [project] [flags]", true, func(fs *flag.FlagSet) { declareContextFlags(fs) }},
 	{"fetch", "Make sure the named projects are checked out: gitty fetch <group/project>... [flags]", false, func(fs *flag.FlagSet) { declareFetchFlags(fs) }},
+	{"share", "Send the instance's hub what the checkouts here say", false, func(fs *flag.FlagSet) { declareShareFlags(fs) }},
 	{"index", "Index the workspace: project metadata, and the links between checkouts", false, func(fs *flag.FlagSet) { declareIndexFlags(fs) }},
 	{"related", "List what a project uses and what uses it: gitty related [project] [flags]", true, func(fs *flag.FlagSet) { declareRelatedFlags(fs) }},
 	{"auth", "Check the token against the workspace's instance and report its scopes", false, func(fs *flag.FlagSet) { declareAuthFlags(fs) }},
@@ -44,6 +45,7 @@ type initFlags struct {
 	force      *bool
 	token      *string
 	verify     *bool
+	hub        *string
 	cloneHosts stringList
 }
 
@@ -55,6 +57,7 @@ func declareInitFlags(fs *flag.FlagSet) *initFlags {
 	f.force = fs.Bool("force", false, "Overwrite an existing .gitty/config")
 	f.token = fs.String("token", "", "GitLab Access Token to verify (falls back to env vars)")
 	f.verify = fs.Bool("verify", true, "Check the token against the instance and report its scopes")
+	f.hub = fs.String("hub", "", "Address of the instance's gitty-up, to share what checkouts say with it (e.g. https://gitty.example.com)")
 	fs.Var(&f.cloneHosts, "allow-clone-host", "Additional host whose repositories this workspace may clone and send its token to (repeatable, or comma-separated)")
 	return f
 }
@@ -74,6 +77,7 @@ type syncFlags struct {
 	archived       *bool
 	prune          *bool
 	related        relatedFlag
+	noShare        *bool
 	exclude        stringList
 	cloneHosts     stringList
 }
@@ -116,6 +120,7 @@ func declareSyncFlags(fs *flag.FlagSet) *syncFlags {
 	f.acceptHostKeys = fs.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
 	f.archived = fs.Bool("archived", false, "Include archived projects and groups (left out by default)")
 	f.prune = fs.Bool("prune", false, "Move checkouts that no longer exist upstream aside as <dir>.gitty-orphan-<n> (never deleted); without it they are only reported")
+	f.noShare = fs.Bool("no-share", false, "Do not send the workspace's hub what the checkouts say after syncing")
 	fs.Var(&f.related, "related", "Sync the projects linked to the one this directory is a checkout of, instead of a group: --related (what it uses), --related=used-by, or --related=both")
 	fs.Var(&f.exclude, "exclude", "Namespace path or glob to leave out, e.g. acme/vendor or 'acme/*-mirror' (repeatable, or comma-separated; adds to the workspace's exclude list)")
 	fs.Var(&f.cloneHosts, "allow-clone-host", "Additional host whose repositories may be cloned and sent this workspace's token (repeatable, or comma-separated)")
@@ -250,7 +255,28 @@ type fetchFlags struct {
 	verbose        *bool
 	jobs           *int
 	acceptHostKeys *bool
+	noShare        *bool
 	exclude        stringList
+}
+
+type shareFlags struct {
+	hub     *string
+	token   *string
+	anon    *bool
+	dryRun  *bool
+	verbose *bool
+	jobs    *int
+}
+
+func declareShareFlags(fs *flag.FlagSet) *shareFlags {
+	f := &shareFlags{}
+	f.hub = fs.String("hub", "", "Address of the hub (default: the workspace's, from its config or GITTY_HUB)")
+	f.token = fs.String("token", "", "GitLab Access Token (falls back to env vars); the hub asks the instance whose it is")
+	f.anon = fs.Bool("anon", false, "Send no token: for a hub that does not ask who is calling")
+	f.dryRun = fs.Bool("dry-run", false, "Ask the hub what it has and print what would be sent, without sending it")
+	f.verbose = fs.Bool("verbose", false, "Print each git invocation and its output to stderr")
+	f.jobs = fs.Int("jobs", 4, "Number of checkouts to read and send concurrently (1-16)")
+	return f
 }
 
 func declareFetchFlags(fs *flag.FlagSet) *fetchFlags {
@@ -262,6 +288,7 @@ func declareFetchFlags(fs *flag.FlagSet) *fetchFlags {
 	f.verbose = fs.Bool("verbose", false, "Print each git invocation and its output (URLs redacted) to stderr")
 	f.jobs = fs.Int("jobs", 4, "Number of concurrent clones (1-16)")
 	f.acceptHostKeys = fs.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new)")
+	f.noShare = fs.Bool("no-share", false, "Do not send the workspace's hub what the checkouts say after fetching")
 	fs.Var(&f.exclude, "exclude", "Namespace path or glob never to fetch (repeatable, or comma-separated; adds to the workspace's exclude list)")
 	return f
 }

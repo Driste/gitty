@@ -202,7 +202,7 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 	line := kind
 	if s.dryRun {
 		switch kind {
-		case "clone", "pull", "group", "reclone", "prune", "index":
+		case "clone", "pull", "group", "reclone", "prune", "index", "share":
 			line = "plan " + kind
 		}
 	}

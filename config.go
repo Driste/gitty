@@ -35,6 +35,11 @@ type Config struct {
 	// team. Each entry is a full GitLab path ("acme/vendor") — which also
 	// covers everything beneath it — or a path.Match glob ("acme/*-mirror").
 	Exclude []string `toml:"exclude,omitempty"`
+
+	// Hub is the address of the instance's gitty-up, if it has one. gitty
+	// sends it what it reads from the checkouts here (see share.go). It is
+	// read from the workspace's root config only.
+	Hub string `toml:"hub,omitempty"`
 }
 
 // AddExcludes adds a command's --exclude patterns to the workspace's own.
