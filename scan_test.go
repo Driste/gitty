@@ -18,9 +18,15 @@ func scanLines(t *testing.T, r *resolver, file, text string) ([]contract.Link, [
 	lines := strings.Split(text, "\n")
 	switch classifyFile(file) {
 	case classCI:
-		c.scanCI(lines, ciVariables("acme/app", "https://gitlab.example.com"))
+		c.scanCI(lines, ciVariables("acme/app", "https://gitlab.example.com", r.registry))
 	case classManifest:
 		c.scanTokens(lines, nil)
+	case classImages:
+		c.scanImages(lines)
+	case classSubmodules:
+		c.scanSubmodules(lines)
+	case classDocs:
+		c.scanMentions(lines)
 	default:
 		t.Fatalf("%s is not a file the scanner reads", file)
 	}
@@ -247,6 +253,200 @@ func TestScanCIUnresolvedOnce(t *testing.T) {
 	}
 }
 
+// targetSet renders links with what they point at, for the tests of that.
+func targetSet(links []contract.Link) string {
+	var out []string
+	for _, l := range links {
+		out = append(out, l.Kind+" "+l.To+" -> "+l.Target)
+	}
+	return strings.Join(out, "\n")
+}
+
+// TestScanTargets: a link says not only that a project is referred to but,
+// where the reference says so, what in it — which is the file to open.
+func TestScanTargets(t *testing.T) {
+	r := testResolver(t, "https://gitlab.example.com")
+	ci := strings.Join([]string{
+		"include:",
+		"  - project: acme/ci-templates",
+		"    ref: main",
+		"    file: '/templates/build.yml'",
+		"  - project: acme/lib",
+		"    file:",
+		"      - /ci/test.yml",
+		"      - ci/lint.yml # with a comment",
+		"  - project: acme/ops/deploy",
+		"    file: [ '/a.yml', \"/b.yml\" ]",
+		"  - project: acme/ci-templates", // the same project again: one link, both files
+		"    file: /templates/deploy.yml",
+		"  - project: acme/ops/release",
+		"    file: /$PIPELINE.yml", // a variable gitty cannot know
+		"  - component: $CI_SERVER_FQDN/acme/components/sast@1.0",
+		"  - remote: 'https://gitlab.example.com/acme/platform/svc/-/raw/main/ci/shared.yml'",
+		"  - local: /ci/own.yml",
+		"build:",
+		"  file: not-an-include.yml", // a key named file somewhere else
+		"  trigger:",
+		"    project: acme/app-data",
+		"    file: ignored.yml",
+		"",
+	}, "\n")
+	links, _ := scanLines(t, r, ".gitlab-ci.yml", ci)
+	want := strings.Join([]string{
+		"ci-trigger acme/app-data -> ",
+		"ci-include acme/ci-templates -> templates/build.yml, templates/deploy.yml",
+		"ci-component acme/components -> sast",
+		"ci-include acme/lib -> ci/test.yml, ci/lint.yml",
+		"ci-include acme/ops/deploy -> a.yml, b.yml",
+		"ci-include acme/ops/release -> ",
+		"ci-include acme/platform/svc -> ci/shared.yml",
+	}, "\n")
+	if got := targetSet(links); got != want {
+		t.Errorf("targets:\n%s\n--- want:\n%s", got, want)
+	}
+
+	tf, _ := scanLines(t, r, "main.tf", "source = \"git::https://gitlab.example.com/acme/platform/svc.git//modules/net?ref=v3\"\nsource = \"git::https://gitlab.example.com/acme/lib.git\"\n")
+	if got, want := targetSet(tf), "depends acme/lib -> \ndepends acme/platform/svc -> modules/net"; got != want {
+		t.Errorf("terraform targets:\n%s\n--- want:\n%s", got, want)
+	}
+}
+
+func TestScanImages(t *testing.T) {
+	r := testResolver(t, "https://gitlab.example.com") // registry.example.com:5050
+	tests := []struct {
+		name string
+		file string
+		text string
+		want string
+		unre string
+	}{
+		{
+			name: "a Dockerfile",
+			file: "Dockerfile",
+			text: strings.Join([]string{
+				"ARG BASE=registry.example.com:5050/acme/lib/base:1.2",
+				"FROM registry.example.com:5050/acme/lib/base:1.2 AS build",
+				"FROM --platform=linux/amd64 registry.example.com:5050/acme/platform/svc@sha256:0123abcd",
+				"FROM golang:1.24",
+				"FROM registry.example.com:5050/acme/gone/x:1",
+				"FROM docker.io/library/alpine:3",
+				"RUN git clone https://gitlab.example.com/acme/app-data.git /data",
+				"FROM registry.example.com:5050/acme/dependency_proxy/containers/alpine:3",
+				"FROM registry.example.com:5050/acme/vendor/mirror:1",
+				"FROM notregistry.example.com:5050/acme/ops/deploy:1",
+				"",
+			}, "\n"),
+			// The image of a project is the project; a sub-image name and a
+			// tag or digest are not part of its path. The first evidence wins.
+			want: "depends acme/app-data Dockerfile:7\nimage acme/lib Dockerfile:1\nimage acme/platform/svc Dockerfile:3",
+			unre: "image acme/gone/x Dockerfile:5",
+		},
+		{
+			name: "a pipeline: image, services, and a pull in a script",
+			file: ".gitlab-ci.yml",
+			text: strings.Join([]string{
+				"default:",
+				"  image: $CI_REGISTRY/acme/lib/base:1.2",
+				"test:",
+				"  image: ${CI_REGISTRY_IMAGE}/ci:latest", // its own image
+				"  services:",
+				"    - name: registry.example.com:5050/acme/components/db:15",
+				"      alias: db",
+				"    - registry.example.com:5050/acme/platform/svc:stable",
+				"  script:",
+				"    - docker pull $CI_REGISTRY/acme/ops/deploy/tool:1",
+				"",
+			}, "\n"),
+			want: "image acme/components .gitlab-ci.yml:6\nimage acme/lib .gitlab-ci.yml:2\nimage acme/ops/deploy .gitlab-ci.yml:10\nimage acme/platform/svc .gitlab-ci.yml:8",
+		},
+		{
+			name: "a compose file",
+			file: "deploy/docker-compose.prod.yml",
+			text: "services:\n  api:\n    image: registry.example.com:5050/acme/lib:2\n  db:\n    image: postgres:16\n",
+			want: "image acme/lib deploy/docker-compose.prod.yml:3",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			links, unresolved := scanLines(t, r, tt.file, tt.text)
+			if got := linkSet(links); got != tt.want {
+				t.Errorf("links:\n%s\n--- want:\n%s", got, tt.want)
+			}
+			if got := unresolvedSet(unresolved); got != tt.unre {
+				t.Errorf("unresolved:\n%s\n--- want:\n%s", got, tt.unre)
+			}
+		})
+	}
+
+	t.Run("before the registry is known, its conventional name is tried", func(t *testing.T) {
+		idx := newIndex(&Config{URL: "https://gitlab.example.com"})
+		idx.Projects["acme/lib"] = &contract.Project{ID: 1}
+		guess := newResolver(idx, &Config{URL: "https://gitlab.example.com"})
+		links, _ := scanLines(t, guess, "Dockerfile", "FROM registry.gitlab.example.com/acme/lib:1\nFROM registry.example.com:5050/acme/lib:1\n")
+		if got := linkSet(links); got != "image acme/lib Dockerfile:1" {
+			t.Errorf("links: %s", got)
+		}
+		// An instance addressed by number has no name to derive one from.
+		byIP := newResolver(idx, &Config{URL: "http://10.0.0.5:8080"})
+		if byIP.registry != "" {
+			t.Errorf("registry guessed for an IP address: %q", byIP.registry)
+		}
+	})
+}
+
+func TestScanSubmodules(t *testing.T) {
+	r := testResolver(t, "https://gitlab.example.com")
+	text := strings.Join([]string{
+		`[submodule "lib"]`,
+		"\tpath = vendor/lib",
+		"\turl = ../lib.git", // relative to this project's own URL: acme/app → acme/lib
+		`[submodule "svc"]`,
+		"\tpath = svc",
+		"\turl = https://gitlab.example.com/acme/platform/svc.git",
+		`[submodule "elsewhere"]`,
+		"\turl = git@github.com:someone/thing.git",
+		`[submodule "gone"]`,
+		"\turl = ../../other/missing.git",
+		`[submodule "climbs"]`,
+		"\turl = ../../../../etc/passwd",
+		`[submodule "same-group"]`,
+		"\turl = ./deploy",
+		"",
+	}, "\n")
+	links, unresolved := scanLines(t, r, ".gitmodules", text)
+	if got, want := linkSet(links), "submodule acme/lib .gitmodules:3\nsubmodule acme/platform/svc .gitmodules:6"; got != want {
+		t.Errorf("links:\n%s\n--- want:\n%s", got, want)
+	}
+	// "./deploy" from acme/app is acme/app/deploy: a path, but no project.
+	if got, want := unresolvedSet(unresolved), "submodule acme/app/deploy .gitmodules:14\nsubmodule other/missing .gitmodules:10"; got != want {
+		t.Errorf("unresolved:\n%s\n--- want:\n%s", got, want)
+	}
+}
+
+func TestScanMentions(t *testing.T) {
+	r := testResolver(t, "https://gitlab.example.com")
+	text := strings.Join([]string{
+		"# app",
+		"",
+		"Built on [lib](https://gitlab.example.com/acme/lib) and deployed by",
+		"<https://gitlab.example.com/acme/ops/deploy/-/pipelines>. See also https://gitlab.example.com/acme/lib/-/issues/4.",
+		"Our own issues: https://gitlab.example.com/acme/app/-/issues",
+		"Something that is gone: https://gitlab.example.com/acme/gone",
+		"And elsewhere: https://github.com/acme/lib",
+		"",
+	}, "\n")
+	links, unresolved := scanLines(t, r, "README.md", text)
+	// Two projects on one line are two mentions; a second mention of one
+	// already mentioned adds nothing.
+	if got, want := linkSet(links), "mentions acme/lib README.md:3\nmentions acme/ops/deploy README.md:4"; got != want {
+		t.Errorf("links:\n%s\n--- want:\n%s", got, want)
+	}
+	// A link in prose that leads nowhere is not worth reporting.
+	if len(unresolved) != 0 {
+		t.Errorf("unresolved: %s", unresolvedSet(unresolved))
+	}
+}
+
 func TestClassifyFile(t *testing.T) {
 	for name, want := range map[string]fileClass{
 		".gitlab-ci.yml":               classCI,
@@ -255,7 +455,21 @@ func TestClassifyFile(t *testing.T) {
 		".gitlab/ci/test.yml":          classCI,
 		".gitlab/ci/jobs/lint.yaml":    classCI,
 		".gitlab/issue_templates/x.md": classNone,
-		"docker-compose.yml":           classNone,
+		"docker-compose.yml":           classImages,
+		"compose.prod.yaml":            classImages,
+		"Dockerfile":                   classImages,
+		"Dockerfile.dev":               classImages,
+		"build/worker.dockerfile":      classImages,
+		"Containerfile":                classImages,
+		"dockerfiles.txt":              classNone,
+		".gitmodules":                  classSubmodules,
+		"sub/.gitmodules":              classNone, // git only reads the one at the root
+		"README.md":                    classDocs,
+		"AGENTS.md":                    classDocs,
+		"docs/design/overview.md":      classDocs,
+		"CHANGELOG.md":                 classNone, // every merge request it lists is not a relation
+		"src/notes.md":                 classNone,
+		"docs/api.yaml":                classNone,
 		"go.mod":                       classManifest,
 		"services/api/go.mod":          classManifest,
 		"package.json":                 classManifest,
@@ -413,6 +627,7 @@ func TestScanCheckout(t *testing.T) {
 		"ci-include acme/ci-templates .gitlab-ci.yml:2",
 		"depends acme/components services/api/package.json:1",
 		"depends acme/lib go.mod:3",
+		"mentions acme/ops/deploy docs/notes.md:1",
 	}, "\n")
 	if got := linkSet(out.Links); got != want {
 		t.Errorf("links:\n%s\n--- want:\n%s", got, want)
@@ -426,8 +641,8 @@ func TestScanCheckout(t *testing.T) {
 	if out.Summary != "The app." {
 		t.Errorf("summary = %q", out.Summary)
 	}
-	if out.Files != 3 {
-		t.Errorf("files read = %d, want 3 (.gitlab-ci.yml, go.mod, services/api/package.json)", out.Files)
+	if out.Files != 6 {
+		t.Errorf("files read = %d, want 6 (.gitlab-ci.yml, go.mod, services/api/package.json and three documents)", out.Files)
 	}
 
 	// An archived project is described, but not asked what it uses.
@@ -446,7 +661,7 @@ func TestScanCheckout(t *testing.T) {
 }
 
 func TestExpandVars(t *testing.T) {
-	vars := ciVariables("acme/platform/svc", "https://gitlab.example.com:8443/")
+	vars := ciVariables("acme/platform/svc", "https://gitlab.example.com:8443/", "registry.example.com")
 	for in, want := range map[string]string{
 		"$CI_PROJECT_NAMESPACE/lib":           "acme/platform/lib",
 		"${CI_PROJECT_ROOT_NAMESPACE}/shared": "acme/shared",

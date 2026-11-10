@@ -321,8 +321,10 @@ var toolContext = &tool{
 	title: "Context of a project",
 	description: "Which other projects of the GitLab instance a project uses, and which use it. For each: its description, " +
 		"`path` (the absolute path of its checkout on this machine), the `links` that relate the two — each with a `kind` " +
-		"(depends, ci-include, ci-trigger, ci-component, image, submodule, fork, mentions) and `evidence` (file:line in the project " +
-		"that holds the reference) — and the documentation files worth reading in it. Call it before changing a project, to find the " +
+		"(depends, ci-include, ci-trigger, ci-component, image, submodule, fork, mentions), `evidence` (file:line in the project " +
+		"that holds the reference) and, where the reference names something inside the other project, a `target` — then `files`, " +
+		"the files those links point at that exist in the checkout (the template a pipeline includes), and `docs`, the " +
+		"documentation worth reading in it, both relative to `path`. Call it before changing a project, to find the " +
 		"code it depends on and the code that depends on it. Projects it uses that are not checked out are cloned first (`fetched` " +
 		"says which), so their paths exist when the call returns; projects already checked out are never pulled or changed. " +
 		"`used_by` only covers projects that are checked out: `coverage` says how much of the namespace that is.",

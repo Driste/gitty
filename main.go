@@ -94,6 +94,7 @@ func main() {
 			AllowCloneHosts:   f.cloneHosts,
 			Exclude:           f.exclude,
 			Prune:             *f.prune,
+			Related:           string(f.related),
 		})
 		stop()
 		exitOnError(err)

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gitlab.com/gitlab-org/api/client-go"
@@ -337,6 +338,19 @@ func (w *workspace) refreshIndex(ctx context.Context, opts refreshOptions) (*con
 			return nil, stats, err
 		}
 	}
+	// A project checked out since it was listed has not been asked about on
+	// its own yet, so where it was forked from is not known. Ask now, if the
+	// instance can be asked at all; like the listing above, it is not worth
+	// failing over.
+	if !reachable && w.requireAPI() == nil {
+		var arrived []string
+		for _, c := range checkouts {
+			if meta := idx.Projects[c.project]; meta != nil && meta.ID != 0 && meta.Local == nil {
+				arrived = append(arrived, c.project)
+			}
+		}
+		w.lookUpCheckouts(ctx, idx, arrived)
+	}
 	if ctx.Err() != nil {
 		return nil, stats, errInterrupted
 	}
@@ -564,9 +578,18 @@ func (w *workspace) listProjects(ctx context.Context) (projects []*gitlab.Projec
 // essential: a lookup that fails leaves that project as the listing had it.
 func (w *workspace) lookUpCheckouts(ctx context.Context, idx *contract.Index, projects []string) {
 	var mu sync.Mutex
+	// An instance that does not answer is not asked again for every other
+	// checkout: the first failure that is not "no such project" ends it.
+	var unreachable atomic.Bool
 	forEachConcurrent(ctx, listConcurrency, projects, func(project string) {
+		if unreachable.Load() {
+			return
+		}
 		p, err := w.s.src.Project(ctx, project)
 		if err != nil || p == nil {
+			if err != nil && !errors.Is(err, errProjectNotFound) {
+				unreachable.Store(true)
+			}
 			if w.s.verbose && ctx.Err() == nil {
 				w.s.diagf("%s: could not be looked up (%v)", project, err)
 			}
@@ -1035,7 +1058,7 @@ func reconcile(idx *contract.Index, r *resolver) bool {
 			changed = true
 		case !r.knows(l.To):
 			changed = true
-			demoted = append(demoted, contract.Unresolved{From: l.From, Ref: l.To, Kind: l.Kind, Evidence: l.Evidence})
+			demoted = append(demoted, contract.Unresolved{From: l.From, Ref: l.To, Kind: l.Kind, Evidence: l.Evidence, Target: l.Target})
 		default:
 			have[key(l.From, l.To, l.Kind)] = true
 			links = append(links, l)
@@ -1058,7 +1081,7 @@ func reconcile(idx *contract.Index, r *resolver) bool {
 			changed = true
 			if target != u.From && !have[key(u.From, target, u.Kind)] {
 				have[key(u.From, target, u.Kind)] = true
-				links = append(links, contract.Link{From: u.From, To: target, Kind: u.Kind, Evidence: u.Evidence})
+				links = append(links, contract.Link{From: u.From, To: target, Kind: u.Kind, Evidence: u.Evidence, Target: u.Target})
 			}
 			continue
 		}

@@ -327,15 +327,34 @@ project and the reason it matters, with absent ones fetched into place.
 
 ## Phase 3: Shell fetch and remaining sources (US4)
 
-- [ ] T033 [US4] `sync.go`: `--related[=uses|used-by|both]` — select link
-      targets/sources of the current project not checked out and feed the
-      existing pool; `--dry-run` parity; events as today.
-- [ ] T034 [P] [US4] `scan.go`: image extractor (`FROM`, `image:` against
-      registry prefixes) → `image`.
-- [ ] T035 [P] [US4] `scan.go`: `.gitmodules` extractor → `submodule`.
-- [ ] T036 [P] [US4] `scan.go`: documentation mentions extractor →
-      `mentions` (root `*.md`, `docs/**/*.md`).
-- [ ] T037 [US4] tests for T033–T036; README updates.
+- [x] T033 [US4] `syncrelated.go`: `gitty sync --related[=uses|used-by|both]`
+      — a sync whose project list is the far side of the subject's links
+      (project, group or named subject), fed to `fetchProjects` with
+      `update`: absent projects cloned, present ones fast-forwarded. Sync's
+      events, summary and exit codes; `--dry-run` plans the identical run in
+      memory and writes nothing, the index included. Mention-only projects
+      left out; a link out of the workspace's namespace is `skip <project>
+      outside-workspace`; archived related projects are synced; `--exclude`
+      applies to the run without touching the index. Refused with
+      `--groups`, `--nested`, `--prune`.
+- [x] T034 [P] [US4] `scan.go` / `resolve.go`: image extractor — `FROM` in
+      `Dockerfile*`/`Containerfile*`, `image:` in CI and compose files,
+      matched against the instance's registry host (learned from a project
+      lookup, `Index.Registry`) → `image`.
+- [x] T035 [P] [US4] `scan.go`: `.gitmodules` extractor, relative URLs
+      resolved against the project's own path → `submodule`.
+- [x] T036 [P] [US4] `scan.go`: documentation mentions (`*.md` at the root
+      and under `docs/`, changelogs and licences skipped) → `mentions`;
+      listed last in a briefing and never fetched on their own account.
+- [x] T037 [US4] tests for T033–T036 (`scan_test.go`, `briefing_test.go`,
+      `syncrelated_test.go`, `TestE2ESyncRelated*`); README and `context.md`.
+- [x] T046 [US1] What a link points at: `Link.Target` / `Unresolved.Target`
+      (included files, component name, module directory) and
+      `Related.Files`, the ones that exist in the checkout, listed first
+      under "Where to read next". `ScannerVersion` 3.
+- [x] T047 [US3] `index.go`: a project checked out after it was listed is
+      looked up at the next refresh (fork origin), best effort; lookups stop
+      at the first failure that is not "no such project".
 
 ---
 

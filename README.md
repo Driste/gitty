@@ -17,7 +17,7 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 * **Excludes**: List the projects or subgroups you never want (`exclude = [...]` in the config, or `--exclude`) and every sync and listing leaves them out, reporting each skip.
 * **Orphans**: Checkouts whose project was deleted or moved upstream are reported by `sync` and `ls`; `sync --prune` moves them aside — never deletes.
 * **Shell Completion**: `gitty completion bash|zsh|fish` completes commands, flags, and group paths.
-* **Cross-Repository Context**: `gitty context` tells you — or a coding agent — which other projects a project uses and which use it, where each one is on disk, and the file and line that says so; `--fetch` clones the ones that are missing.
+* **Cross-Repository Context**: `gitty context` tells you — or a coding agent — which other projects a project uses and which use it, where each one is on disk, and the file and line that says so; `--fetch` clones the ones that are missing, and `gitty sync --related` keeps them up to date.
 * **Plugins**: `gitty <name>` runs an executable called `gitty-<name>`, the way git does.
 * **Live Namespace Only**: Projects and groups GitLab has archived are left out of `ls` and `sync` unless you ask for them with `--archived`.
 
@@ -177,6 +177,7 @@ gitty -C ~/ws/tenant/images sync
 | `--archived` | `false` | Include projects and groups GitLab has archived. Left out by default. |
 | `--exclude` | `""` | Namespace path or glob to leave out — `acme/vendor` (and everything beneath it), `'acme/*-mirror'`. Repeatable, or comma-separated. Adds to the workspace's `exclude` list (see below). |
 | `--prune` | `false` | Move checkouts that no longer exist upstream aside as `<dir>.gitty-orphan-<n>`. Never deletes anything. Without it, orphans are only reported. |
+| `--related` | | Sync the projects a project is linked to instead of a group: `--related` (what it uses), `--related=used-by`, `--related=both`. See [Syncing what a project needs](#syncing-what-a-project-needs-gitty-sync---related). |
 | `--token` | `""` | Your GitLab Access Token. Falls back to `GITLAB_TOKEN` or `CI_JOB_TOKEN` env vars. Required unless `--anon` is set. |
 | `--anon` | `false` | Sync public groups and repositories anonymously. Any `GITLAB_TOKEN` / `CI_JOB_TOKEN` in the environment is ignored, so a stale token cannot turn an anonymous run into a 401. Conflicts with `--token`. |
 | `--groups` | `false` | Only fetch groups/subgroups and create their directory structure locally. |
@@ -387,6 +388,7 @@ pull tenant/images/app         # repo fast-forwarded (git pull --ff-only)
 group tenant/images            # group dir + nested config ensured
 reclone tenant/images/app      # broken checkout moved aside and re-cloned
 skip tenant/images/vendor excluded          # matched an exclude pattern
+skip platform/ci/templates outside-workspace   # --related: linked to, but this workspace has no place for it
 orphan tenant/images/old no project upstream   # local checkout, nothing upstream (see --prune)
 prune tenant/images/old        # --prune: moved aside as old.gitty-orphan-1
 error tenant/images/app git pull failed
@@ -672,10 +674,16 @@ A **link** is one evidenced reference from a project to another:
 | `ci-trigger` | `.gitlab-ci.yml`: `trigger: project:` | The pipeline triggers the project's pipeline. |
 | `ci-component` | `.gitlab-ci.yml`: `include: component:` | The pipeline uses a CI/CD component the project publishes. |
 | `depends` | Package manifests (`go.mod`, `package.json`, `requirements*.txt`, `pyproject.toml`, `Gemfile`, `Cargo.toml`, `pom.xml`, `build.gradle`, `composer.json`, `*.tf`, `Chart.yaml`, `.npmrc`, …); clone URLs in CI scripts; `needs: project:` | The project is named as a dependency: by its URL on the instance, its Go module path, or its package registry. |
+| `image` | `FROM` in `Dockerfile*` / `Containerfile*`; `image:` in CI and compose files | A container image is pulled from the project's registry on the instance. |
+| `submodule` | `.gitmodules` | The project is a git submodule of this one. |
 | `fork` | The GitLab API | The project was forked from the other one. |
+| `mentions` | `*.md` at the top of the repository and under `docs/` | The documentation links to the project. The weakest kind: worth knowing, not a dependency. |
 
 Every link carries its **evidence** — a file and line (`go.mod:12`), or the
-API field it came from — so it can be opened and checked. A reference only
+API field it came from — so it can be opened and checked. Where the reference
+names something inside the other project, the link carries that too, as its
+**target**: the files a pipeline includes, the component it uses, the
+directory of a Terraform module. A reference only
 becomes a link when it lands on a project that really exists in the
 workspace's part of the instance; one that points at the instance but matches
 nothing is reported as **unresolved**, never presented as a project.
@@ -716,9 +724,9 @@ gitty context --format=json  # the same briefing as data
 gitlab.example.com · `.` · main · topics: go, api · docs: README.md, AGENTS.md
 
 ## Uses (3)
-- **acme/ci-templates** — Pipeline templates · `../ci-templates` (fetched) · ci-include (.gitlab-ci.yml:2)
+- **acme/ci-templates** — Pipeline templates · `../ci-templates` (fetched) · ci-include templates/build.yml (.gitlab-ci.yml:2)
 - **acme/lib** — Shared domain types · `../lib` · depends (go.mod:12)
-- **acme/base-images** — Hardened base images · *not checked out* (`gitty fetch acme/base-images`) · depends (.gitlab-ci.yml:31)
+- **acme/base-images** — Hardened base images · *not checked out* (`gitty fetch acme/base-images`) · image (Dockerfile:1)
 
 ## Used by (1)
 - **acme/web** — Web frontend · `../web` · depends (package.json:21)
@@ -727,7 +735,7 @@ gitlab.example.com · `.` · main · topics: go, api · docs: README.md, AGENTS.
 - acme/old-lib (go.mod:14)
 
 ## Where to read next
-- acme/ci-templates: ../ci-templates/README.md
+- acme/ci-templates: ../ci-templates/templates/build.yml, ../ci-templates/README.md
 - acme/lib: ../lib/AGENTS.md, ../lib/README.md
 
 ## Notes
@@ -736,22 +744,26 @@ gitlab.example.com · `.` · main · topics: go, api · docs: README.md, AGENTS.
 
 One line per related project: what it is, **where it is on this machine**
 (relative to the directory you ran the command in), and **why it matters**
-(the kind of link and the file and line that proves it). "Where to read next"
-lists each related checkout's documentation, instructions written for agents
-first and the README last. The headings are stable, so the output can be
-searched as well as read.
+(the kind of link, what in that project it points at, and the file and line
+that proves it). "Where to read next" lists, for each related checkout, the
+files the links point at — the template that is actually included — and then
+its documentation, instructions written for agents first and the README last.
+Projects that are only mentioned in documentation come last on each side. The
+headings are stable, so the output can be searched as well as read.
 
 The briefing is the only thing on stdout. `--format=json` prints it as one
 JSON document with the same content — absolute `path` and `relative_path` for
-every project that is checked out, `links` with `kind` and `evidence`, `docs`,
-and the totals of both sides.
+every project that is checked out, `links` with `kind`, `evidence` and
+`target`, the `files` those links point at, `docs`, and the totals of both
+sides.
 
 **`--fetch`** clones the projects the subject *uses* that are not checked out
 yet, each into the directory its namespace path gives it — exactly where a
 `gitty sync` of its group would have put it — and marks them `(fetched)`. It
 only ever adds: a project that is already checked out is never pulled or
-touched, projects that merely use the subject are not fetched, and at most 25
-are cloned per run. What fetching does is reported on stderr. A fetch that
+touched, projects that merely use the subject are not fetched, nor are
+projects its documentation only mentions, and at most 25 are cloned per run.
+What fetching does is reported on stderr. A fetch that
 fails leaves the project in the briefing, as not checked out, with the reason;
 the exit code is then 1.
 
@@ -891,6 +903,47 @@ arbitrary. `--dry-run` prints `plan clone` lines and clones nothing;
 `--format=json` prints one document on stdout (`project`, `path`, `present`,
 `fetched`, `error` per project) and sends the events to stderr.
 
+### Syncing what a project needs (`gitty sync --related`)
+
+```bash
+cd ~/ws/acme/app
+gitty sync --related              # what this project uses
+gitty sync --related=used-by      # what uses it
+gitty sync --related=both
+gitty sync --related acme/app     # a project by its path, or by its directory
+```
+
+```text
+clone acme/ci-templates
+pull acme/lib
+summary cloned=1 pulled=1 skipped=0 errors=0
+```
+
+A sync whose list of projects comes from the links instead of from a group.
+The related projects that are not checked out are cloned into their namespace
+paths, the ones that are get a fast-forward pull, and nothing else in the
+workspace is touched. It is what `gitty context --fetch` does, for the shell
+and for scripts, plus the pull — so run before an agent starts it leaves the
+project's surroundings both present and current.
+
+Everything else is `sync`: the same events and summary line, the same
+`--dry-run` (which plans the identical run and writes nothing), `--jobs`,
+`--exclude`, `--reclone-broken` and exit codes. It differs in three ways.
+Links are followed **one step**: what a newly cloned project uses in turn is
+the next run's business, from there. A related project is synced **whether or
+not it is archived**, because a file in the project asked for it. And a link
+into a namespace this workspace has no place for — a workspace anchored at
+`acme`, a template in `platform/ci` — is passed over with `skip <project>
+outside-workspace` rather than failed on. Projects that are only mentioned in
+documentation are left out.
+
+In a group's directory the subject is every checkout of the group, so at the
+root of a workspace `gitty sync --related` brings in whatever the checked-out
+projects use and are missing. `--related=used-by` can only name projects that
+are checked out, since links are found by reading checkouts; it is a pull of
+the projects that depend on this one. The direction is given after an equals
+sign. `--related` cannot be combined with `--groups`, `--nested` or `--prune`.
+
 ### The index (`gitty index`)
 
 ```bash
@@ -959,7 +1012,8 @@ It answers from the index, bringing it up to date first — checkouts whose
 commit moved are reread, and the project being asked about is always reread,
 so an uncommitted edit to it shows. With an index in place that needs **no
 network and no token**; the instance is only contacted when there is no index
-yet, or a checkout appears that the index has never heard of.
+yet, or when a checkout has appeared since it was built — and then only if a
+credential is at hand, and without failing if the instance does not answer.
 
 ---
 

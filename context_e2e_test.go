@@ -466,7 +466,7 @@ func TestE2EContext(t *testing.T) {
 		"Customer-facing API.",
 		"",
 		"## Uses (2)",
-		"- **acme/ci-templates** — Pipeline templates · *not checked out* (`gitty fetch acme/ci-templates`) · ci-include (.gitlab-ci.yml:2)",
+		"- **acme/ci-templates** — Pipeline templates · *not checked out* (`gitty fetch acme/ci-templates`) · ci-include templates/build.yml (.gitlab-ci.yml:2)",
 		"- **acme/lib** — Shared domain types · *not checked out* (`gitty fetch acme/lib`) · depends (package.json:4)",
 		"",
 		// An empty side is said to be empty, and the blind spot is named.
@@ -494,7 +494,7 @@ func TestE2EContext(t *testing.T) {
 		"Customer-facing API.",
 		"",
 		"## Uses (2)",
-		"- **acme/ci-templates** — Pipeline templates · `../../ci-templates` (fetched) · ci-include (.gitlab-ci.yml:2)",
+		"- **acme/ci-templates** — Pipeline templates · `../../ci-templates` (fetched) · ci-include templates/build.yml (.gitlab-ci.yml:2)",
 		"- **acme/lib** — Shared domain types · `../../lib` (fetched) · depends (package.json:4)",
 		"",
 		"## Used by (0)",
@@ -504,7 +504,7 @@ func TestE2EContext(t *testing.T) {
 		"- acme/old-lib (package.json:5)",
 		"",
 		"## Where to read next",
-		"- acme/ci-templates: ../../ci-templates/README.md",
+		"- acme/ci-templates: ../../ci-templates/templates/build.yml, ../../ci-templates/README.md",
 		"- acme/lib: ../../lib/AGENTS.md, ../../lib/README.md",
 		"",
 		"## Notes",
@@ -599,7 +599,7 @@ func TestE2EContext(t *testing.T) {
 		"- **acme/app** — Customer-facing API · `app`\n",
 		"- **acme/app-fork** · *not checked out*\n",
 		"## Links within the group (2)\n",
-		"- acme/app → acme/ci-templates · ci-include (.gitlab-ci.yml:2)\n",
+		"- acme/app → acme/ci-templates · ci-include templates/build.yml (.gitlab-ci.yml:2)\n",
 		"- acme/app → acme/lib · depends (package.json:4)\n",
 		"## References that are not projects here (1)\n- acme/old-lib (acme/app: package.json:5)\n",
 	} {
@@ -621,7 +621,7 @@ func TestE2EContext(t *testing.T) {
 		t.Errorf("exit = %d, want 1: the briefing is complete but not everything asked for was done\n%s", code, stderr)
 	}
 	for _, want := range []string{
-		"- **acme/ci-templates** — Pipeline templates · `../ci-templates` · ci-include (.gitlab-ci.yml:2)\n",
+		"- **acme/ci-templates** — Pipeline templates · `../ci-templates` · ci-include templates/build.yml (.gitlab-ci.yml:2)\n",
 		"- **acme/lib** — Shared domain types · *not checked out* (`gitty fetch acme/lib`) · depends (package.json:4)\n  - fetching it failed: git fetch failed\n",
 	} {
 		if !strings.Contains(stdout, want) {
@@ -868,9 +868,9 @@ func TestE2EContextReachesOtherGroups(t *testing.T) {
 
 	stdout, stderr := mustGitty(t, appDir, nil, "context", "--fetch", "--anon")
 	for _, want := range []string{
-		"- **platform/ci/templates** — Shared pipeline templates · `../../platform/ci/templates` (fetched) · ci-include (.gitlab-ci.yml:2)\n",
+		"- **platform/ci/templates** — Shared pipeline templates · `../../platform/ci/templates` (fetched) · ci-include build.yml (.gitlab-ci.yml:2)\n",
 		"## References that are not projects here (1)\n- platform/ci/gone (.gitlab-ci.yml:4)\n",
-		"- platform/ci/templates: ../../platform/ci/templates/README.md\n",
+		"- platform/ci/templates: ../../platform/ci/templates/build.yml, ../../platform/ci/templates/README.md\n",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("briefing missing %q:\n%s\nstderr:\n%s", want, stdout, stderr)
@@ -895,5 +895,190 @@ func TestE2EContextReachesOtherGroups(t *testing.T) {
 	stdout, _ = mustGitty(t, appDir, nil, "context", "--fetch", "--anon")
 	if !strings.Contains(stdout, "- **platform/tools/lint** · `../../platform/tools/lint` (fetched) · ci-trigger (.gitlab-ci.yml:8)\n") {
 		t.Errorf("--fetch should have found and fetched it:\n%s", stdout)
+	}
+}
+
+// TestE2ESyncRelated: `gitty sync --related` is a sync of the projects a
+// project is linked to — the absent ones cloned, the present ones pulled, and
+// no other project in the group touched.
+func TestE2ESyncRelated(t *testing.T) {
+	skipIfShort(t)
+	fx := newLinkedFixture(t)
+	f := fx.f
+	ws := initWorkspace(t, f)
+	cloneInto(t, f, ws, "acme/app")
+	appDir := filepath.Join(ws, "acme", "app")
+	libDir := filepath.Join(ws, "acme", "lib")
+
+	t.Log("--dry-run plans the sync and writes nothing, not even the index")
+	stdout, _ := mustGitty(t, filepath.Join(appDir, "src"), nil, "sync", "--related", "--anon", "--dry-run", "--jobs=1")
+	assertContextEvents(t, stdout)
+	wantLines(t, "sync --related --dry-run", stdout,
+		"plan clone acme/ci-templates",
+		"plan clone acme/lib",
+		"summary cloned=2 pulled=0 skipped=0 errors=0",
+	)
+	if _, err := os.Stat(libDir); !os.IsNotExist(err) {
+		t.Error("--dry-run cloned")
+	}
+	if _, err := os.Stat(indexPath(ws)); !os.IsNotExist(err) {
+		t.Error("--dry-run wrote the index")
+	}
+
+	t.Log("the real run does what the dry run said: what the project uses, and no sibling")
+	stdout, stderr := mustGitty(t, filepath.Join(appDir, "src"), nil, "sync", "--related", "--anon", "--jobs=1")
+	assertContextEvents(t, stdout)
+	wantLines(t, "sync --related", stdout,
+		"clone acme/ci-templates",
+		"clone acme/lib",
+		"summary cloned=2 pulled=0 skipped=0 errors=0",
+	)
+	if !strings.Contains(stderr, "Syncing projects related to acme/app (uses)") {
+		t.Errorf("stderr should say what is being synced:\n%s", stderr)
+	}
+	if got := readFileT(t, filepath.Join(libDir, "lib.txt")); got != "needle in the library\n" {
+		t.Errorf("lib.txt = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "app-fork")); !os.IsNotExist(err) {
+		t.Error("a project that is not related was cloned")
+	}
+
+	t.Log("a second run pulls: what is already there is brought up to date")
+	work := t.TempDir()
+	gitRun(t, work, "clone", "-q", filepath.Join(f.gitRoot, "acme", "lib.git"), ".")
+	f.pushUpdate(t, work, "acme/lib", "lib.txt", "a newer needle\n")
+	stdout, _ = mustGitty(t, appDir, nil, "sync", "--related", "--anon", "--jobs=1")
+	wantLines(t, "sync --related, again", stdout,
+		"pull acme/ci-templates",
+		"pull acme/lib",
+		"summary cloned=0 pulled=2 skipped=0 errors=0",
+	)
+	if got := readFileT(t, filepath.Join(libDir, "lib.txt")); got != "a newer needle\n" {
+		t.Errorf("after the pull lib.txt = %q", got)
+	}
+
+	t.Log("--related=used-by is the other side; a subject can be named, by path or by directory")
+	stdout, _ = mustGitty(t, ws, nil, "sync", "acme/lib", "--related=used-by", "--anon", "--jobs=1")
+	wantLines(t, "sync acme/lib --related=used-by", stdout,
+		"pull acme/app",
+		"summary cloned=0 pulled=1 skipped=0 errors=0",
+	)
+	cloneInto(t, f, ws, "acme/app-fork")
+	stdout, _ = mustGitty(t, ws, nil, "sync", "--related=both", "--anon", "--jobs=1", "--dry-run", filepath.Join("acme", "app"))
+	wantLines(t, "sync --related=both --dry-run <dir>", stdout,
+		"plan pull acme/app-fork",
+		"plan pull acme/ci-templates",
+		"plan pull acme/lib",
+		"summary cloned=0 pulled=3 skipped=0 errors=0",
+	)
+
+	t.Log("--exclude leaves a related project out of this run")
+	stdout, _ = mustGitty(t, appDir, nil, "sync", "--related", "--anon", "--jobs=1", "--exclude=acme/lib")
+	wantLines(t, "sync --related --exclude", stdout,
+		"skip acme/lib excluded",
+		"pull acme/ci-templates",
+		"summary cloned=0 pulled=1 skipped=1 errors=0",
+	)
+	if idx := readIndex(t, ws); len(idx.Exclude) != 0 {
+		t.Errorf("a one-run --exclude was recorded in the index: %v", idx.Exclude)
+	}
+
+	t.Log("a pull that cannot fast-forward is that project's error, and the run's exit status")
+	gitRun(t, libDir, "commit", "-q", "--allow-empty", "-m", "local work")
+	gitRun(t, work, "pull", "-q", "origin", "main")
+	f.pushUpdate(t, work, "acme/lib", "lib.txt", "the newest needle\n")
+	stdout, stderr, code := runGitty(t, appDir, nil, "sync", "--related", "--anon", "--jobs=1")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "pull acme/ci-templates\n") || !strings.Contains(stdout, "error acme/lib ") ||
+		!strings.Contains(stdout, "summary cloned=0 pulled=1 skipped=0 errors=1\n") {
+		t.Errorf("sync --related with a diverged checkout:\n%s", stdout)
+	}
+
+	t.Log("what does not go with --related is refused before anything happens")
+	for name, args := range map[string][]string{
+		"an unknown direction": {"sync", "--related=sideways", "--anon"},
+		"--groups":             {"sync", "--related", "--groups", "--anon"},
+		"--nested":             {"sync", "--related", "--nested", "--anon"},
+		"--prune":              {"sync", "--related", "--prune", "--anon"},
+		"no credential":        {"sync", "--related"},
+	} {
+		if _, stderr, code := runGitty(t, appDir, []string{"GITLAB_TOKEN=", "CI_JOB_TOKEN="}, args...); code != 2 {
+			t.Errorf("%s: exit = %d, want 2\n%s", name, code, stderr)
+		}
+	}
+	// The direction is given after an equals sign; apart from it, it would be
+	// read as the subject. The error says so.
+	_, stderr, code = runGitty(t, appDir, nil, "sync", "--related", "used-by", "--anon")
+	if code != 2 || !strings.Contains(stderr, "--related=used-by") {
+		t.Errorf("sync --related used-by: exit %d\n%s", code, stderr)
+	}
+}
+
+// TestE2ESyncRelatedInAGroup: in a group's directory the subject is every
+// checkout of the group, and what one of them uses is synced even when it is
+// itself a member of the group.
+func TestE2ESyncRelatedInAGroup(t *testing.T) {
+	skipIfShort(t)
+	fx := newLinkedFixture(t)
+	ws := initWorkspace(t, fx.f)
+	cloneInto(t, fx.f, ws, "acme/app")
+
+	stdout, _ := mustGitty(t, filepath.Join(ws, "acme"), nil, "sync", "--related", "--anon", "--jobs=1")
+	wantLines(t, "sync --related in a group", stdout,
+		"clone acme/ci-templates",
+		"clone acme/lib",
+		"summary cloned=2 pulled=0 skipped=0 errors=0",
+	)
+}
+
+// TestE2ESyncRelatedReachesOtherGroups: a link into a group the workspace has
+// never listed is followed when the workspace has room for the project, and
+// passed over — not failed on — when it is anchored at a group that does not.
+func TestE2ESyncRelatedReachesOtherGroups(t *testing.T) {
+	skipIfShort(t)
+	f := newFakeGitLab(t)
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.addRepo(t, "acme/app", map[string]string{
+		".gitlab-ci.yml": "include:\n  - project: platform/ci/templates\n    file: /build.yml\n  - project: platform/ci/gone\n    file: /x.yml\n",
+	})
+	f.addRepo(t, "platform/ci/templates", map[string]string{"build.yml": "build:\n  script: [make]\n"})
+	f.projects["acme"] = []apiProject{f.project(1, "acme/app")}
+	f.projects["platform/ci"] = []apiProject{f.project(2, "platform/ci/templates")}
+
+	t.Log("a workspace of the whole instance has a place for it")
+	ws := initWorkspace(t, f)
+	cloneInto(t, f, ws, "acme/app")
+	appDir := filepath.Join(ws, "acme", "app")
+	stdout, _ := mustGitty(t, appDir, nil, "sync", "--related", "--anon", "--dry-run")
+	wantLines(t, "sync --related --dry-run", stdout,
+		"plan clone platform/ci/templates",
+		"summary cloned=1 pulled=0 skipped=0 errors=0",
+	)
+	stdout, _ = mustGitty(t, appDir, nil, "sync", "--related", "--anon")
+	wantLines(t, "sync --related", stdout,
+		"clone platform/ci/templates",
+		"summary cloned=1 pulled=0 skipped=0 errors=0",
+	)
+	if got := readFileT(t, filepath.Join(ws, "platform", "ci", "templates", "build.yml")); !strings.Contains(got, "make") {
+		t.Errorf("the included template was not cloned: %q", got)
+	}
+
+	t.Log("a workspace of one group does not")
+	ws = t.TempDir()
+	writeConfigAt(t, ws, Config{URL: f.srv.URL, HTTP: true, RootPath: "acme"})
+	gitRun(t, ws, "clone", "-q", filepath.Join(f.gitRoot, "acme", "app.git"), "app")
+	stdout, _ = mustGitty(t, filepath.Join(ws, "app"), nil, "sync", "--related", "--anon")
+	wantLines(t, "sync --related in a workspace of one group", stdout,
+		"skip platform/ci/templates outside-workspace",
+		"summary cloned=0 pulled=0 skipped=1 errors=0",
+	)
+	entries, err := os.ReadDir(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 { // .gitty and app
+		t.Errorf("workspace root holds %v, want only .gitty and app", entries)
 	}
 }

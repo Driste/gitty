@@ -154,7 +154,7 @@ func (w *workspace) fetchForBriefing(ctx context.Context, idx *contract.Index, b
 		absent = absent[:maxContextFetch]
 	}
 	w.s.progress.enable(w.s.errOut)
-	results := w.fetchProjects(ctx, absent)
+	results := w.fetchProjects(ctx, absent, false)
 	if ctx.Err() != nil {
 		return nil, errInterrupted
 	}

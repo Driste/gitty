@@ -83,7 +83,7 @@ type Invocation struct {
 }
 
 // AgentSchemaVersion is reported in the schema so consumers can detect changes.
-const AgentSchemaVersion = "3.8.0"
+const AgentSchemaVersion = "3.9.0"
 
 // buildAgentSchema constructs the schema describing every gitty command.
 // It is the single source of truth used to render the agent-facing schema.
@@ -148,7 +148,7 @@ func buildAgentSchema() AgentSchema {
 			},
 			{
 				Name:        "sync",
-				Description: "Sync a GitLab group. Clones repositories that do not exist locally and fast-forwards those that do. Works from anywhere inside a workspace created by 'init': the nearest .gitty/config above the current directory is used, and the directory's position below it is the current group.",
+				Description: "Sync a GitLab group. Clones repositories that do not exist locally and fast-forwards those that do. Works from anywhere inside a workspace created by 'init': the nearest .gitty/config above the current directory is used, and the directory's position below it is the current group. With related, the projects synced are the ones a project is linked to instead of the ones in a group.",
 				InputSchema: InputSchema{
 					Type: "object",
 					Properties: map[string]SchemaProp{
@@ -213,6 +213,10 @@ func buildAgentSchema() AgentSchema {
 						"exclude": {
 							Type:        "string",
 							Description: "Namespace path or glob to leave out, e.g. 'acme/vendor' (covers everything beneath it) or 'acme/*-mirror'. Repeatable, and also accepts a comma-separated list. Adds to the workspace's exclude list; excluded projects are reported as 'skip <path> excluded'.",
+						},
+						"related": {
+							Type:        "string",
+							Description: "Sync the projects linked to a project instead of a group: 'uses' (what it depends on, includes, triggers or builds from), 'used-by' (what does that to it) or 'both'. Always pass the value with an equals sign (--related=uses). The project is the checkout the command is run in, or the one named by 'path' (a namespace path or a directory); in a group's directory it is every checkout of the group. Absent projects are cloned at their namespace path and present ones fast-forwarded; nothing else in the workspace is touched. Projects that are only mentioned in documentation are left out. Cannot be combined with groups, nested or prune.",
 						},
 						"prune": {
 							Type:        "boolean",
@@ -331,7 +335,7 @@ func buildAgentSchema() AgentSchema {
 			},
 			{
 				Name:        "context",
-				Description: "Brief a project: which other projects of the GitLab instance it uses and which use it, each with its description, the absolute and relative path of its checkout on this machine (or the command that fetches it), the kind of link (depends, ci-include, ci-trigger, ci-component, image, submodule, fork, mentions) and the file and line that proves it. Use it before changing a project, to find the code it depends on and the code that depends on it. With fetch, the projects it uses that are not checked out are cloned first, into the places their namespace paths give them. The briefing is the only thing on stdout: Markdown by default, or with format=json one JSON document (fields: schema, instance, workspace, subject, uses[], used_by[], uses_total, used_by_total, within[], unresolved[], notes[]; each related project has project, description, present, fetched, path, relative_path, fetch_command, fetch_error, links[{from,to,kind,evidence}], docs[], summary). Answered from the workspace index, which is brought up to date first; the instance is only contacted to fetch, or if the index has to be built. Exit 1 means the briefing was printed but a fetch failed (see fetch_error).",
+				Description: "Brief a project: which other projects of the GitLab instance it uses and which use it, each with its description, the absolute and relative path of its checkout on this machine (or the command that fetches it), the kind of link (depends, ci-include, ci-trigger, ci-component, image, submodule, fork, mentions) and the file and line that proves it. Use it before changing a project, to find the code it depends on and the code that depends on it. With fetch, the projects it uses that are not checked out are cloned first, into the places their namespace paths give them. The briefing is the only thing on stdout: Markdown by default, or with format=json one JSON document (fields: schema, instance, workspace, subject, uses[], used_by[], uses_total, used_by_total, within[], unresolved[], notes[]; each related project has project, description, present, fetched, path, relative_path, fetch_command, fetch_error, links[{from,to,kind,evidence,target}], files[], docs[], summary; target is what the reference names inside the other project, such as the files a pipeline includes, and files are the ones among them that exist in its checkout, relative to path). A project that is only mentioned in documentation (kind mentions) is listed last and is not fetched. Answered from the workspace index, which is brought up to date first; the instance is only contacted to fetch, or if the index has to be built. Exit 1 means the briefing was printed but a fetch failed (see fetch_error).",
 				InputSchema: InputSchema{
 					Type: "object",
 					Properties: map[string]SchemaProp{

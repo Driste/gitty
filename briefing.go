@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -106,6 +107,13 @@ func (w *workspace) buildBriefing(idx *contract.Index, subj subject, direction s
 	uses, usedBy, within := subjectLinks(idx, subj)
 	usesRel := w.relatedFrom(idx, uses, func(l contract.Link) string { return l.To })
 	usedByRel := w.relatedFrom(idx, usedBy, func(l contract.Link) string { return l.From })
+	// What a link points at is in the project it leads to: for the ones
+	// the subject uses, that is the related project's own checkout.
+	for i := range usesRel {
+		if usesRel[i].Present {
+			usesRel[i].Files = linkedFiles(usesRel[i].Path, usesRel[i].Links)
+		}
+	}
 	b.UsesTotal, b.UsedByTotal = len(usesRel), len(usedByRel)
 
 	if direction != directionUsedBy {
@@ -151,12 +159,30 @@ func (w *workspace) relatedFrom(idx *contract.Index, links []contract.Link, othe
 		}
 		rel.Links = append(rel.Links, l)
 	}
-	sort.Strings(order)
+	// Projects related by something real come first; one that is only
+	// mentioned in documentation comes after them.
+	sort.Slice(order, func(i, j int) bool {
+		a, b := onlyMentioned(byProject[order[i]].Links), onlyMentioned(byProject[order[j]].Links)
+		if a != b {
+			return b
+		}
+		return order[i] < order[j]
+	})
 	out := make([]contract.Related, 0, len(order))
 	for _, p := range order {
 		out = append(out, *byProject[p])
 	}
 	return out
+}
+
+// onlyMentioned reports whether every link is a mention in documentation.
+func onlyMentioned(links []contract.Link) bool {
+	for _, l := range links {
+		if l.Kind != contract.KindMentions {
+			return false
+		}
+	}
+	return true
 }
 
 // describe fills in everything a briefing says about one related project
@@ -182,6 +208,46 @@ func (w *workspace) describe(idx *contract.Index, project string) *contract.Rela
 		rel.FetchCommand = "gitty fetch " + project
 	}
 	return rel
+}
+
+// maxLinkedFiles bounds how many pointed-at files one related project lists.
+const maxLinkedFiles = 8
+
+// linkedFiles returns the files in a checkout that the links to it point at
+// and that are really there, relative to the checkout: the template a
+// pipeline includes, the definition of a component it uses. Naming the file
+// saves the reader a search; naming one that does not exist would cost them
+// one, so each is checked.
+func linkedFiles(dir string, links []contract.Link) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(rel string) {
+		// Cleaned against a root, so no target can name anything outside
+		// the checkout it is supposed to be in.
+		rel = strings.TrimPrefix(path.Clean("/"+rel), "/")
+		if rel == "" || seen[rel] || len(out) == maxLinkedFiles {
+			return
+		}
+		seen[rel] = true
+		if fi, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); err == nil && fi.Mode().IsRegular() {
+			out = append(out, rel)
+		}
+	}
+	for _, l := range links {
+		if l.Target == "" {
+			continue
+		}
+		for _, target := range strings.Split(l.Target, ", ") {
+			if l.Kind == contract.KindCIComponent {
+				// Where GitLab looks for a component named <target>.
+				add("templates/" + target + ".yml")
+				add("templates/" + target + "/template.yml")
+				continue
+			}
+			add(target)
+		}
+	}
+	return out
 }
 
 // groupDir returns the directory that stands for a group in this workspace,
@@ -210,11 +276,13 @@ func (w *workspace) groupDir(group string) (string, bool) {
 }
 
 // absentUses lists the projects a briefing's subject uses that are not
-// checked out and could be: what `--fetch` goes and gets.
+// checked out and could be: what `--fetch` goes and gets. A project that is
+// only mentioned in the subject's documentation is not among them: a link in
+// a README is not a reason to clone a repository.
 func absentUses(b *contract.Briefing) []string {
 	var out []string
 	for _, r := range b.Uses {
-		if !r.Present && r.FetchCommand != "" {
+		if !r.Present && r.FetchCommand != "" && !onlyMentioned(r.Links) {
 			out = append(out, r.Project)
 		}
 	}
@@ -257,7 +325,11 @@ func renderBriefing(sb *strings.Builder, b *contract.Briefing) {
 		if len(b.Within) > 0 {
 			fmt.Fprintf(sb, "\n## Links within the group (%d)\n", len(b.Within))
 			for _, l := range b.Within {
-				fmt.Fprintf(sb, "- %s → %s · %s (%s)\n", l.From, l.To, l.Kind, l.Evidence)
+				what := l.Kind
+				if l.Target != "" {
+					what += " " + l.Target
+				}
+				fmt.Fprintf(sb, "- %s → %s · %s (%s)\n", l.From, l.To, what, l.Evidence)
 			}
 		}
 	} else {
@@ -317,7 +389,11 @@ func renderBriefing(sb *strings.Builder, b *contract.Briefing) {
 						evidence = member + ": " + evidence
 					}
 				}
-				why = append(why, fmt.Sprintf("%s (%s)", l.Kind, evidence))
+				what := l.Kind
+				if l.Target != "" {
+					what += " " + l.Target
+				}
+				why = append(why, fmt.Sprintf("%s (%s)", what, evidence))
 			}
 			fmt.Fprintf(sb, "- **%s**%s · %s · %s\n", r.Project, dashed(r.Description),
 				whereIs(r.Present, r.RelativePath, r.Fetched, r.FetchCommand, r.Archived), strings.Join(why, ", "))
@@ -355,12 +431,13 @@ func renderBriefing(sb *strings.Builder, b *contract.Briefing) {
 	var next []string
 	for _, list := range [][]contract.Related{b.Uses, b.UsedBy} {
 		for _, r := range list {
-			if !r.Present || len(r.Docs) == 0 {
+			if !r.Present || len(r.Files)+len(r.Docs) == 0 {
 				continue
 			}
+			// The files the links point at first, then the documentation.
 			var files []string
-			for _, d := range r.Docs {
-				files = append(files, joinRel(r.RelativePath, d))
+			for _, f := range append(append([]string(nil), r.Files...), r.Docs...) {
+				files = append(files, joinRel(r.RelativePath, f))
 			}
 			next = append(next, fmt.Sprintf("- %s: %s", r.Project, strings.Join(files, ", ")))
 		}

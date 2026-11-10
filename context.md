@@ -114,6 +114,7 @@ ones.
 | `--verbose`        | boolean | `false` | Print each git invocation and its output to stderr (URLs redacted). |
 | `--reclone-broken` | boolean | `false` | Move aside non-repo destinations (renamed `<dir>.gitty-broken-<n>`, never deleted) and clone fresh; without it they are `error` events. |
 | `--accept-new-host-keys` | boolean | `false` | SSH only: record unknown host keys without prompting (`StrictHostKeyChecking=accept-new`); a changed key is still refused. Set this for unattended runs. |
+| `--related`        | string  | `""`    | Sync the projects a project is linked to instead of a group: `--related` or `--related=uses` (what it uses), `--related=used-by`, `--related=both`. The value needs the equals sign. See "Cross-repository context" below. |
 
 ```bash
 export GITLAB_TOKEN="glpat-XXXXXXXX"
@@ -250,8 +251,9 @@ gitty sync --path=tenant/images --nested
 
 gitty knows which projects of the instance refer to which: it reads the
 checkouts it manages for references (CI `include:`/`trigger:`/`component:`,
-dependencies named in package manifests, clone URLs in CI scripts, forks) and
-keeps them in an index at `<workspace>/.gitty/index.json`. Use this before
+dependencies named in package manifests, clone URLs in CI scripts, container
+images from the instance's registry, submodules, forks, links in
+documentation) and keeps them in an index at `<workspace>/.gitty/index.json`. Use this before
 changing a project, to find the code it depends on and the code that depends
 on it.
 
@@ -261,6 +263,7 @@ gitty context acme/app --fetch     # ...first cloning what it uses and is not he
 gitty context --format=json        # the same briefing as one JSON document
 gitty related acme/lib             # just the links, as greppable lines
 gitty fetch acme/lib acme/tools    # make sure these projects are checked out
+gitty sync --related               # clone what this project uses, and pull what is already here
 gitty index                        # refresh project metadata from the instance
 ```
 
@@ -281,14 +284,22 @@ gitty index                        # refresh project metadata from the instance
       "docs": ["AGENTS.md", "README.md"]
     },
     {
+      "project": "acme/ci-templates",
+      "present": true, "fetched": true,
+      "path": "/ws/acme/ci-templates", "relative_path": "../ci-templates",
+      "links": [ { "from": "acme/app", "to": "acme/ci-templates", "kind": "ci-include", "evidence": ".gitlab-ci.yml:3", "target": "templates/build.yml" } ],
+      "files": ["templates/build.yml"],
+      "docs": ["README.md"]
+    },
+    {
       "project": "acme/base-images",
       "present": false,
       "fetch_command": "gitty fetch acme/base-images",
-      "links": [ { "from": "acme/app", "to": "acme/base-images", "kind": "ci-include", "evidence": ".gitlab-ci.yml:3" } ]
+      "links": [ { "from": "acme/app", "to": "acme/base-images", "kind": "image", "evidence": "Dockerfile:1" } ]
     }
   ],
   "used_by": [ { "project": "acme/web", "present": true, "path": "/ws/acme/web", "links": [ { "from": "acme/web", "to": "acme/app", "kind": "depends", "evidence": "package.json:21" } ] } ],
-  "uses_total": 2, "used_by_total": 1,
+  "uses_total": 3, "used_by_total": 1,
   "unresolved": [ { "from": "acme/app", "ref": "acme/old-lib", "kind": "depends", "evidence": "go.mod:14" } ],
   "coverage": { "projects": 42, "checked_out": 4 }
 }
@@ -300,7 +311,12 @@ How to read it:
   `file:line` inside the project named by the link's `from` — the subject for
   `uses`, the other project for `used_by` — or `api:<field>`.
 - Link kinds: `depends`, `ci-include`, `ci-trigger`, `ci-component`, `image`,
-  `submodule`, `fork`, `mentions`.
+  `submodule`, `fork`, `mentions`. `mentions` is a link in documentation: the
+  weakest kind, listed last and never fetched on its own account.
+- `target` is what the reference names inside the other project, as written:
+  the files a pipeline includes, a component's name, a module's directory.
+  `files` are the ones among them that exist in the checkout, relative to its
+  `path` — the place to start reading.
 - **`used_by` is only as complete as the workspace.** Links are found by
   reading checkouts; `coverage` says how many of the known projects are
   checked out. Do not conclude "nothing else uses this" from an empty
@@ -316,6 +332,11 @@ How to read it:
 - `--fetch` only clones. A project that is present is never pulled or
   modified. Exit code 1 with a briefing on stdout means a fetch failed; the
   entry has `fetch_error`.
+- `gitty sync --related` is the one that also updates: it clones the related
+  projects that are absent and fast-forwards the ones that are present, with
+  `sync`'s events (`clone`, `pull`, `skip`, `error`, `summary`) and
+  `--dry-run`. Do not run it on checkouts you have uncommitted work in
+  progress on unless a pull is what you want.
 - With an index in place `context` and `related` need no network and no
   token. Building the index, and fetching, need `--token`/`GITLAB_TOKEN` or
   `--anon`.

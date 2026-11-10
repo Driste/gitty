@@ -24,6 +24,7 @@ func testResolver(t *testing.T, instance string) *resolver {
 	}
 	idx.Projects["acme/scratch"] = &contract.Project{Local: &contract.Local{Dir: "scratch"}}
 	idx.Hosts = []string{"ssh.gitlab.example.com"}
+	idx.Registry = "registry.example.com:5050"
 	return newResolver(idx, &Config{
 		URL:        instance,
 		CloneHosts: []string{"git.internal.example"},

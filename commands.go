@@ -1,6 +1,9 @@
 package main
 
-import "flag"
+import (
+	"flag"
+	"fmt"
+)
 
 // command describes one gitty subcommand: what it is called, what it does in
 // a sentence, whether it takes a group path as its argument, and how its
@@ -71,8 +74,32 @@ type syncFlags struct {
 	acceptHostKeys *bool
 	archived       *bool
 	prune          *bool
+	related        relatedFlag
 	exclude        stringList
 	cloneHosts     stringList
+}
+
+// relatedFlag is --related[=uses|used-by|both]: a flag that may be given
+// bare, in which case it means the projects the subject uses.
+type relatedFlag string
+
+func (f *relatedFlag) String() string { return string(*f) }
+
+// IsBoolFlag lets the flag package accept `--related` with no value.
+func (f *relatedFlag) IsBoolFlag() bool { return true }
+
+func (f *relatedFlag) Set(v string) error {
+	switch v {
+	case "true":
+		*f = directionUses
+	case "false":
+		*f = ""
+	case directionUses, directionUsedBy, directionBoth:
+		*f = relatedFlag(v)
+	default:
+		return fmt.Errorf("choose %s, %s or %s", directionUses, directionUsedBy, directionBoth)
+	}
+	return nil
 }
 
 func declareSyncFlags(fs *flag.FlagSet) *syncFlags {
@@ -90,6 +117,7 @@ func declareSyncFlags(fs *flag.FlagSet) *syncFlags {
 	f.acceptHostKeys = fs.Bool("accept-new-host-keys", false, "For SSH clones, record unknown host keys without prompting (ssh StrictHostKeyChecking=accept-new); a changed key is still refused")
 	f.archived = fs.Bool("archived", false, "Include archived projects and groups (left out by default)")
 	f.prune = fs.Bool("prune", false, "Move checkouts that no longer exist upstream aside as <dir>.gitty-orphan-<n> (never deleted); without it they are only reported")
+	fs.Var(&f.related, "related", "Sync the projects linked to the one this directory is a checkout of, instead of a group: --related (what it uses), --related=used-by, or --related=both")
 	fs.Var(&f.exclude, "exclude", "Namespace path or glob to leave out, e.g. acme/vendor or 'acme/*-mirror' (repeatable, or comma-separated; adds to the workspace's exclude list)")
 	fs.Var(&f.cloneHosts, "allow-clone-host", "Additional host whose repositories may be cloned and sent this workspace's token (repeatable, or comma-separated)")
 	return f

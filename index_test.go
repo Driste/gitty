@@ -512,6 +512,75 @@ func TestRefreshIndexOffline(t *testing.T) {
 	}
 }
 
+// TestRefreshIndexLearnsAboutArrivals: a project checked out after it was
+// listed is asked about on its own at the next refresh — that is the only
+// way to learn where it was forked from — and an instance that does not
+// answer costs the refresh nothing.
+func TestRefreshIndexLearnsAboutArrivals(t *testing.T) {
+	cfg := &Config{URL: "https://gitlab.example.com", RootPath: "acme"}
+	var lookups []string
+	src := fakeSource{lookups: &lookups, projects: map[string][]*gitlab.Project{
+		"acme": {
+			{ID: 1, PathWithNamespace: "acme/app"},
+			{ID: 2, PathWithNamespace: "acme/app-fork", ForkedFromProject: &gitlab.ForkParent{PathWithNamespace: "acme/app"}},
+			{ID: 3, PathWithNamespace: "acme/other-fork", ForkedFromProject: &gitlab.ForkParent{PathWithNamespace: "acme/app"}},
+		},
+	}}
+	w, _, _ := newTestWorkspace(t, cfg, src)
+	checkout := func(name string) {
+		t.Helper()
+		writeTree(t, filepath.Join(w.Root, name), map[string]string{"README.md": "# " + name + "\n"})
+		gitRun(t, filepath.Join(w.Root, name), "commit", "-q", "-m", "one")
+	}
+	checkout("app")
+	ctx := context.Background()
+
+	idx, _, err := w.refreshIndex(ctx, refreshOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Links) != 0 || strings.Join(lookups, " ") != "acme/app" {
+		t.Fatalf("first refresh: links %q, lookups %v; only what is checked out is asked about", linkSet(idx.Links), lookups)
+	}
+
+	// The fork is checked out. Nothing was listed again, so nothing but
+	// asking about it can say what it is a fork of.
+	checkout("app-fork")
+	lookups = nil
+	idx, stats, err := w.refreshIndex(ctx, refreshOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkSet(idx.Links) != "fork acme/app api:forked_from_project" || !stats.Written {
+		t.Errorf("after the fork arrived: links %q, stats %+v", linkSet(idx.Links), stats)
+	}
+	if strings.Join(lookups, " ") != "acme/app-fork" {
+		t.Errorf("lookups = %v, want the arrival and nothing else", lookups)
+	}
+
+	// Once asked about, it is not asked about again.
+	lookups = nil
+	if _, stats, err = w.refreshIndex(ctx, refreshOptions{}); err != nil || stats.Written || len(lookups) != 0 {
+		t.Errorf("an unchanged workspace: err=%v stats=%+v lookups=%v", err, stats, lookups)
+	}
+
+	// Another arrives while the instance is out of reach: it is indexed as
+	// the listing described it, and the refresh does not fail.
+	checkout("other-fork")
+	src.lookupErr = context.DeadlineExceeded
+	w.s.src = src
+	idx, _, err = w.refreshIndex(ctx, refreshOptions{})
+	if err != nil {
+		t.Fatalf("an unreachable instance must not fail the refresh: %v", err)
+	}
+	if other := idx.Projects["acme/other-fork"]; other == nil || other.Local == nil || other.ForkedFrom != "" {
+		t.Errorf("acme/other-fork = %+v", other)
+	}
+	if linkSet(idx.Links) != "fork acme/app api:forked_from_project" {
+		t.Errorf("links = %q; what was known must be kept", linkSet(idx.Links))
+	}
+}
+
 // TestRefreshIndexArchived: an archived project is described but not asked
 // what it uses, unless archived projects are asked for.
 func TestRefreshIndexArchived(t *testing.T) {

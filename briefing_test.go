@@ -306,3 +306,89 @@ func TestRenderBriefingDetails(t *testing.T) {
 		t.Errorf("rendering:\n%s\n--- want:\n%s", got, want)
 	}
 }
+
+// A project that is only mentioned in documentation is listed after the ones
+// related by something real, and is never a reason to clone anything.
+func TestBriefingMentions(t *testing.T) {
+	w, idx := briefingWorkspace(t, "app", "app")
+	for i, p := range []string{"acme/aaa-mentioned", "acme/lib", "acme/zzz-both"} {
+		idx.Projects[p] = &contract.Project{ID: int64(10 + i)}
+	}
+	idx.Links = []contract.Link{
+		{From: "acme/app", To: "acme/aaa-mentioned", Kind: contract.KindMentions, Evidence: "README.md:9"},
+		{From: "acme/app", To: "acme/lib", Kind: contract.KindDepends, Evidence: "go.mod:3"},
+		{From: "acme/app", To: "acme/zzz-both", Kind: contract.KindMentions, Evidence: "README.md:12"},
+		{From: "acme/app", To: "acme/zzz-both", Kind: contract.KindImage, Evidence: "Dockerfile:1"},
+	}
+	b, err := w.buildBriefing(idx, subject{Path: "acme/app"}, directionUses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, r := range b.Uses {
+		order = append(order, r.Project)
+	}
+	if got := strings.Join(order, " "); got != "acme/lib acme/zzz-both acme/aaa-mentioned" {
+		t.Errorf("order = %s", got)
+	}
+	if got := strings.Join(absentUses(b), " "); got != "acme/lib acme/zzz-both" {
+		t.Errorf("to fetch = %q; a mention alone must not be fetched", got)
+	}
+	// It can still be fetched by name, and the briefing says how.
+	if b.Uses[2].FetchCommand != "gitty fetch acme/aaa-mentioned" {
+		t.Errorf("mentioned project = %+v", b.Uses[2])
+	}
+}
+
+// The files a link points at are named when they are there — and only then.
+func TestBriefingLinkedFiles(t *testing.T) {
+	w, idx := briefingWorkspace(t, "app", "app", "ci-templates", "components")
+	touch := func(rel string) {
+		t.Helper()
+		full := filepath.Join(w.Root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	touch("ci-templates/templates/build.yml")
+	touch("components/templates/sast.yml")
+	touch("components/templates/scan/template.yml")
+	touch("secret.txt") // beside the checkouts, in none of them
+	idx.Links = []contract.Link{
+		{From: "acme/app", To: "acme/ci-templates", Kind: contract.KindCIInclude, Evidence: ".gitlab-ci.yml:2",
+			Target: "templates/build.yml, templates/gone.yml, ../secret.txt, templates"},
+		{From: "acme/app", To: "acme/components", Kind: contract.KindCIComponent, Evidence: ".gitlab-ci.yml:9", Target: "sast, scan, missing"},
+		// What uses the subject points into the subject, not into the user.
+		{From: "acme/ci-templates", To: "acme/app", Kind: contract.KindCIInclude, Evidence: ".gitlab-ci.yml:1", Target: "templates/build.yml"},
+	}
+	b, err := w.buildBriefing(idx, subject{Path: "acme/app"}, directionBoth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(b.Uses[0].Files, " "); got != "templates/build.yml" {
+		t.Errorf("ci-templates files = %q; only what exists, and nothing outside the checkout", got)
+	}
+	if got := strings.Join(b.Uses[1].Files, " "); got != "templates/sast.yml templates/scan/template.yml" {
+		t.Errorf("components files = %q; a component is looked for where GitLab keeps it", got)
+	}
+	if len(b.UsedBy) != 1 || len(b.UsedBy[0].Files) != 0 {
+		t.Errorf("used by = %+v", b.UsedBy)
+	}
+
+	var sb strings.Builder
+	renderBriefing(&sb, b)
+	for _, want := range []string{
+		"· ci-include templates/build.yml, templates/gone.yml, ../secret.txt, templates (.gitlab-ci.yml:2)\n",
+		"· ci-component sast, scan, missing (.gitlab-ci.yml:9)\n",
+		// The files first, then the documentation.
+		"- acme/ci-templates: ../ci-templates/templates/build.yml, ../ci-templates/README.md\n",
+		"- acme/components: ../components/templates/sast.yml, ../components/templates/scan/template.yml, ../components/README.md\n",
+	} {
+		if !strings.Contains(sb.String(), want) {
+			t.Errorf("rendering missing %q:\n%s", want, sb.String())
+		}
+	}
+}

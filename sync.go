@@ -376,6 +376,11 @@ type syncOptions struct {
 	// Prune moves checkouts that no longer exist upstream aside (never
 	// deletes them); see findOrphans.
 	Prune bool
+
+	// Related, when set, makes this a sync of the projects linked to a
+	// subject instead of a group: "uses", "used-by" or "both". Path then
+	// names the subject. See runSyncRelated.
+	Related string
 }
 
 // maxJobs bounds --jobs: beyond ~16 concurrent clones the bottleneck is the
@@ -386,6 +391,9 @@ const maxJobs = 16
 // It returns an error when setup fails or when one or more groups/repositories
 // could not be synced, so the caller can surface a non-zero exit code.
 func runSync(ctx context.Context, opts syncOptions) error {
+	if opts.Related != "" {
+		return runSyncRelated(ctx, opts)
+	}
 	if !opts.Groups && !opts.Repos {
 		opts.Repos = true
 	}

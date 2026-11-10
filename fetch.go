@@ -46,13 +46,18 @@ func cleanProjectArg(arg string) (string, error) {
 // fetchProjects makes sure each named project is checked out, cloning the
 // ones that are not, and reports what became of each, in the order given.
 // Events go to the syncer's output as a sync's would.
-func (w *workspace) fetchProjects(ctx context.Context, projects []string) []contract.FetchResult {
+//
+// With update, a project that is already checked out is brought up to date
+// as a sync would (a fast-forward pull) instead of being left alone. That is
+// `gitty sync --related`; everything else here only ever adds.
+func (w *workspace) fetchProjects(ctx context.Context, projects []string, update bool) []contract.FetchResult {
 	s := w.s
 	results := make([]contract.FetchResult, len(projects))
 	type pending struct {
-		i   int
-		dir string
-		p   *gitlab.Project
+		i       int
+		dir     string
+		p       *gitlab.Project
+		present bool // checked out before this call
 	}
 	var todo []*pending
 	seen := map[string]bool{}
@@ -79,10 +84,12 @@ func (w *workspace) fetchProjects(ctx context.Context, projects []string) []cont
 		}
 		if classifyDest(dir) == destRepo && !isUnborn(dir) {
 			res.Present, res.Path = true, w.absDir(dir)
-			s.event("skip", project, "present")
-			continue
+			if !update {
+				s.event("skip", project, "present")
+				continue
+			}
 		}
-		todo = append(todo, &pending{i: i, dir: dir})
+		todo = append(todo, &pending{i: i, dir: dir, present: res.Present})
 	}
 	if len(todo) == 0 {
 		return results
@@ -135,7 +142,7 @@ func (w *workspace) fetchProjects(ctx context.Context, projects []string) []cont
 		res := &results[t.i]
 		if classifyDest(t.dir) == destRepo {
 			res.Present, res.Path = true, w.absDir(t.dir)
-			res.Fetched = !s.dryRun
+			res.Fetched = !s.dryRun && !t.present
 		}
 		if failures := s.failuresFor(res.Project); len(failures) > before {
 			res.Error = failures[len(failures)-1]
@@ -249,7 +256,7 @@ func runFetch(ctx context.Context, opts fetchOptions) error {
 		}
 	}
 
-	results := w.fetchProjects(ctx, projects)
+	results := w.fetchProjects(ctx, projects, false)
 
 	cloned, present, failed := 0, 0, 0
 	for _, r := range results {

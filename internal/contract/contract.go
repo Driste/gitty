@@ -30,7 +30,7 @@ const IndexVersion = 1
 // ScannerVersion identifies the rules links are extracted with. It is not a
 // format version: an index whose scanner is older reads fine, and gitty
 // rescans its checkouts so that links found by newer rules appear.
-const ScannerVersion = 2
+const ScannerVersion = 3
 
 // Supported reports whether a document of the given version can be read by
 // code built against this package, and if not, an error naming both sides —
@@ -140,6 +140,10 @@ type Link struct {
 	// Evidence is where the reference was found: "file:line" inside From's
 	// checkout, or "api:<field>" for what only the API knows (a fork).
 	Evidence string `json:"evidence"`
+	// Target says what in To the reference is to, when the reference says:
+	// the file a pipeline includes, the component it uses, the path a URL
+	// points at. Several are separated by ", ".
+	Target string `json:"target,omitempty"`
 }
 
 // Unresolved is a reference that looks like a project of the instance but
@@ -150,6 +154,7 @@ type Unresolved struct {
 	Ref      string `json:"ref"`
 	Kind     string `json:"kind"` // the kind of link it would have been
 	Evidence string `json:"evidence"`
+	Target   string `json:"target,omitempty"` // as Link.Target
 }
 
 // Briefing is what `gitty context --format=json` prints: one project (or
@@ -256,6 +261,10 @@ type Related struct {
 	// this project's.
 	Links []Link `json:"links"`
 
+	// Files are the files of this project that the links point at — the
+	// template a pipeline includes, the component it uses — and that exist
+	// in its checkout, relative to Path: where to look first.
+	Files   []string `json:"files,omitempty"`
 	Docs    []string `json:"docs,omitempty"` // relative to Path
 	Summary string   `json:"summary,omitempty"`
 }

@@ -50,9 +50,12 @@ type scanOutcome struct {
 type fileClass int
 
 const (
-	classNone     fileClass = iota
-	classCI                 // GitLab CI configuration
-	classManifest           // a package or build manifest
+	classNone       fileClass = iota
+	classCI                   // GitLab CI configuration
+	classManifest             // a package or build manifest
+	classImages               // a Dockerfile or a compose file
+	classSubmodules           // .gitmodules
+	classDocs                 // documentation
 )
 
 // manifestNames are the manifests recognised by exact file name.
@@ -85,7 +88,17 @@ func classifyFile(name string) fileClass {
 		}
 	}
 	isYAML := strings.HasSuffix(base, ".yml") || strings.HasSuffix(base, ".yaml")
+	lower := strings.ToLower(base)
 	switch {
+	case name == ".gitmodules":
+		return classSubmodules
+	case base == "Dockerfile" || strings.HasPrefix(base, "Dockerfile.") || strings.HasSuffix(lower, ".dockerfile") ||
+		base == "Containerfile" || strings.HasPrefix(base, "Containerfile."):
+		return classImages
+	case isYAML && (strings.HasPrefix(lower, "docker-compose") || strings.HasPrefix(lower, "compose")):
+		return classImages
+	case strings.HasSuffix(lower, ".md") && (dir == "" || strings.HasPrefix(name, "docs/")) && !isDocNoise(base):
+		return classDocs
 	case base == ".gitlab-ci.yml" || base == ".gitlab-ci.yaml":
 		return classCI
 	case isYAML && strings.Contains(base, ".gitlab-ci."):
@@ -122,7 +135,7 @@ func (sc *scanner) scan(ctx context.Context, dir, project string, links bool) (s
 	sort.Strings(names)
 
 	c := newCollector(project, sc.r)
-	vars := ciVariables(project, sc.instance)
+	vars := ciVariables(project, sc.instance, sc.r.registry)
 	var rootFiles []string
 	var result scanOutcome
 	for _, name := range names {
@@ -153,6 +166,12 @@ func (sc *scanner) scan(ctx context.Context, dir, project string, links bool) (s
 			c.scanCI(lines, vars)
 		case classManifest:
 			c.scanTokens(lines, nil)
+		case classImages:
+			c.scanImages(lines)
+		case classSubmodules:
+			c.scanSubmodules(lines)
+		case classDocs:
+			c.scanMentions(lines)
 		}
 	}
 
@@ -230,13 +249,58 @@ func (c *collector) add(kind string, x ref, line int) {
 		if _, seen := c.links[key]; !seen {
 			c.links[key] = contract.Link{From: c.from, To: x.Project, Kind: kind, Evidence: evidence}
 		}
+		c.addTarget(x.Project, kind, x.Target)
 	case x.unresolved():
 		c.claimed[c.claimKey(line)] = true
 		key := strings.ToLower(x.Path)
 		if _, seen := c.unresolved[key]; !seen {
 			c.unresolved[key] = contract.Unresolved{From: c.from, Ref: x.Path, Kind: kind, Evidence: evidence}
 		}
+		c.addTarget(x.Path, kind, x.Target)
 	}
+}
+
+// maxTargetLen bounds what a link records about where in the other project
+// it points: enough for the files a pipeline includes, not a catalogue.
+const maxTargetLen = 240
+
+// addTarget notes what in a project a link of the given kind points at. A
+// link may point at several things — a pipeline including three templates
+// from one project is one link — so they accumulate, each once.
+//
+// It is noted for a reference that did not resolve as well, under the path
+// it was written with: if the instance later turns out to have that project,
+// the link made of the reference is the same link a scan would have found.
+func (c *collector) addTarget(project, kind, target string) {
+	target = strings.TrimSpace(target)
+	if target == "" || strings.ContainsAny(target, ",\n") {
+		return
+	}
+	if l, ok := c.links[project+"\x00"+kind]; ok {
+		l.Target = joinTarget(l.Target, target)
+		c.links[project+"\x00"+kind] = l
+		return
+	}
+	if u, ok := c.unresolved[strings.ToLower(project)]; ok && u.Kind == kind {
+		u.Target = joinTarget(u.Target, target)
+		c.unresolved[strings.ToLower(project)] = u
+	}
+}
+
+// joinTarget adds one more thing pointed at to a list of them.
+func joinTarget(have, target string) string {
+	for _, t := range strings.Split(have, ", ") {
+		if t == target {
+			return have
+		}
+	}
+	switch {
+	case have == "":
+		return target
+	case len(have)+len(target)+2 <= maxTargetLen:
+		return have + ", " + target
+	}
+	return have
 }
 
 // result returns everything collected, in a stable order.
@@ -303,6 +367,74 @@ func (c *collector) scanTokensLine(line string, lineNo int) {
 	}
 }
 
+// --- images, submodules, mentions ---
+
+// scanImagesLine reports every image on a line that lives in the instance's
+// container registry as a link to the project it belongs to: a base image in
+// a Dockerfile, a job's `image:` or a service in a pipeline, a service in a
+// compose file. An image from anywhere else is somebody else's.
+func (c *collector) scanImagesLine(line string, lineNo int) {
+	if c.claimed[c.claimKey(lineNo)] {
+		return
+	}
+	var found []ref
+	for _, image := range c.r.images(line) {
+		found = append(found, c.r.resolveImage(image))
+	}
+	for _, x := range found {
+		c.add(contract.KindImage, x, lineNo)
+	}
+}
+
+// scanImages reads a Dockerfile or a compose file: the images it names, and
+// anything else on the instance it reaches for (a clone in a RUN step).
+func (c *collector) scanImages(lines []string) {
+	for i, line := range lines {
+		c.scanImagesLine(line, i+1)
+		c.scanTokensLine(line, i+1)
+	}
+}
+
+// scanSubmodules reads .gitmodules. A submodule's URL is either a URL like
+// any other or — the form GitLab itself recommends, because it survives a
+// change of host or protocol — a path relative to the project's own.
+func (c *collector) scanSubmodules(lines []string) {
+	for i, raw := range lines {
+		key, value, ok := strings.Cut(raw, "=")
+		if !ok || strings.TrimSpace(key) != "url" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") {
+			target := path.Join(c.from, value)
+			if target == ".." || strings.HasPrefix(target, "../") {
+				continue // climbs out of the instance: not a path on it
+			}
+			c.add(contract.KindSubmodule, c.r.resolvePath(target), i+1)
+			continue
+		}
+		c.add(contract.KindSubmodule, c.r.resolveURL(value), i+1)
+	}
+}
+
+// scanMentions reads documentation for links to other projects of the
+// instance. It is the weakest kind of link — a sentence, not a dependency —
+// and is treated as such: a mention never causes a project to be fetched,
+// and a link that leads nowhere is not worth reporting.
+func (c *collector) scanMentions(lines []string) {
+	for i, line := range lines {
+		var found []ref
+		for _, tok := range c.r.tokens(line) {
+			if x := c.r.resolveToken(tok); x.resolved() {
+				found = append(found, x)
+			}
+		}
+		for _, x := range found {
+			c.add(contract.KindMentions, x, i+1)
+		}
+	}
+}
+
 // --- GitLab CI extractor ---
 
 // ciFrame is one open mapping key in a CI file: a key whose value is the
@@ -335,6 +467,14 @@ type ciFrame struct {
 // script is a dependency too.
 func (c *collector) scanCI(lines []string, vars map[string]string) {
 	var stack []ciFrame
+	// The include item being read, once its project is known: the `file:`
+	// entries that follow in the same item say which of that project's
+	// files are included.
+	var inc struct {
+		active    bool
+		project   string
+		keyIndent int // where the item's keys are written
+	}
 	for i, raw := range lines {
 		lineNo := i + 1
 		line := strings.TrimRight(raw, "\r")
@@ -368,13 +508,24 @@ func (c *collector) scanCI(lines []string, vars map[string]string) {
 		}
 
 		block := enclosingCIBlock(stack)
+		// The item ends where the next one begins — a dash further out than
+		// its keys — or where the include block does.
+		if inc.active && (block != "include" || (item && dashIndent < inc.keyIndent) || (!item && indent < inc.keyIndent)) {
+			inc.active = false
+		}
 		key, value, isKey := splitYAMLKey(body)
 		if !isKey {
+			if inc.active && len(stack) > 0 && stack[len(stack)-1].key == "file" {
+				// One of the files of `file:` written as a list.
+				c.addTarget(inc.project, contract.KindCIInclude, includedFile(body, vars))
+				continue
+			}
 			// A plain scalar in a list: under include it is a file to
 			// include, by path or by URL.
 			if block == "include" {
 				c.add(contract.KindCIInclude, c.r.resolveURL(expandVars(cleanYAMLScalar(body), vars)), lineNo)
 			}
+			c.scanImagesLine(expandVars(line, vars), lineNo)
 			c.scanTokensLine(expandVars(line, vars), lineNo)
 			continue
 		}
@@ -388,11 +539,21 @@ func (c *collector) scanCI(lines []string, vars map[string]string) {
 		case "project":
 			switch block {
 			case "include":
-				c.add(contract.KindCIInclude, c.r.resolvePath(value), lineNo)
+				x := c.r.resolvePath(value)
+				c.add(contract.KindCIInclude, x, lineNo)
+				inc.active = (x.resolved() && x.Project != c.from) || x.unresolved()
+				inc.project, inc.keyIndent = x.Path, indent
 			case "trigger":
 				c.add(contract.KindCITrigger, c.r.resolvePath(value), lineNo)
 			case "needs":
 				c.add(contract.KindDepends, c.r.resolvePath(value), lineNo)
+			}
+		case "file":
+			// `file: /a.yml`, or `file: [/a.yml, /b.yml]`, beside `project:`.
+			if inc.active && indent == inc.keyIndent {
+				for _, f := range strings.Split(strings.Trim(value, "[]"), ",") {
+					c.addTarget(inc.project, contract.KindCIInclude, includedFile(f, vars))
+				}
 			}
 		case "component":
 			if block == "include" {
@@ -413,8 +574,19 @@ func (c *collector) scanCI(lines []string, vars map[string]string) {
 				c.add(contract.KindCIInclude, c.r.resolveURL(value), lineNo)
 			}
 		}
+		c.scanImagesLine(expandVars(line, vars), lineNo)
 		c.scanTokensLine(expandVars(line, vars), lineNo)
 	}
+}
+
+// includedFile cleans one entry of an include's `file:`: a path from the
+// root of the included project, usually written with a leading slash.
+func includedFile(raw string, vars map[string]string) string {
+	f := strings.TrimLeft(expandVars(cleanYAMLScalar(raw), vars), "/")
+	if strings.Contains(f, "$") {
+		return "" // a variable gitty cannot expand: not a path to point at
+	}
+	return f
 }
 
 // enclosingCIBlock names the block a line sits in, as far as this extractor
@@ -480,7 +652,7 @@ func cleanYAMLScalar(v string) string {
 // resolves for the project it is written in. Variables set anywhere else —
 // in the file, in the project's settings — are unknown here, and a value
 // still holding one is left unresolved rather than guessed.
-func ciVariables(project, instance string) map[string]string {
+func ciVariables(project, instance, registry string) map[string]string {
 	vars := map[string]string{
 		"CI_PROJECT_PATH":           project,
 		"CI_PROJECT_NAMESPACE":      parentPath(project),
@@ -492,6 +664,10 @@ func ciVariables(project, instance string) map[string]string {
 	if u, err := url.Parse(instance); err == nil && u.Host != "" {
 		vars["CI_SERVER_HOST"] = u.Hostname()
 		vars["CI_SERVER_FQDN"] = u.Host
+	}
+	if registry != "" {
+		vars["CI_REGISTRY"] = registry
+		vars["CI_REGISTRY_IMAGE"] = registry + "/" + strings.ToLower(project)
 	}
 	return vars
 }
@@ -522,6 +698,19 @@ var docNoise = []string{
 	"MAINTAINERS", "CODEOWNERS",
 }
 
+// isDocNoise reports whether a file is one of the documents that say nothing
+// about how a project works: a changelog, a licence, a code of conduct.
+func isDocNoise(name string) bool {
+	upper := strings.ToUpper(name)
+	stem := strings.TrimSuffix(upper, path.Ext(upper))
+	for _, noise := range docNoise {
+		if strings.HasPrefix(stem, noise) {
+			return true
+		}
+	}
+	return false
+}
+
 // pickDocs chooses, from a checkout's root-level files, the documents worth
 // pointing a reader at, most useful first: instructions written for agents,
 // then design and contribution notes, then anything else, and the README
@@ -531,10 +720,8 @@ func pickDocs(rootFiles []string) []string {
 	rank := func(name string) int {
 		upper := strings.ToUpper(name)
 		stem := strings.TrimSuffix(upper, path.Ext(upper))
-		for _, noise := range docNoise {
-			if strings.HasPrefix(stem, noise) {
-				return -1
-			}
+		if isDocNoise(name) {
+			return -1
 		}
 		switch {
 		case strings.HasPrefix(stem, "README"):

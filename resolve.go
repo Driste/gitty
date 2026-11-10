@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"net/url"
 	"regexp"
 	"sort"
@@ -37,8 +38,12 @@ type resolver struct {
 	// reference to an excluded project is not a link and not unresolved
 	// either: the user asked gitty to leave it alone, so it is passed over.
 	excluded func(string) bool
+	// registry is where the instance's container registry is: an image
+	// named <registry>/<project path>[/<more>] belongs to that project.
+	registry string
 
 	tokenRe *regexp.Regexp
+	imageRe *regexp.Regexp
 }
 
 // reservedTop are first path segments GitLab keeps for itself. A URL on the
@@ -92,6 +97,19 @@ func newResolver(idx *contract.Index, cfg *Config) *resolver {
 		hosts = append(hosts, regexp.QuoteMeta(h))
 	}
 	sort.Slice(hosts, func(i, j int) bool { return len(hosts[i]) > len(hosts[j]) })
+	// The registry is learned from the API when a checkout is looked up.
+	// Until then the conventional name is the best guess there is — and a
+	// wrong guess finds nothing rather than something false, since an image
+	// still has to name a known project to become a link.
+	r.registry = strings.ToLower(strings.Trim(idx.Registry, "/"))
+	if r.registry == "" {
+		if h := extractHost(cfg.URL); h != "" && net.ParseIP(h) == nil {
+			r.registry = "registry." + h
+		}
+	}
+	if r.registry != "" {
+		r.imageRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9.\-])` + regexp.QuoteMeta(r.registry) + `/([a-z0-9._\-/]+)`)
+	}
 	if len(hosts) > 0 {
 		r.tokenRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9.\-])(?:[a-z][a-z0-9+.\-]*://)?(?:[a-z0-9._~%!$&+\-]+(?::[^@\s/]*)?@)?(?:` +
 			strings.Join(hosts, "|") + `)(?::[0-9]+)?[/:]([a-z0-9_.~%+/@#?=&\-]+)`)
@@ -110,6 +128,9 @@ type ref struct {
 	// OnInstance says the candidate points at this instance at all. A
 	// candidate that does not is somebody else's and is ignored.
 	OnInstance bool
+	// Target is what in the project the candidate points at, when it says:
+	// a component's name, the file behind a raw URL.
+	Target string
 }
 
 // resolved reports whether the candidate landed on a known project.
@@ -196,6 +217,36 @@ func (r *resolver) tokens(line string) []string {
 	return out
 }
 
+// images returns the image paths named on a line that live in the
+// instance's registry: for each occurrence of the registry, what follows it
+// up to the tag or digest.
+func (r *resolver) images(line string) []string {
+	if r.imageRe == nil {
+		return nil
+	}
+	var out []string
+	for _, m := range r.imageRe.FindAllStringSubmatch(line, -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
+// resolveImage resolves the path of an image in the instance's registry. A
+// project's images are named after it, possibly with more after: the
+// project is the longest known one the path starts with.
+func (r *resolver) resolveImage(imagePath string) ref {
+	p := strings.Trim(imagePath, "/.")
+	// The dependency proxy serves other registries' images under a group's
+	// name; nothing of the instance's own is being referred to.
+	if p == "" || strings.Contains(p, "/dependency_proxy/") || r.leftOut(p) {
+		return ref{}
+	}
+	if canonical, ok := r.lookup(p); ok {
+		return ref{Project: canonical, Path: canonical, OnInstance: true}
+	}
+	return ref{Path: p, OnInstance: true}
+}
+
 // resolvePath resolves a bare project path, as written under `project:` in a
 // CI file. It is on the instance by construction and must match a project
 // exactly: there is nothing after a project path in that position.
@@ -241,9 +292,31 @@ func (r *resolver) resolveToken(token string) ref {
 		return ref{}
 	}
 	if canonical, ok := r.lookup(p); ok {
-		return ref{Project: canonical, Path: canonical, OnInstance: true}
+		return ref{Project: canonical, Path: canonical, OnInstance: true, Target: tokenTarget(token)}
 	}
-	return ref{Path: p, OnInstance: true}
+	return ref{Path: p, OnInstance: true, Target: tokenTarget(token)}
+}
+
+// tokenTarget returns the file or directory inside a project that a URL
+// points at, when it points at one: what follows /-/raw/<ref>/ (or blob, or
+// tree), or the sub-directory after "//" that Terraform module sources use.
+func tokenTarget(token string) string {
+	if i := strings.IndexAny(token, "#?"); i >= 0 {
+		token = token[:i]
+	}
+	if i := strings.Index(token, "/-/"); i >= 0 {
+		parts := strings.SplitN(token[i+len("/-/"):], "/", 3)
+		if len(parts) == 3 && (parts[0] == "raw" || parts[0] == "blob" || parts[0] == "tree") {
+			if decoded, err := url.PathUnescape(parts[2]); err == nil {
+				return strings.Trim(decoded, "/")
+			}
+		}
+		return ""
+	}
+	if i := strings.Index(token, ".git//"); i >= 0 {
+		return strings.Trim(token[i+len(".git//"):], "/")
+	}
+	return ""
 }
 
 // resolveURL resolves a candidate that carries its own host: a full URL, an
@@ -275,14 +348,14 @@ func (r *resolver) resolveComponent(candidate string) ref {
 		return ref{}
 	}
 	if canonical, ok := r.exact(p[:i]); ok {
-		return ref{Project: canonical, Path: canonical, OnInstance: true}
+		return ref{Project: canonical, Path: canonical, OnInstance: true, Target: p[i+1:]}
 	}
 	// Not where the format says it should be; a nested component directory
 	// is the likeliest reason, and the longest match still names the project.
 	if canonical, ok := r.lookup(p); ok {
-		return ref{Project: canonical, Path: canonical, OnInstance: true}
+		return ref{Project: canonical, Path: canonical, OnInstance: true, Target: strings.Trim(p[len(canonical):], "/")}
 	}
-	return ref{Path: p[:i], OnInstance: true}
+	return ref{Path: p[:i], OnInstance: true, Target: p[i+1:]}
 }
 
 // instancePath reduces what followed the host to a clean path on the
