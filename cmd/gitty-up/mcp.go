@@ -98,18 +98,22 @@ func serverInfo() map[string]any {
 
 // handleMCP is the MCP endpoint.
 func (h *hub) handleMCP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		// No stream to open and no session to end, in either era.
-		w.Header().Set("Allow", "POST")
-		http.Error(w, "the MCP endpoint takes POST", http.StatusMethodNotAllowed)
-		return
-	}
+	// Who is asking comes first, whatever they ask. A client that is turned
+	// away tries other ways in — an older transport opens with a GET — and
+	// each of those must be told the same thing: not "wrong method" when the
+	// trouble is the token.
 	c, status, why := h.auth.identify(r.Context(), r)
 	if c == nil {
 		if status == http.StatusUnauthorized {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="gitty-up"`)
 		}
 		writeRPCError(w, status, nil, codeInvalidRequest, why, nil)
+		return
+	}
+	if r.Method != http.MethodPost {
+		// No stream to open and no session to end, in either era.
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "the MCP endpoint takes POST", http.StatusMethodNotAllowed)
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))

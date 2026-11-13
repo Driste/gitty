@@ -747,6 +747,22 @@ func TestCallersAreAskedWhoTheyAre(t *testing.T) {
 	if r := as(""); r.status != 401 || !strings.Contains(r.header.Get("WWW-Authenticate"), "Bearer") || !strings.Contains(r.raw, "Authorization: Bearer") {
 		t.Errorf("no token: %d %s", r.status, r.raw)
 	}
+	// A client that is turned away falls back to older ways of connecting,
+	// which open with a GET. It must hear "who are you", not "wrong method".
+	for token, want := range map[string]int{"": 401, "nonsense-get": 401, "tok-ben": 405} {
+		req, _ := http.NewRequest(http.MethodGet, h.web.URL+"/mcp", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET /mcp with token %q = %d, want %d", token, resp.StatusCode, want)
+		}
+	}
 	for i := 0; i < 3; i++ {
 		if r := as("nonsense"); r.status != 401 {
 			t.Errorf("a token the instance does not know: %d", r.status)
@@ -760,8 +776,11 @@ func TestCallersAreAskedWhoTheyAre(t *testing.T) {
 	}
 	// Four tokens were asked about once each: the instance is not asked
 	// again for every call.
-	if got := h.fake.hitsFor("/api/v4/user"); got != 3 {
-		t.Errorf("GitLab was asked who a caller is %d times, want 3 (ana, nonsense, gone)", got)
+	if got := h.fake.hitsFor("/api/v4/user"); got != 5 {
+		t.Errorf("GitLab was asked who a caller is %d times, want 5 (nonsense-get, ben, nonsense, ana, gone)", got)
+	}
+	if !strings.Contains(h.logs.String(), "turned a caller away") {
+		t.Errorf("a refused caller should be noted for whoever runs the hub:\n%s", h.logs.String())
 	}
 	// GitLab's other header works too.
 	if r := h.post(t, "/mcp", ping, map[string]string{"PRIVATE-TOKEN": "tok-ben"}); r.status != 200 {

@@ -97,6 +97,9 @@ func (a *authenticator) identify(ctx context.Context, r *http.Request) (*caller,
 		return &c, 0, ""
 	case err == nil, status == http.StatusUnauthorized, status == http.StatusForbidden:
 		a.remember(key, knownCaller{until: now.Add(refusalTTL)})
+		// Said once per token and half-minute, for whoever runs the hub:
+		// a client that cannot get in rarely says why in its own words.
+		a.gl.logf("turned a caller away: %s does not accept the token they sent", a.gl.host)
 		return nil, http.StatusUnauthorized, a.gl.host + " does not accept that token"
 	}
 	// The instance could not be asked. That is not the caller's fault and

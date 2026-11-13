@@ -816,6 +816,51 @@ a shape like this:
 The hub describes projects and does not hold them. An agent that wants one on
 disk runs `gitty fetch <path>` in a gitty workspace.
 
+**opencode.** In `opencode.jsonc` in the project, or in
+`~/.config/opencode/opencode.json` for every project:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "gitty": {
+        "type": "remote",
+        "url": "https://gitty.example.com/mcp",
+        "oauth": false,
+        "headers": { "Authorization": "Bearer {env:GITLAB_TOKEN}" }
+      }
+    }
+  }
+}
+```
+
+`"oauth": false` matters: the hub takes a GitLab token in a header, and
+without it opencode tries to sign in with OAuth instead. `{env:GITLAB_TOKEN}`
+is read from the environment opencode is started in. `opencode mcp list`
+should then show `gitty connected`; `failed … (401)` means the token is
+missing from that environment or the instance does not accept it, and the
+hub's own log says which caller it turned away. Tested with opencode 1.19.5
+in each of its protocol modes (`"protocol": "legacy"`, the default, `"auto"`
+and `"2026-07-28"`).
+
+The `gitty` command needs no configuration, only to be on `PATH`: an agent
+runs it in its shell. What it needs is to be told when, which is what
+`AGENTS.md` is for:
+
+```markdown
+## Other projects in our GitLab
+
+- Before building something, ask the gitty MCP server whether we already
+  have it: walk the tree, or search, then read the project's outline.
+- Before changing something others may use, read its outline for what uses it.
+- To read a project that is not on disk, run `gitty fetch <group/project>`.
+  It is cloned into this workspace at that same path.
+- `gitty sync --related` in a checkout brings in what that project uses.
+- When you work out what a project is for or how it is meant to be used,
+  record it with the server's note tool, citing the file that shows it.
+```
+
 ### Sharing what checkouts say (`gitty share`)
 
 A workspace names its hub once:
