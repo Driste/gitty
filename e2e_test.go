@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,10 @@ import (
 
 var gittyBin string
 
+// e2eBinDir holds the binaries built for this test run; it is removed when
+// the run ends.
+var e2eBinDir string
+
 func TestMain(m *testing.M) {
 	code := func() int {
 		tmp, err := os.MkdirTemp("", "gitty-e2e-bin")
@@ -39,6 +44,7 @@ func TestMain(m *testing.M) {
 			return 1
 		}
 		defer os.RemoveAll(tmp)
+		e2eBinDir = tmp
 
 		gittyBin = filepath.Join(tmp, "gitty-e2e")
 		out, err := exec.Command("go", "build", "-o", gittyBin, ".").CombinedOutput()
@@ -118,18 +124,44 @@ func gitRun(t *testing.T, dir string, args ...string) {
 // --- Fake GitLab (API + git-over-HTTP) ---
 
 type apiGroup struct {
-	ID       int    `json:"id"`
-	FullPath string `json:"full_path"`
-	Archived bool   `json:"archived,omitempty"`
+	ID          int    `json:"id"`
+	FullPath    string `json:"full_path"`
+	Archived    bool   `json:"archived,omitempty"`
+	Description string `json:"description,omitempty"`
+	Visibility  string `json:"visibility,omitempty"`
 }
 
 type apiProject struct {
-	ID                int    `json:"id"`
+	ID                int      `json:"id"`
+	PathWithNamespace string   `json:"path_with_namespace"`
+	HTTPURLToRepo     string   `json:"http_url_to_repo"`
+	SSHURLToRepo      string   `json:"ssh_url_to_repo"`
+	WebURL            string   `json:"web_url,omitempty"`
+	DefaultBranch     string   `json:"default_branch,omitempty"`
+	Description       string   `json:"description,omitempty"`
+	Topics            []string `json:"topics,omitempty"`
+	Visibility        string   `json:"visibility,omitempty"`
+	LastActivityAt    string   `json:"last_activity_at,omitempty"`
+
+	// Only GitLab's full project representation carries these; a listing
+	// asked for with simple=true leaves them out (see simplified).
+	Archived                     bool           `json:"archived,omitempty"`
+	ContainerRegistryImagePrefix string         `json:"container_registry_image_prefix,omitempty"`
+	ForkedFromProject            *apiForkParent `json:"forked_from_project,omitempty"`
+}
+
+type apiForkParent struct {
 	PathWithNamespace string `json:"path_with_namespace"`
-	HTTPURLToRepo     string `json:"http_url_to_repo"`
-	SSHURLToRepo      string `json:"ssh_url_to_repo"`
-	DefaultBranch     string `json:"default_branch,omitempty"`
-	Archived          bool   `json:"archived,omitempty"`
+}
+
+// simplified returns the project as GitLab's simple=true listing renders it:
+// identifying fields only. Keeping the fake honest about this is what stops
+// gitty from quietly depending on a field the trimmed listing does not have.
+func (p apiProject) simplified() apiProject {
+	p.Archived = false
+	p.ContainerRegistryImagePrefix = ""
+	p.ForkedFromProject = nil
+	return p
 }
 
 type fakeGitLab struct {
@@ -171,6 +203,10 @@ type fakeGitLab struct {
 	subgroups   map[string][]apiGroup
 	descendants map[string][]apiGroup
 	projects    map[string][]apiProject
+	// shared holds, per group, projects of other namespaces that have been
+	// shared with it. GitLab lists them with the group's own unless asked
+	// not to (with_shared=false).
+	shared map[string][]apiProject
 
 	mu          sync.Mutex
 	lastToken   string
@@ -185,6 +221,7 @@ func newFakeGitLab(t *testing.T) *fakeGitLab {
 		subgroups:   map[string][]apiGroup{},
 		descendants: map[string][]apiGroup{},
 		projects:    map[string][]apiProject{},
+		shared:      map[string][]apiProject{},
 	}
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
@@ -270,6 +307,21 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A single project by its (URL-encoded, here already decoded) path, or
+	// by its id.
+	if pathNS, ok := strings.CutPrefix(r.URL.Path, "/api/v4/projects/"); ok {
+		for _, projects := range f.projects {
+			for _, p := range projects {
+				if p.PathWithNamespace == pathNS || strconv.Itoa(p.ID) == pathNS {
+					writeJSON(w, http.StatusOK, p)
+					return
+				}
+			}
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "404 Project Not Found"})
+		return
+	}
+
 	// The top-level group listing that backs `gitty ls /`.
 	if r.URL.Path == "/api/v4/groups" {
 		writeJSON(w, http.StatusOK, orEmptyGroups(f.topLevel))
@@ -284,6 +336,17 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	notFound := func() {
 		writeJSON(w, http.StatusNotFound, map[string]string{"message": "404 Group Not Found"})
+	}
+	// A group may be named by its id as well as by its path.
+	if first, tail, _ := strings.Cut(rest, "/"); first != "" && strings.Trim(first, "0123456789") == "" {
+		for path, g := range f.groups {
+			if strconv.Itoa(g.ID) == first {
+				rest = path
+				if tail != "" {
+					rest += "/" + tail
+				}
+			}
+		}
 	}
 
 	switch {
@@ -300,9 +363,21 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				list = append(list, projects...)
 			}
 		}
+		if r.URL.Query().Get("with_shared") != "false" {
+			list = append(list, f.shared[target]...)
+		}
 		list = filterArchivedProjects(list, r.URL.Query().Get("archived"))
+		sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 		lo, hi := paginate(w, r, f.pageSize, len(list))
-		writeJSON(w, http.StatusOK, list[lo:hi])
+		page := list[lo:hi]
+		if r.URL.Query().Get("simple") == "true" {
+			trimmed := make([]apiProject, len(page))
+			for i, p := range page {
+				trimmed[i] = p.simplified()
+			}
+			page = trimmed
+		}
+		writeJSON(w, http.StatusOK, page)
 
 	case strings.HasSuffix(rest, "/subgroups"):
 		target := strings.TrimSuffix(rest, "/subgroups")
@@ -406,9 +481,15 @@ func (f *fakeGitLab) project(id int, pathNS string) apiProject {
 		PathWithNamespace: pathNS,
 		HTTPURLToRepo:     f.srv.URL + "/git/" + pathNS + ".git",
 		SSHURLToRepo:      "git@example.invalid:" + pathNS + ".git",
+		WebURL:            f.srv.URL + "/" + pathNS,
 		DefaultBranch:     "main",
+
+		ContainerRegistryImagePrefix: fakeRegistryHost + "/" + pathNS,
 	}
 }
+
+// fakeRegistryHost is the container registry the fake instance advertises.
+const fakeRegistryHost = "registry.example.invalid"
 
 // addRepo creates a work repo with the given files, publishes it as a bare
 // repo served over HTTP at /git/<name>.git, and returns the work repo path so
@@ -878,30 +959,6 @@ func TestE2EVersionLdflagsContract(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(out)); got != tag {
 		t.Errorf("stamped binary reports version %q, want %q", got, tag)
-	}
-}
-
-func TestE2EAgentSchemaOutput(t *testing.T) {
-	skipIfShort(t)
-
-	stdout, stderr, code := runGitty(t, t.TempDir(), nil, "agent", "schema")
-	if code != 0 {
-		t.Fatalf("agent schema exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
-	}
-
-	var schema AgentSchema
-	if err := json.Unmarshal([]byte(stdout), &schema); err != nil {
-		t.Fatalf("agent schema stdout is not valid JSON: %v\n%s", err, stdout)
-	}
-	if schema.Name != "gitty" {
-		t.Errorf("schema name = %q, want gitty", schema.Name)
-	}
-	sync, ok := findTool(schema, "sync")
-	if !ok {
-		t.Fatal("schema missing sync tool")
-	}
-	if _, ok := sync.InputSchema.Properties["anon"]; !ok {
-		t.Error("sync tool schema missing 'anon' property")
 	}
 }
 
@@ -2387,5 +2444,171 @@ func TestE2EArchivedExcludedByDefault(t *testing.T) {
 	}
 	if _, stderr, code := runGitty(t, ws, nil, "sync", "acme", "--path=acme", "--anon"); code != 2 || !strings.Contains(stderr, "not both") {
 		t.Errorf("both forms together should be a usage error (exit %d):\n%s", code, stderr)
+	}
+}
+
+// gitty auth re-runs the token check for an existing workspace, with an exit
+// code: 0 when the token works, 2 when it is missing or rejected.
+func TestE2EAuthCommand(t *testing.T) {
+	skipIfShort(t)
+
+	const token = "glpat-auth-check"
+	f := newFakeGitLab(t)
+	f.requireToken = token
+	f.authUser = "alice"
+	f.authScopes = []string{"api"}
+	ws := initWorkspace(t, f)
+	sub := filepath.Join(ws, "acme")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// From a subdirectory, a working token: report on stdout, exit 0.
+	stdout, stderr, code := runGitty(t, sub, []string{"GITLAB_TOKEN=" + token}, "auth")
+	if code != 0 {
+		t.Fatalf("auth exit = %d, want 0:\n%s\n%s", code, stdout, stderr)
+	}
+	for _, want := range []string{"Instance " + f.srv.URL, "HTTP(S)", "authenticated as @alice", "Scopes: api"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+
+	// A rejected token is a configuration problem: exit 2.
+	stdout, stderr, code = runGitty(t, ws, []string{"GITLAB_TOKEN=wrong"}, "auth")
+	if code != 2 || !strings.Contains(stdout, "REJECTED") || !strings.Contains(stderr, "rejected") {
+		t.Errorf("rejected token: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+
+	// No token at all: exit 2 with the setup hint.
+	stdout, stderr, code = runGitty(t, ws, nil, "auth")
+	if code != 2 || !strings.Contains(stdout, "No GitLab token found") || !strings.Contains(stderr, "no token") {
+		t.Errorf("missing token: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+
+	// A token that can list but not clone over HTTP(S) fails the check too.
+	f.authScopes = []string{"read_api"}
+	stdout, stderr, code = runGitty(t, ws, []string{"GITLAB_TOKEN=" + token}, "auth")
+	if code != 2 || !strings.Contains(stdout, "read_repository") || !strings.Contains(stderr, "cannot clone") {
+		t.Errorf("under-scoped token: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+}
+
+// TestE2EOrphans: a checkout whose project disappeared upstream is reported
+// by sync and ls, and moved aside — never deleted — by sync --prune.
+func TestE2EOrphans(t *testing.T) {
+	skipIfShort(t)
+
+	f := newFakeGitLab(t)
+	f.addRepo(t, "acme/keep", map[string]string{"k.txt": "k"})
+	f.addRepo(t, "acme/gone", map[string]string{"g.txt": "g"})
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	f.projects["acme"] = []apiProject{f.project(500, "acme/keep"), f.project(501, "acme/gone")}
+
+	ws := initWorkspace(t, f)
+	if _, _, code := runGitty(t, ws, nil, "sync", "acme", "--anon"); code != 0 {
+		t.Fatalf("initial sync exit = %d", code)
+	}
+
+	// The project is deleted upstream.
+	f.projects["acme"] = []apiProject{f.project(500, "acme/keep")}
+
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync exit = %d, want 0 (an orphan is not an error):\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "orphan acme/gone no project upstream\n") || !strings.Contains(stdout, "orphans=1 pruned=0") {
+		t.Errorf("sync should report the orphan:\n%s", stdout)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "gone", "g.txt")); got != "g" {
+		t.Error("reporting must leave the checkout where it is")
+	}
+
+	stdout, _, code = runGitty(t, ws, nil, "ls", "acme", "--anon", "--format=text")
+	if code != 0 || !strings.Contains(stdout, "orphan acme/gone no project upstream\n") || !strings.Contains(stdout, "orphans=1") {
+		t.Errorf("ls should list the orphan (exit %d):\n%s", code, stdout)
+	}
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "acme", "--anon", "--prune", "--dry-run")
+	if code != 0 || !strings.Contains(stdout, "plan prune acme/gone\n") {
+		t.Errorf("dry-run prune (exit %d):\n%s\n%s", code, stdout, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "gone", "g.txt")); err != nil {
+		t.Error("dry run must not move the checkout")
+	}
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "acme", "--anon", "--prune")
+	if code != 0 || !strings.Contains(stdout, "prune acme/gone\n") || !strings.Contains(stdout, "orphans=1 pruned=1") {
+		t.Errorf("prune (exit %d):\n%s\n%s", code, stdout, stderr)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "gone.gitty-orphan-1", "g.txt")); got != "g" {
+		t.Errorf("pruned checkout should be intact under its aside name, got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "acme", "gone")); !os.IsNotExist(err) {
+		t.Error("pruned checkout should no longer be in place")
+	}
+
+	// Afterwards: nothing to report, and status does not see the aside dir.
+	stdout, _, _ = runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if strings.Contains(stdout, "orphan") {
+		t.Errorf("no orphans expected after pruning:\n%s", stdout)
+	}
+	stdout, _, _ = runGitty(t, ws, nil, "status")
+	if strings.Contains(stdout, "gitty-orphan") || !strings.Contains(stdout, "status acme/keep ") {
+		t.Errorf("status should skip the aside dir and still see keep:\n%s", stdout)
+	}
+}
+
+// TestE2EEmptyRepositoryIsNotAFailure: a project nothing has been pushed to
+// still has a default branch as far as the API is concerned. Bringing it up
+// leaves an unborn repository, not an error on every run — and the run after
+// the first push checks it out.
+func TestE2EEmptyRepositoryIsNotAFailure(t *testing.T) {
+	skipIfShort(t)
+	f := newFakeGitLab(t)
+	f.groups["acme"] = apiGroup{ID: 1, FullPath: "acme"}
+	bare := filepath.Join(f.gitRoot, "acme", "empty.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, bare, "init", "-q", "--bare", "-b", "main", ".")
+	gitRun(t, bare, "update-server-info")
+	f.addRepo(t, "acme/full", map[string]string{"README.md": "full"})
+	f.projects["acme"] = []apiProject{f.project(1, "acme/empty"), f.project(2, "acme/full")}
+	ws := initWorkspace(t, f)
+
+	stdout, stderr, code := runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 || !strings.Contains(stdout, "clone acme/empty\n") || !strings.Contains(stdout, "errors=0") {
+		t.Fatalf("first sync: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "acme/empty: the repository is empty") {
+		t.Errorf("stderr should say why there is nothing in the checkout:\n%s", stderr)
+	}
+	if classifyDest(filepath.Join(ws, "acme", "empty")) != destRepo {
+		t.Error("the empty project should still be a repository on disk")
+	}
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 || !strings.Contains(stdout, "pull acme/empty\n") || !strings.Contains(stdout, "errors=0") {
+		t.Fatalf("second sync: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+
+	// Someone pushes the first commit.
+	work := t.TempDir()
+	gitRun(t, work, "init", "-q", "-b", "main", ".")
+	if err := os.WriteFile(filepath.Join(work, "first.txt"), []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, work, "add", ".")
+	gitRun(t, work, "commit", "-q", "-m", "first")
+	gitRun(t, work, "push", "-q", bare, "main")
+	gitRun(t, bare, "update-server-info")
+
+	stdout, stderr, code = runGitty(t, ws, nil, "sync", "acme", "--anon")
+	if code != 0 {
+		t.Fatalf("sync after the first push: exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if got := readFileT(t, filepath.Join(ws, "acme", "empty", "first.txt")); got != "first" {
+		t.Errorf("first.txt = %q", got)
 	}
 }

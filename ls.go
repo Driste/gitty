@@ -26,8 +26,10 @@ type lsOptions struct {
 	// IncludeArchived lists archived projects and groups too; they are left
 	// out by default, as sync leaves them out.
 	IncludeArchived bool
-	Format          string
-	Color           string
+	// Exclude adds patterns to the workspace's own; see Config.Excluded.
+	Exclude []string
+	Format  string
+	Color   string
 }
 
 // lsProject is one remote project and whether it is already checked out.
@@ -35,6 +37,9 @@ type lsProject struct {
 	Path     string `json:"path"`
 	Present  bool   `json:"present"`
 	Archived bool   `json:"archived,omitempty"`
+	// Orphan marks a local checkout with no project upstream: it is always
+	// present, and a sync would report (or, with --prune, move aside) it.
+	Orphan bool `json:"orphan,omitempty"`
 }
 
 // lsGroup is one remote group with the projects directly inside it.
@@ -57,6 +62,7 @@ type lsSummary struct {
 	New      int `json:"new"`
 	Present  int `json:"present"`
 	Archived int `json:"archived,omitempty"`
+	Orphans  int `json:"orphans,omitempty"`
 }
 
 // resolveLsTarget maps an ls argument onto a GitLab group path the way a shell
@@ -113,7 +119,7 @@ func buildLsReport(ctx context.Context, s *syncer, target string, nested bool) (
 	wg.Add(3)
 	go func() { defer wg.Done(); groups, gErr = s.src.Subgroups(ctx, target, nested, s.includeArchived) }()
 	go func() { defer wg.Done(); root, _ = s.src.Group(ctx, target) }()
-	go func() { defer wg.Done(); projects, pErr = s.src.Projects(ctx, target, nested, s.includeArchived) }()
+	go func() { defer wg.Done(); projects, pErr = s.src.Projects(ctx, target, nested, true) }()
 	wg.Wait()
 	if gErr != nil {
 		return lsReport{}, fmt.Errorf("listing subgroups for %s: %w", target, gErr)
@@ -124,7 +130,21 @@ func buildLsReport(ctx context.Context, s *syncer, target string, nested bool) (
 	if root != nil {
 		groups = append([]*gitlab.Group{root}, groups...)
 	}
-	return assembleReport(s, target, nested, groups, projects), nil
+	// Archived projects are listed only on request, but they still count as
+	// known upstream when deciding what is orphaned.
+	orphans := s.findOrphans(target, projects)
+	if !s.includeArchived {
+		live := projects[:0]
+		for _, p := range projects {
+			if !p.Archived {
+				live = append(live, p)
+			}
+		}
+		projects = live
+	}
+	report := assembleReport(s, target, nested, groups, projects)
+	addOrphans(&report, orphans)
+	return report, nil
 }
 
 // buildTopLevelReport lists the instance's top-level groups — the equivalent
@@ -143,6 +163,9 @@ func assembleReport(s *syncer, target string, nested bool, groups []*gitlab.Grou
 	report := lsReport{Target: target, Nested: nested}
 
 	for _, p := range projects {
+		if s.cfg.Excluded(p.PathWithNamespace) {
+			continue
+		}
 		present := false
 		rel := getLocalRelPath(p.PathWithNamespace, s.cfg.RootPath)
 		if isWithinWorkspace(rel) && classifyDest(filepath.Join(".", rel)) == destRepo {
@@ -169,6 +192,9 @@ func assembleReport(s *syncer, target string, nested bool, groups []*gitlab.Grou
 	seen := map[string]bool{}
 	var paths []string
 	for _, g := range groups {
+		if s.cfg.Excluded(g.FullPath) {
+			continue
+		}
 		if !seen[g.FullPath] {
 			seen[g.FullPath] = true
 			paths = append(paths, g.FullPath)
@@ -189,6 +215,34 @@ func assembleReport(s *syncer, target string, nested bool, groups []*gitlab.Grou
 	}
 	report.Summary.Groups = len(report.Groups)
 	return report
+}
+
+// addOrphans folds local-only checkouts into the report under the group
+// their path names, creating that group entry if the listing did not.
+func addOrphans(r *lsReport, orphans []orphan) {
+	for _, o := range orphans {
+		parent := parentPath(o.nsPath)
+		placed := false
+		for i := range r.Groups {
+			if r.Groups[i].Path == parent {
+				r.Groups[i].Projects = append(r.Groups[i].Projects, lsProject{Path: o.nsPath, Present: true, Orphan: true})
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			r.Groups = append(r.Groups, lsGroup{Path: parent, Projects: []lsProject{{Path: o.nsPath, Present: true, Orphan: true}}})
+		}
+		r.Summary.Projects++
+		r.Summary.Present++
+		r.Summary.Orphans++
+	}
+	sort.Slice(r.Groups, func(i, j int) bool { return r.Groups[i].Path < r.Groups[j].Path })
+	for i := range r.Groups {
+		ps := r.Groups[i].Projects
+		sort.Slice(ps, func(a, b int) bool { return ps[a].Path < ps[b].Path })
+	}
+	r.Summary.Groups = len(r.Groups)
 }
 
 // --- rendering ---
@@ -270,6 +324,9 @@ func writeLsTree(w io.Writer, r lsReport, p palette) {
 		if r.Summary.Archived > 0 {
 			summary += p.paint(p.dim, fmt.Sprintf(" (%d archived)", r.Summary.Archived))
 		}
+		if r.Summary.Orphans > 0 {
+			summary += p.paint(p.missing, fmt.Sprintf(", %d %s with no project upstream", r.Summary.Orphans, plural(r.Summary.Orphans, "orphan")))
+		}
 	}
 	fmt.Fprintln(w, summary)
 }
@@ -303,6 +360,9 @@ func writeChildren(w io.Writer, n *lsNode, prefix string, p palette) {
 		if proj.Archived {
 			state += ", archived"
 		}
+		if proj.Orphan {
+			state, style = "orphan", p.missing
+		}
 		fmt.Fprintf(w, "%s%s  %s\n",
 			prefix+branch, p.paint(style, lastSegment(proj.Path)), p.paint(p.dim, state))
 		i++
@@ -326,6 +386,10 @@ func writeLsText(s *syncer, r lsReport) {
 			if proj.Present {
 				state = "present"
 			}
+			if proj.Orphan {
+				s.event("orphan", proj.Path, "no project upstream")
+				continue
+			}
 			if proj.Archived {
 				s.event("project", proj.Path, state, "archived")
 				continue
@@ -337,6 +401,9 @@ func writeLsText(s *syncer, r lsReport) {
 		r.Summary.Groups, r.Summary.Projects, r.Summary.New, r.Summary.Present)
 	if r.Summary.Archived > 0 {
 		line += fmt.Sprintf(" archived=%d", r.Summary.Archived)
+	}
+	if r.Summary.Orphans > 0 {
+		line += fmt.Sprintf(" orphans=%d", r.Summary.Orphans)
 	}
 	fmt.Fprintln(s.out, line)
 }
@@ -362,6 +429,7 @@ func runLs(ctx context.Context, opts lsOptions) error {
 	}
 	s.nested = opts.Nested
 	s.includeArchived = opts.IncludeArchived
+	s.cfg.AddExcludes(opts.Exclude)
 
 	target, topLevel := resolveLsTarget(opts.Target, s.cfg.RootPath)
 

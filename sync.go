@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +37,19 @@ type gitlabSource interface {
 	// TopLevelGroups returns the instance's top-level groups — the namespaces
 	// visible to the caller, with no parent.
 	TopLevelGroups(ctx context.Context) ([]*gitlab.Group, error)
+	// NamespaceProjects returns every project that lives beneath target,
+	// archived ones included and marked — the listing the index is built
+	// from. Unlike Projects it leaves out projects that are merely shared
+	// with the group: they live in another namespace, and the index is of
+	// this one.
+	NamespaceProjects(ctx context.Context, target string) ([]*gitlab.Project, error)
+	// Project returns the single project with the given namespace path, in
+	// GitLab's full representation: what a listing trims away (the fork
+	// origin, the container registry prefix) is here. When there is none it
+	// returns an error wrapping errProjectNotFound. GitLab answers for a
+	// path a project used to have, so the project returned may carry a
+	// different path than the one asked for.
+	Project(ctx context.Context, path string) (*gitlab.Project, error)
 }
 
 // gitRunner executes a git command in dir with extra environment entries and
@@ -49,6 +65,8 @@ type syncCounts struct {
 	pulled  int
 	skipped int
 	errors  int
+	orphans int // checkouts with no project upstream (pruned ones included)
+	pruned  int // orphans moved aside by --prune
 }
 
 // syncer carries the resolved configuration and collaborators for a single
@@ -69,8 +87,10 @@ type syncer struct {
 	// an archived project is one its owners have retired, and a workspace
 	// mirroring the live namespace should not keep pulling it down.
 	includeArchived bool
-	cred            credential
-	exePath         string // this binary, for the askpass re-exec
+	// prune moves orphaned checkouts aside instead of only reporting them.
+	prune   bool
+	cred    credential
+	exePath string // this binary, for the askpass re-exec
 
 	// acceptNewHostKeys maps to ssh's StrictHostKeyChecking=accept-new:
 	// unknown hosts are recorded without prompting, a changed key is still
@@ -87,6 +107,81 @@ type syncer struct {
 
 	mu     sync.Mutex
 	counts syncCounts
+	// failures keeps every error event's path and detail, in order, so a
+	// long run can end with a recap instead of leaving the user to scroll.
+	failures []string
+
+	// progress is the one-line "[done/total] action path" indicator shown on
+	// a terminal; see progressLine.
+	progress progressLine
+}
+
+// progressLine keeps a single status line alive at the bottom of a terminal
+// while repositories are being synced. It only ever draws on a terminal, so
+// piped or redirected stderr sees nothing of it; and every other write to
+// either stream clears it first and redraws it afterwards, so event lines
+// and diagnostics stay whole. Callers hold the syncer's mutex.
+type progressLine struct {
+	w       io.Writer
+	on      bool
+	total   int
+	done    int
+	current string
+	shown   bool
+}
+
+// enable turns the line on when w is a terminal.
+func (p *progressLine) enable(w io.Writer) {
+	if f, ok := w.(*os.File); ok && isTerminal(f) {
+		p.w, p.on = w, true
+	}
+}
+
+func (p *progressLine) clear() {
+	if p.on && p.shown {
+		fmt.Fprint(p.w, "\r\x1b[2K")
+		p.shown = false
+	}
+}
+
+func (p *progressLine) draw() {
+	if !p.on || p.total == 0 || p.done >= p.total {
+		return
+	}
+	fmt.Fprintf(p.w, "\r\x1b[2K[%d/%d] %s", p.done, p.total, p.current)
+	p.shown = true
+}
+
+// start records that a repository's work has begun.
+func (s *syncer) progressStart(action, path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.progress.current = action + " " + path
+	s.progress.draw()
+}
+
+// finish records that a repository's work is over, whatever the outcome.
+func (s *syncer) progressFinish() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.progress.done++
+	s.progress.clear()
+	s.progress.draw()
+}
+
+// progressTotal sets how many repositories the run will touch.
+func (s *syncer) progressTotal(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.progress.total, s.progress.done = n, 0
+}
+
+// progressStop clears the line for good, before the summary.
+func (s *syncer) progressStop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.progress.clear()
+	s.progress.on = false
 }
 
 // event emits one machine-readable line on the primary output stream:
@@ -107,7 +202,7 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 	line := kind
 	if s.dryRun {
 		switch kind {
-		case "clone", "pull", "group", "reclone":
+		case "clone", "pull", "group", "reclone", "prune", "index", "share":
 			line = "plan " + kind
 		}
 	}
@@ -115,7 +210,9 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 	if len(detail) > 0 {
 		line += " " + strings.Join(detail, " ")
 	}
+	s.progress.clear()
 	fmt.Fprintln(s.out, line)
+	s.progress.draw()
 
 	switch kind {
 	case "clone", "reclone":
@@ -124,8 +221,31 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 		s.counts.pulled++
 	case "skip":
 		s.counts.skipped++
+	case "orphan":
+		s.counts.orphans++
+	case "prune":
+		s.counts.orphans++
+		s.counts.pruned++
 	case "error":
 		s.counts.errors++
+		s.failures = append(s.failures, strings.TrimSpace(path+" "+strings.Join(detail, " ")))
+	}
+}
+
+// recapFailures lists everything that failed, at the end, on stderr. The
+// per-item error events and git output scroll past during a large sync; the
+// recap is the part worth reading when it is over. It is deliberately not on
+// stdout: the summary line is the event stream's last word.
+func (s *syncer) recapFailures() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.failures) == 0 {
+		return
+	}
+	s.progress.clear()
+	fmt.Fprintf(s.errOut, "\n%d failed:\n", len(s.failures))
+	for _, f := range s.failures {
+		fmt.Fprintf(s.errOut, "  %s\n", f)
 	}
 }
 
@@ -133,7 +253,9 @@ func (s *syncer) eventLocked(kind, path string, detail ...string) {
 func (s *syncer) diagf(format string, args ...any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.progress.clear()
 	fmt.Fprintf(s.errOut, format+"\n", args...)
+	s.progress.draw()
 }
 
 // runGit is the single choke point for git execution: it prints the redacted
@@ -151,12 +273,14 @@ func (s *syncer) runGit(ctx context.Context, path, dir string, extraEnv []string
 	}
 	if s.verbose && len(out) > 0 {
 		s.mu.Lock()
+		s.progress.clear()
 		fmt.Fprintf(s.errOut, "--- git %s for %s ---\n", strings.Join(redactArgs(args), " "), path)
 		s.errOut.Write(out)
 		if out[len(out)-1] != '\n' {
 			fmt.Fprintln(s.errOut)
 		}
 		fmt.Fprintf(s.errOut, "--- end %s ---\n", path)
+		s.progress.draw()
 		s.mu.Unlock()
 	}
 	return nil
@@ -183,6 +307,8 @@ func (s *syncer) reportGitFailure(path string, args []string, out []byte, err er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.eventLocked("error", path, "git "+gitSubcommand(args)+" failed")
+	s.progress.clear()
+	defer s.progress.draw()
 	fmt.Fprintf(s.errOut, "--- git %s for %s failed: %v ---\n", strings.Join(redactArgs(args), " "), path, err)
 	if len(out) > 0 {
 		s.errOut.Write(out)
@@ -242,8 +368,19 @@ type syncOptions struct {
 	Jobs              int
 
 	// AllowCloneHosts adds trusted clone hosts for this run only; see
-	// Config.AllowCloneHosts.
+	// Config.AllowCloneHosts. Exclude adds patterns to the workspace's own;
+	// see Config.Excluded.
 	AllowCloneHosts []string
+	Exclude         []string
+
+	// Prune moves checkouts that no longer exist upstream aside (never
+	// deletes them); see findOrphans.
+	Prune bool
+
+	// Related, when set, makes this a sync of the projects linked to a
+	// subject instead of a group: "uses", "used-by" or "both". Path then
+	// names the subject. See runSyncRelated.
+	Related string
 }
 
 // maxJobs bounds --jobs: beyond ~16 concurrent clones the bottleneck is the
@@ -254,6 +391,9 @@ const maxJobs = 16
 // It returns an error when setup fails or when one or more groups/repositories
 // could not be synced, so the caller can surface a non-zero exit code.
 func runSync(ctx context.Context, opts syncOptions) error {
+	if opts.Related != "" {
+		return runSyncRelated(ctx, opts)
+	}
 	if !opts.Groups && !opts.Repos {
 		opts.Repos = true
 	}
@@ -271,8 +411,11 @@ func runSync(ctx context.Context, opts syncOptions) error {
 	s.recloneBroken = opts.RecloneBroken
 	s.acceptNewHostKeys = opts.AcceptNewHostKeys
 	s.includeArchived = opts.IncludeArchived
+	s.prune = opts.Prune
 	s.jobs = opts.Jobs
 	s.cfg.AllowCloneHosts(opts.AllowCloneHosts)
+	s.cfg.AddExcludes(opts.Exclude)
+	s.progress.enable(s.errOut)
 
 	if s.verbose {
 		// Enough to tell which binary, which git and whose configuration a
@@ -305,10 +448,18 @@ func runSync(ctx context.Context, opts syncOptions) error {
 		s.syncRepos(ctx, fullTarget)
 	}
 
+	s.progressStop()
 	// The summary is always the last stdout line, on success and failure
 	// alike, and is identical between dry and real runs (parity contract).
-	fmt.Fprintf(s.out, "summary cloned=%d pulled=%d skipped=%d errors=%d\n",
+	summary := fmt.Sprintf("summary cloned=%d pulled=%d skipped=%d errors=%d",
 		s.counts.cloned, s.counts.pulled, s.counts.skipped, s.counts.errors)
+	// Orphan figures appear only when there is something to say, so the
+	// summary line of a clean run is unchanged.
+	if s.counts.orphans > 0 {
+		summary += fmt.Sprintf(" orphans=%d pruned=%d", s.counts.orphans, s.counts.pruned)
+	}
+	fmt.Fprintln(s.out, summary)
+	s.recapFailures()
 
 	// An interrupted run reports 130 even when items had already failed; the
 	// workspace is left recoverable and a re-run picks up where this stopped.
@@ -339,6 +490,15 @@ func (s *syncer) syncGroups(ctx context.Context, target string) {
 	if root != nil {
 		allGroups = append([]*gitlab.Group{root}, allGroups...)
 	}
+	keptGroups := allGroups[:0]
+	for _, g := range allGroups {
+		if s.cfg.Excluded(g.FullPath) {
+			s.event("skip", g.FullPath, "excluded")
+			continue
+		}
+		keptGroups = append(keptGroups, g)
+	}
+	allGroups = keptGroups
 
 	s.diagf("Found %d groups to sync.", len(allGroups))
 
@@ -372,6 +532,7 @@ func (s *syncer) syncGroups(ctx context.Context, target string) {
 			HTTP:       s.cfg.HTTP,
 			RootPath:   g.FullPath,
 			CloneHosts: append([]string(nil), s.cfg.CloneHosts...),
+			Exclude:    append([]string(nil), s.cfg.Exclude...),
 		}
 		if err := SaveConfigTo(groupDest, subCfg); err != nil {
 			s.event("error", g.FullPath, "saving config failed")
@@ -387,14 +548,36 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	s.diagf("--- Syncing Repositories ---")
 	s.diagf("Fetching projects for: '%s' (Nested: %t)...", target, s.nested)
 
-	allProjects, err := s.src.Projects(ctx, target, s.nested, s.includeArchived)
+	// Everything upstream, archived included: archived projects are not
+	// synced unless asked, but a checkout of one is not an orphan either.
+	known, err := s.src.Projects(ctx, target, s.nested, true)
 	if err != nil {
 		s.event("error", target, "listing projects failed")
 		s.diagf("listing projects for %s: %v", target, err)
 		return
 	}
-
+	var allProjects []*gitlab.Project
+	for _, p := range known {
+		if p.Archived && !s.includeArchived {
+			continue
+		}
+		allProjects = append(allProjects, p)
+	}
 	s.diagf("Found %d projects.", len(allProjects))
+
+	// Excluded projects are reported, not silently dropped: a skip event per
+	// project keeps the event stream a complete account of the listing.
+	kept := allProjects[:0]
+	for _, p := range allProjects {
+		if s.cfg.Excluded(p.PathWithNamespace) {
+			s.event("skip", p.PathWithNamespace, "excluded")
+			continue
+		}
+		kept = append(kept, p)
+	}
+	allProjects = kept
+	defer s.reportOrphans(ctx, target, known)
+	s.progressTotal(len(allProjects))
 
 	// Sync one repository on its own first so an SSH host-key prompt happens
 	// once rather than once per worker (see needsHostKeyWarmup).
@@ -408,6 +591,84 @@ func (s *syncer) syncRepos(ctx context.Context, target string) {
 	forEachConcurrent(ctx, s.jobs, allProjects, func(p *gitlab.Project) {
 		s.syncOneRepo(ctx, p)
 	})
+}
+
+// orphan is a local checkout with no project behind it upstream any more —
+// deleted, moved to another namespace, or transferred away.
+type orphan struct {
+	nsPath string // its GitLab-style path, for event lines
+	dir    string // its directory, relative to the working directory
+}
+
+// findOrphans compares the checkouts under target's directory with the
+// projects upstream (archived included) and returns the ones nothing upstream
+// accounts for. Without nested only the target's own directory is examined,
+// matching what the sync itself covered. Excluded paths are not orphans: the
+// user asked gitty to leave them alone.
+func (s *syncer) findOrphans(target string, known []*gitlab.Project) []orphan {
+	expected := make(map[string]bool, len(known))
+	for _, p := range known {
+		expected[filepath.ToSlash(filepath.Clean(getLocalRelPath(p.PathWithNamespace, s.cfg.RootPath)))] = true
+	}
+	targetDir := filepath.Clean(getLocalRelPath(target, s.cfg.RootPath))
+	if targetDir == "" {
+		targetDir = "."
+	}
+	if !isWithinWorkspace(targetDir) {
+		return nil
+	}
+	repos, err := findRepos(targetDir)
+	if err != nil {
+		return nil
+	}
+	var out []orphan
+	for _, r := range repos {
+		if !s.nested && strings.Contains(r, "/") {
+			continue // a checkout in a subgroup this flat sync did not cover
+		}
+		dir := filepath.ToSlash(filepath.Join(targetDir, r))
+		if expected[dir] {
+			continue
+		}
+		nsPath := path.Join(s.cfg.RootPath, dir)
+		if s.cfg.Excluded(nsPath) {
+			continue
+		}
+		out = append(out, orphan{nsPath: nsPath, dir: filepath.FromSlash(dir)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].nsPath < out[j].nsPath })
+	return out
+}
+
+// orphanAsideMarker names the directories --prune moves orphans to. Like
+// moved-aside broken checkouts they are archived copies, never deleted, and
+// workspace walks skip them.
+const orphanAsideMarker = ".gitty-orphan-"
+
+// reportOrphans emits an orphan event for every checkout nothing upstream
+// accounts for and, with --prune, moves each aside as <dir>.gitty-orphan-<n>.
+// It runs after an interrupted sync too, since it needs no network, but not
+// when the listing itself failed — an empty "known" would make every checkout
+// look orphaned.
+func (s *syncer) reportOrphans(ctx context.Context, target string, known []*gitlab.Project) {
+	for _, o := range s.findOrphans(target, known) {
+		if !s.prune {
+			s.event("orphan", o.nsPath, "no project upstream")
+			continue
+		}
+		if s.dryRun {
+			s.event("prune", o.nsPath)
+			continue
+		}
+		aside, err := moveAside(o.dir, orphanAsideMarker)
+		if err != nil {
+			s.event("error", o.nsPath, "moving orphan aside failed")
+			s.diagf("%s: %v", o.nsPath, err)
+			continue
+		}
+		s.event("prune", o.nsPath)
+		s.diagf("%s: moved to %s", o.nsPath, aside)
+	}
 }
 
 // destState classifies a repo's local destination path.
@@ -454,8 +715,15 @@ func classifyDest(dest string) destState {
 // renameAside moves a broken destination to dest+".gitty-broken-<n>" (never
 // deleting anything) so a fresh clone can take its place.
 func renameAside(dest string) (string, error) {
+	return moveAside(dest, brokenAsideMarker)
+}
+
+// moveAside renames dest to dest+marker+<n>, choosing the first n that is
+// free. Nothing is ever deleted: the directory keeps its contents under a
+// name that workspace walks know to skip.
+func moveAside(dest, marker string) (string, error) {
 	for n := 1; n < 100; n++ {
-		aside := fmt.Sprintf("%s.gitty-broken-%d", dest, n)
+		aside := fmt.Sprintf("%s%s%d", dest, marker, n)
 		if _, err := os.Stat(aside); os.IsNotExist(err) {
 			if err := os.Rename(dest, aside); err != nil {
 				return "", err
@@ -463,7 +731,7 @@ func renameAside(dest string) (string, error) {
 			return aside, nil
 		}
 	}
-	return "", fmt.Errorf("too many .gitty-broken directories beside %s", dest)
+	return "", fmt.Errorf("too many %s directories beside %s", strings.Trim(marker, "."), dest)
 }
 
 // syncOneRepo handles one project end-to-end and emits its own events.
@@ -473,6 +741,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 	if ctx.Err() != nil {
 		return
 	}
+	defer s.progressFinish()
 
 	cloneURL := s.cloneURL(p)
 
@@ -503,6 +772,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		// Existing checkout: fast-forward it. --ff-only refuses to create a
 		// merge commit, so a diverged or dirty checkout fails loudly instead
 		// of leaving the repo in a surprising state.
+		s.progressStart("pulling", p.PathWithNamespace)
 		env, args, ok := s.authForCheckout(ctx, p.PathWithNamespace, repoDest, "pull", "--ff-only")
 		if !ok {
 			return
@@ -546,6 +816,7 @@ func (s *syncer) syncOneRepo(ctx context.Context, p *gitlab.Project) {
 		s.diagf("creating %s: %v", parentDir, err)
 		return
 	}
+	s.progressStart("cloning", p.PathWithNamespace)
 	if err := s.bringUp(ctx, p, repoDest, cloneURL, true); err == nil {
 		s.event(kind, p.PathWithNamespace)
 		s.reportResolvedOrigin(ctx, p.PathWithNamespace, repoDest, cloneURL)
@@ -625,6 +896,19 @@ func (s *syncer) bringUp(ctx context.Context, p *gitlab.Project, dest, url strin
 	// costs one more round trip and fails cleanly on an empty repository —
 	// which then stays unborn, as `git clone` leaves it.
 	branch := p.DefaultBranch
+	if branch != "" {
+		// The API names the default branch whether or not anything has been
+		// pushed to it. A project with an empty repository is not a failed
+		// checkout: it stays unborn, as `git clone` leaves it, and a later
+		// run finishes the job once there is something to check out.
+		if _, err := s.git(ctx, dest, nil, "show-ref", "--verify", "--quiet", "refs/remotes/origin/"+branch); err != nil {
+			if out, err := s.git(ctx, dest, nil, "for-each-ref", "--count=1", "refs/remotes/origin"); err == nil && strings.TrimSpace(string(out)) == "" {
+				s.diagf("%s: the repository is empty; nothing to check out yet", path)
+				return nil
+			}
+			branch = "" // the remote has branches, but not that one: ask it
+		}
+	}
 	if branch == "" {
 		if err := s.runGit(ctx, path, dest, env, "remote", "set-head", "origin", "--auto"); err != nil {
 			return nil
@@ -670,6 +954,8 @@ func (s *syncer) explainFetchFailure(ctx context.Context, path, dest, url, effec
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.progress.clear()
+	defer s.progress.draw()
 	fmt.Fprintf(s.errOut, "--- url.insteadOf rules git sees inside %s ---\n", dest)
 	for _, line := range strings.Split(rules, "\n") {
 		// "file:<path>\t<key> <value>": redact token by token, since the
@@ -1246,7 +1532,32 @@ func (s gitlabClientSource) TopLevelGroups(ctx context.Context) ([]*gitlab.Group
 	return all, nil
 }
 
+func (s gitlabClientSource) NamespaceProjects(ctx context.Context, target string) ([]*gitlab.Project, error) {
+	return s.listProjects(ctx, target, true, true, false)
+}
+
+func (s gitlabClientSource) Project(ctx context.Context, path string) (*gitlab.Project, error) {
+	p, _, err := s.client.Projects.GetProject(path, nil, gitlab.WithContext(ctx))
+	if errors.Is(err, gitlab.ErrNotFound) {
+		return nil, fmt.Errorf("%s: %w", path, errProjectNotFound)
+	}
+	return p, err
+}
+
 func (s gitlabClientSource) Projects(ctx context.Context, target string, nested, archived bool) ([]*gitlab.Project, error) {
+	return s.listProjects(ctx, target, nested, archived, true)
+}
+
+// listProjects lists a group's projects. shared says whether projects of
+// other namespaces that have been shared with the group count: they do for a
+// sync, which mirrors what the group can see, and do not for the index.
+func (s gitlabClientSource) listProjects(ctx context.Context, target string, nested, archived, shared bool) ([]*gitlab.Project, error) {
+	// GitLab includes shared projects unless told otherwise; only say so
+	// when leaving them out, so a sync's requests stay exactly as they were.
+	var withShared *bool
+	if !shared {
+		withShared = &shared
+	}
 	list := func(ctx context.Context, archivedOnly bool) ([]*gitlab.Project, error) {
 		// simple=true trims each project to its identifying fields — path,
 		// URLs, default branch — which is all gitty reads, and is a fifth of
@@ -1259,6 +1570,7 @@ func (s gitlabClientSource) Projects(ctx context.Context, target string, nested,
 				IncludeSubGroups: &nested,
 				Simple:           &simple,
 				Archived:         &archivedOnly,
+				WithShared:       withShared,
 				ListOptions:      gitlab.ListOptions{PerPage: 100, Page: int64(page)},
 			}, gitlab.WithContext(ctx))
 		})

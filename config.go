@@ -29,6 +29,40 @@ type Config struct {
 	// advertising repositories on another host (a split API/git deployment, or
 	// a mirror) is intended, which silences the note gitty otherwise prints.
 	CloneHosts []string `toml:"clone_hosts,omitempty"`
+
+	// Exclude lists namespace paths this workspace never syncs or lists: a
+	// huge monorepo, a vendored mirror, a subgroup that belongs to another
+	// team. Each entry is a full GitLab path ("acme/vendor") — which also
+	// covers everything beneath it — or a path.Match glob ("acme/*-mirror").
+	Exclude []string `toml:"exclude,omitempty"`
+
+	// Hub is the address of the instance's gitty-up, if it has one. gitty
+	// sends it what it reads from the checkouts here (see share.go). It is
+	// read from the workspace's root config only.
+	Hub string `toml:"hub,omitempty"`
+}
+
+// AddExcludes adds a command's --exclude patterns to the workspace's own.
+func (c *Config) AddExcludes(patterns []string) {
+	c.Exclude = append(c.Exclude, patterns...)
+}
+
+// Excluded reports whether a namespace path is covered by an exclude entry:
+// equal to it, beneath it, or matching it as a glob.
+func (c *Config) Excluded(nsPath string) bool {
+	for _, pat := range c.Exclude {
+		pat = strings.Trim(strings.TrimSpace(pat), "/")
+		if pat == "" {
+			continue
+		}
+		if nsPath == pat || strings.HasPrefix(nsPath, pat+"/") {
+			return true
+		}
+		if ok, err := path.Match(pat, nsPath); err == nil && ok {
+			return true
+		}
+	}
+	return false
 }
 
 // AllowCloneHosts adds hosts from a command's --allow-clone-host flags to the
@@ -113,29 +147,124 @@ func DiscoverWorkspace() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("determining working directory: %w", err)
 	}
+	loc, err := locateWorkspace(wd)
+	if err != nil {
+		return nil, err
+	}
+	cfg := loc.Config
+	cfg.RootPath = loc.Group()
+	if loc.GroupDir != wd {
+		if err := os.Chdir(loc.GroupDir); err != nil {
+			return nil, fmt.Errorf("entering %s: %w", loc.GroupDir, err)
+		}
+	}
+	return cfg, nil
+}
+
+// workspaceLocation says where a directory sits inside a workspace, without
+// moving the process there: the nearest config above it, and the group that
+// directory corresponds to.
+type workspaceLocation struct {
+	ConfigDir string  // nearest ancestor (the directory included) holding .gitty/config
+	Config    *Config // that config, exactly as written
+	GroupDir  string  // deepest directory from ConfigDir towards the start that is still a group
+	Below     string  // the group path GroupDir adds below ConfigDir, forward slashes
+}
+
+// Group is the full namespace path of the group the directory is in: the
+// config's root_path plus the directories below it. Empty when the workspace
+// is anchored at the instance's top level and the directory is its root.
+func (l *workspaceLocation) Group() string {
+	if l.Below == "" {
+		return l.Config.RootPath
+	}
+	return path.Join(l.Config.RootPath, l.Below)
+}
+
+// locateWorkspace finds the workspace a directory belongs to. It is
+// DiscoverWorkspace without the side effect, for callers that must stay
+// where they were started.
+func locateWorkspace(wd string) (*workspaceLocation, error) {
 	cfgDir, err := findConfigDir(wd)
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(cfgDir, ConfigDir, ConfigName))
+	cfg, err := readConfigIn(cfgDir)
+	if err != nil {
+		return nil, err
+	}
+	groupDir, below := contextBelow(cfgDir, wd)
+	return &workspaceLocation{ConfigDir: cfgDir, Config: cfg, GroupDir: groupDir, Below: below}, nil
+}
+
+// readConfigIn reads the config a directory holds.
+func readConfigIn(dir string) (*Config, error) {
+	file := filepath.Join(dir, ConfigDir, ConfigName)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
 	var cfg Config
 	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", filepath.Join(cfgDir, ConfigDir, ConfigName), err)
-	}
-
-	groupDir, below := contextBelow(cfgDir, wd)
-	if below != "" {
-		cfg.RootPath = path.Join(cfg.RootPath, below)
-	}
-	if groupDir != wd {
-		if err := os.Chdir(groupDir); err != nil {
-			return nil, fmt.Errorf("entering %s: %w", groupDir, err)
-		}
+		return nil, fmt.Errorf("parsing %s: %w", file, err)
 	}
 	return &cfg, nil
+}
+
+// workspaceRoot returns the outermost directory of the workspace that a
+// config directory belongs to, with that directory's config.
+//
+// `gitty sync --groups` writes a config into every group directory it
+// creates, so the config nearest a command is often not the top of the tree.
+// Commands that act on a group want the nearest one; anything kept once per
+// workspace — the index, above all — wants the top, so that a link from
+// acme/platform/app to acme/lib is found whichever of the two the command
+// was started in.
+//
+// A config further up belongs to the same workspace when it names the same
+// instance and its root_path plus the directories in between is this one's
+// root_path — exactly what a config written by `sync --groups` satisfies.
+// Anything else above (another instance's workspace enclosing this one, a
+// config owned by someone else) ends the search: it is a different
+// workspace, and this one's top has already been found.
+func workspaceRoot(cfgDir string, cfg *Config) (string, *Config) {
+	top, topCfg := cfgDir, cfg
+	dev := deviceOf(cfgDir)
+	for d := cfgDir; ; {
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+		if dev != 0 && deviceOf(d) != dev {
+			break
+		}
+		conf := filepath.Join(d, ConfigDir, ConfigName)
+		if fi, err := os.Stat(conf); err != nil || fi.IsDir() {
+			continue // configs may be sparse: not every group directory has one
+		}
+		if !ownedByCurrentUser(conf) {
+			break
+		}
+		outer, err := readConfigIn(d)
+		if err != nil {
+			break
+		}
+		rel, err := filepath.Rel(d, top)
+		if err != nil || !sameInstance(outer.URL, topCfg.URL) ||
+			path.Join(outer.RootPath, filepath.ToSlash(rel)) != topCfg.RootPath {
+			break
+		}
+		top, topCfg = d, outer
+	}
+	return top, topCfg
+}
+
+// sameInstance reports whether two configured instance URLs name the same
+// GitLab: a trailing slash and the case of scheme and host do not matter.
+func sameInstance(a, b string) bool {
+	norm := func(s string) string { return strings.ToLower(strings.TrimRight(strings.TrimSpace(s), "/")) }
+	return norm(a) == norm(b)
 }
 
 // findConfigDir returns the nearest ancestor of dir (dir included) holding a
@@ -170,7 +299,10 @@ func findConfigDir(dir string) (string, error) {
 		}
 		d = parent
 	}
-	return "", usageErrf("no .gitty/config found in %s or any parent directory on the same filesystem; run 'gitty init' at the workspace root first", dir)
+	return "", &usageError{
+		msg:   fmt.Sprintf("no .gitty/config found in %s or any parent directory on the same filesystem; run 'gitty init' at the workspace root first", dir),
+		cause: errNoWorkspace,
+	}
 }
 
 // contextBelow walks from cfgDir down towards wd and returns the deepest
@@ -186,7 +318,7 @@ func contextBelow(cfgDir, wd string) (groupDir, below string) {
 	var parts []string
 	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
 		next := filepath.Join(groupDir, seg)
-		if seg == ConfigDir || strings.Contains(seg, brokenAsideMarker) || classifyDest(next) == destRepo {
+		if seg == ConfigDir || strings.Contains(seg, brokenAsideMarker) || strings.Contains(seg, orphanAsideMarker) || classifyDest(next) == destRepo {
 			break
 		}
 		groupDir = next

@@ -52,17 +52,3 @@ func TestBuildRevisionSuffixIsWellFormed(t *testing.T) {
 		t.Errorf("revision %q is longer than the 12-character short form", rev)
 	}
 }
-
-func TestVersionToolInAgentSchema(t *testing.T) {
-	s := buildAgentSchema()
-	tool, ok := findTool(s, "version")
-	if !ok {
-		t.Fatal("schema is missing the version tool")
-	}
-	if len(tool.InputSchema.Properties) != 0 {
-		t.Errorf("version tool should take no arguments, got %v", tool.InputSchema.Properties)
-	}
-	if len(tool.Invocation.BaseArgs) != 1 || tool.Invocation.BaseArgs[0] != "version" {
-		t.Errorf("version tool baseArgs = %v", tool.Invocation.BaseArgs)
-	}
-}

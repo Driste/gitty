@@ -36,3 +36,5 @@ repos/
 gitty
 
 .claude
+# gitty-up, when built at the repository root (cmd/gitty-up is the source)
+/gitty-up

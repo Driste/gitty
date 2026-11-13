@@ -30,6 +30,7 @@ type initOptions struct {
 	Verify     bool
 	Token      string
 	CloneHosts []string
+	Hub        string
 }
 
 func runInit(opts initOptions) error {
@@ -39,6 +40,14 @@ func runInit(opts initOptions) error {
 	for _, h := range opts.CloneHosts {
 		if extractHost(h) == "" {
 			return usageErrf("invalid --allow-clone-host %q: expected a hostname like git.example.com", h)
+		}
+	}
+
+	hub := ""
+	if opts.Hub != "" {
+		var err error
+		if hub, err = cleanHubURL(opts.Hub, "--hub"); err != nil {
+			return err
 		}
 	}
 
@@ -64,6 +73,7 @@ func runInit(opts initOptions) error {
 		HTTP:       opts.HTTP,
 		RootPath:   "", // The base of your workspace
 		CloneHosts: opts.CloneHosts,
+		Hub:        hub,
 	}
 
 	if err := SaveConfigTo(wd, cfg); err != nil {
@@ -78,6 +88,9 @@ func runInit(opts initOptions) error {
 	fmt.Printf("Cloning over %s\n", transport)
 	if len(cfg.CloneHosts) > 0 {
 		fmt.Printf("Also cloning from: %s\n", strings.Join(cfg.CloneHosts, ", "))
+	}
+	if cfg.Hub != "" {
+		fmt.Printf("Sharing what checkouts say with the hub at %s\n", cfg.Hub)
 	}
 	fmt.Println("You can now run 'gitty sync --path=<path>' to pull down repositories.")
 
