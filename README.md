@@ -4,6 +4,31 @@ A minimal, configurable Go CLI tool to synchronize (clone/pull) GitLab groups, s
 
 `gitty` uses a local `.gitty/config` file to anchor your workspace, preserving the exact namespace directory structure of your GitLab environment to prevent naming collisions.
 
+## Commands
+
+| Command | What it does |
+| :--- | :--- |
+| [`gitty init`](#configuration-gitty-init) | Set up a workspace in the current directory: which GitLab instance, and how to clone from it. |
+| [`gitty sync`](#usage-gitty-sync) | Clone and pull a group's repositories, keeping GitLab's directory structure. |
+| [`gitty sync --related`](#syncing-what-a-project-needs-gitty-sync---related) | Bring in the projects the current checkout uses. |
+| [`gitty status`](#inspecting-a-workspace-gitty-status) | Show the branch of every checkout and whether it is behind. |
+| [`gitty ls`](#browsing-gitty-ls) | List a group's subgroups and projects on GitLab, and what a sync would clone. |
+| [`gitty fetch`](#fetching-a-project-gitty-fetch) | Clone the projects you name into the workspace. |
+| [`gitty up`](#the-instances-shared-context-gitty-up) | Give coding agents the instance's shared context over MCP. [Connecting an agent](#connecting-an-agent) is one line. |
+| [`gitty share`](#sharing-what-checkouts-say-gitty-share) | Tell a team's hub what the checkouts here say. |
+| [`gitty auth`](#re-checking-your-token-gitty-auth) | Check your token against the instance and report its scopes. |
+| [`gitty completion`](#shell-completion-gitty-completion) | Print a completion script for bash, zsh or fish. |
+| [`gitty version`](#from-a-release-recommended) | Print the version. |
+| [`gitty <name>`](#plugins) | Run a plugin: an executable named `gitty-<name>`. |
+
+`gitty <command> -h` lists a command's flags. Run a command
+[from any directory in the workspace](#run-it-from-anywhere-in-the-workspace)
+and it acts on that directory's group. `gitty -C <dir> <command>` runs it as
+if started in `<dir>`.
+
+New here? [Install it](#installation), then `gitty init` and `gitty sync`.
+The [examples](#examples) show the common cases.
+
 ## Features
 * **Workspace Config**: Initialize a workspace with `gitty init` so you don't have to repeatedly pass your GitLab URL or SSH/HTTP preferences.
 * **Granular Syncing**: Choose to sync only repositories, only empty group directory structures, or both.
@@ -1166,14 +1191,3 @@ pull request; to run it yourself:
 ```bash
 go build -o gitty . && ./scripts/integration-test.sh
 ```
-
----
-
-## TODO
-
-- [x] Add a gitty config to each group so that you can go into them and pull from that path
-- [x] For gitlab pipelines, use the CI_ var for the git repo (`CI_JOB_TOKEN` authenticates git; `init` defaults to `CI_SERVER_URL`)
-- [x] Async pull down repos (`--jobs`)
-- [x] Show repos current branches and if they are out of date, maybe a cache (`gitty status`, with `--fetch`)
-- [x] Show how many projects are in each group (`gitty ls`)
-- [x] Show the current groups/projects and which will be removed or added when doing a subsequent run (`gitty ls`: `new` is what a sync adds, `orphan` is what no longer exists upstream; `sync --prune` moves orphans aside)

@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 // TestNoBuiltBinaryIsTracked: the repository holds source. A binary built in
@@ -41,6 +44,75 @@ func TestNoBuiltBinaryIsTracked(t *testing.T) {
 			if bytes.HasPrefix(head[:n], []byte(magic)) {
 				t.Errorf("%s is tracked by git and is %s: remove it with `git rm --cached %s` and build it instead", name, what, name)
 			}
+		}
+	}
+}
+
+// readmeAnchors returns the anchor of every heading in a Markdown file, as
+// GitHub makes them: lower-cased, punctuation dropped, spaces to hyphens,
+// and a number added to a slug already taken. Headings inside a code fence
+// are text, not headings.
+func readmeAnchors(md string) map[string]bool {
+	anchors, fenced := map[string]bool{}, false
+	for _, line := range strings.Split(md, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			fenced = !fenced
+			continue
+		}
+		title := strings.TrimLeft(line, "#")
+		if fenced || title == line || !strings.HasPrefix(title, " ") {
+			continue
+		}
+		var slug strings.Builder
+		for _, r := range strings.ToLower(strings.TrimSpace(title)) {
+			switch {
+			case r == ' ':
+				slug.WriteByte('-')
+			case r == '-' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r):
+				slug.WriteRune(r)
+			}
+		}
+		anchor := slug.String()
+		for n := 1; anchors[anchor]; n++ {
+			anchor = fmt.Sprintf("%s-%d", slug.String(), n)
+		}
+		anchors[anchor] = true
+	}
+	return anchors
+}
+
+// TestReadmeCommandTable: the table at the top of the README is how a
+// reader gets to a command. Every command has a row there, and every link
+// in the file that points into the file lands on a heading — a section
+// renamed without its links is the way such a table quietly stops working.
+func TestReadmeCommandTable(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := string(data)
+	anchors := readmeAnchors(md)
+	for _, m := range regexp.MustCompile(`\]\(#([^)\s]*)\)`).FindAllStringSubmatch(md, -1) {
+		if !anchors[m[1]] {
+			t.Errorf("README.md links to #%s, and no heading makes that anchor", m[1])
+		}
+	}
+
+	start := strings.Index(md, "\n## Commands\n")
+	if start < 0 {
+		t.Fatal("README.md has no Commands section")
+	}
+	table := md[start+1:]
+	if end := strings.Index(table[1:], "\n## "); end >= 0 {
+		table = table[:end+1]
+	}
+	names := []string{"up"} // published with gitty, and run as one of its commands
+	for _, c := range commands {
+		names = append(names, c.name)
+	}
+	for _, name := range names {
+		if !strings.Contains(table, "| [`gitty "+name+"`](#") {
+			t.Errorf("the README's command table has no linked row for `gitty %s`", name)
 		}
 	}
 }
