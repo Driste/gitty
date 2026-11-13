@@ -560,7 +560,7 @@ func TestCommandLine(t *testing.T) {
 		code := run(ctx, args, strings.NewReader(""), &out, &errOut)
 		return code, out.String() + errOut.String()
 	}
-	for _, name := range []string{"GITLAB_TOKEN", envInstance, envGroup, envHub, "GITTY_BIN", "GITTY_WORKSPACE"} {
+	for _, name := range []string{"GITLAB_TOKEN", envInstance, envGroup, envHub, "GITTY_BIN", "GITTY_WORKSPACE", "GITTY_UP_LOG"} {
 		t.Setenv(name, "")
 	}
 	tests := []struct {
@@ -586,6 +586,7 @@ func TestCommandLine(t *testing.T) {
 		{[]string{"--stdio", "--hub=https://hub.example.com"}, 2, "a GitLab token is required to speak to the hub"},
 		{[]string{"--stdio", "--hub=http://hub.example.com", "--token=x"}, 2, "plain http"},
 		{[]string{"--stdio", "--hub=nonsense", "--anon"}, 2, "not the address of a hub"},
+		{[]string{"--url=https://gitlab.example.com", "--anon", "--log=" + filepath.Join(t.TempDir(), "no", "such", "dir", "up.log")}, 2, "--log: "},
 	}
 	for _, tt := range tests {
 		if code, out := run(tt.args...); code != tt.code || !strings.Contains(out, tt.want) {

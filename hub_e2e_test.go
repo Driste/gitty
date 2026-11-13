@@ -588,6 +588,17 @@ func TestE2EUpStdio(t *testing.T) {
 	if log := s.log(); strings.Contains(log, "dev-token") || !strings.Contains(log, "notes are signed @dev") {
 		t.Errorf("the log:\n%s", log)
 	}
+	// Whoever watches the server sees what the agent did, a line each.
+	for _, want := range []string{
+		" hello: e2e 0, MCP 2025-06-18\n",
+		" list: 5 tools\n",
+		` call @dev gitty_outline {"path":"acme/lib"}: `,
+		` call @dev gitty_note {"path":"acme/lib","kind":"caveat","text":"Generated types: edit the schema.","evidence":[{"file":"README.md","line":3}]}: `,
+	} {
+		if !strings.Contains(s.log(), want) {
+			t.Errorf("the log is missing %q:\n%s", want, s.log())
+		}
+	}
 	// It reads checkouts through gitty, and writes into none of them.
 	for _, p := range []string{"app", "lib", "ci-templates", "app-fork"} {
 		if dirty := gitOut(t, filepath.Join(ws, "acme", p), "status", "--porcelain"); dirty != "" {
@@ -598,7 +609,8 @@ func TestE2EUpStdio(t *testing.T) {
 	t.Log("the next session finds what the last one learned, and learns what has changed since")
 	fx.f.pushUpdate(t, fx.app, "acme/app", "src/main.txt", "changed upstream\n")
 	mustGitty(t, ws, dev, "sync", "acme", "--jobs=1")
-	s = startUpStdio(t, ws, own)
+	watched := filepath.Join(t.TempDir(), "up.log")
+	s = startUpStdio(t, ws, append([]string{"GITTY_UP_LOG=" + watched}, own...))
 	if lib := s.tool("gitty_outline", `{"path":"acme/lib"}`); !strings.Contains(lib, `- caveat #1: "Generated types: edit the schema." — @dev, today · cites README.md:3 (still stands)`) {
 		t.Errorf("the note, in the next session:\n%s", lib)
 	}
@@ -608,6 +620,12 @@ func TestE2EUpStdio(t *testing.T) {
 		t.Errorf("the new commit of acme/app:\n%s", app)
 	}
 	s.close()
+	// A host keeps a server's stderr to itself; the file named in the
+	// environment has the same lines, for `tail -f`.
+	if file := readFileT(t, watched); !strings.Contains(file, `] call @dev gitty_outline {"path":"acme/app"}: `) ||
+		!strings.Contains(file, "] read the workspace's checkouts: shared=1 skipped=3 errors=0\n") || strings.Contains(file, "dev-token") {
+		t.Errorf("the log file:\n%s", file)
+	}
 
 	t.Log("in a workspace that names a hub, it serves from that hub, as the token's owner")
 	team := startHub(t, f, "--group=acme")

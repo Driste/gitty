@@ -89,7 +89,7 @@ func (h *hub) handleInfo(w http.ResponseWriter, r *http.Request, _ *caller) {
 	writeJSON(w, http.StatusOK, info)
 }
 
-func (h *hub) handleWant(w http.ResponseWriter, r *http.Request, _ *caller) {
+func (h *hub) handleWant(w http.ResponseWriter, r *http.Request, c *caller) {
 	var req contract.HubWant
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFactsBody)).Decode(&req); err != nil {
 		apiFail(w, http.StatusBadRequest, "the body is not what /v1/want takes")
@@ -99,7 +99,9 @@ func (h *hub) handleWant(w http.ResponseWriter, r *http.Request, _ *caller) {
 		apiFail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, h.st.wants(req.Have))
+	wanted := h.st.wants(req.Have)
+	h.logf("share @%s: %s offered, %d wanted", c.Name, plural(len(req.Have), "checkout"), len(wanted.Want))
+	writeJSON(w, http.StatusOK, wanted)
 }
 
 func (h *hub) handleFacts(w http.ResponseWriter, r *http.Request, c *caller) {

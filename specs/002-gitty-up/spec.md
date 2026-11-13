@@ -319,6 +319,13 @@ group, the service's outline names all three under the right headings.
   in the user's data directory, which several sessions MUST be able to use
   at once. The handshake MUST NOT wait on the instance.
 
+- **FR-019**: The server MUST log each exchange with a client as one line
+  on stderr: the client that connected, each tool call with who made it, its
+  arguments, the size of the answer and the time taken, and each refusal
+  with its reason. `gitty` offering checkouts is a line too. `--log` MUST
+  append the same lines to a file, with the date and the process. Whatever a
+  caller wrote is flattened to its line and bounded; no token is logged.
+
 ### Key Entities
 
 - **Node**: a group or a project of the instance, by namespace path; what

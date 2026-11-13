@@ -8,7 +8,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // MCP over HTTP.
@@ -136,8 +138,23 @@ func (h *hub) handleMCP(w http.ResponseWriter, r *http.Request) {
 // body on a transport that has such a thing, and nil on one that does not
 // (stdio), where everything a request has to say about itself is in it.
 func (h *hub) answer(ctx context.Context, c *caller, body []byte, headers http.Header) (int, *rpcResponse) {
-	fail := func(status int, id json.RawMessage, code int, msg string, data any) (int, *rpcResponse) {
-		return status, &rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg, Data: data}}
+	started := time.Now()
+	req, status, resp := h.respond(ctx, c, body, headers)
+	who := ""
+	if c != nil {
+		who = c.Name
+	}
+	if line := exchangeLine(who, req, resp, time.Since(started)); line != "" {
+		h.logf("%s", line)
+	}
+	return status, resp
+}
+
+// respond is answer before anything is said about it in the log. It also
+// returns the request, as far as there was one to read.
+func (h *hub) respond(ctx context.Context, c *caller, body []byte, headers http.Header) (*rpcRequest, int, *rpcResponse) {
+	fail := func(status int, id json.RawMessage, code int, msg string, data any) (*rpcRequest, int, *rpcResponse) {
+		return nil, status, &rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg, Data: data}}
 	}
 	body = bytes.TrimSpace(body)
 	if len(body) > 0 && body[0] == '[' {
@@ -150,7 +167,7 @@ func (h *hub) answer(ctx context.Context, c *caller, body []byte, headers http.H
 	if req.Method == "" || len(req.ID) == 0 || string(req.ID) == "null" {
 		// A notification, or a response to a request this server never
 		// makes: there is nothing to answer.
-		return http.StatusAccepted, nil
+		return &req, http.StatusAccepted, nil
 	}
 
 	var params struct {
@@ -168,9 +185,131 @@ func (h *hub) answer(ctx context.Context, c *caller, body []byte, headers http.H
 		headerVersion = headers.Get("MCP-Protocol-Version")
 	}
 	if bodyVersion == "" && (headerVersion == "" || isLegacy(headerVersion)) {
-		return h.answerLegacy(ctx, c, &req)
+		status, resp := h.answerLegacy(ctx, c, &req)
+		return &req, status, resp
 	}
-	return h.answerModern(ctx, c, &req, params.Meta, headers, headerVersion, bodyVersion)
+	status, resp := h.answerModern(ctx, c, &req, params.Meta, headers, headerVersion, bodyVersion)
+	return &req, status, resp
+}
+
+// --- what the log says of an exchange ---
+
+// exchangeLine is one line about one exchange, for whoever is watching the
+// server: who asked, what, with which arguments, and what became of it. It
+// is "" for what is not worth a line — a notification, a ping.
+//
+//	hello @ana: opencode 1.19.5, MCP 2025-06-18
+//	list @ana: 5 tools
+//	call @ana gitty_outline {"path":"acme/shop/web"}: 1.8 KB in 2ms
+//	call @ana gitty_outline {"path":"nope"}: error in 1ms: There is no …
+//	refused @ana tools/call: Unknown tool: gitty_nope
+//
+// who is "" where there is one caller and no need to name them. Everything
+// a caller wrote is flattened to the line it is on and cut to a length: a
+// log is read by people, and an argument is whatever a model chose to send.
+func exchangeLine(who string, req *rpcRequest, resp *rpcResponse, took time.Duration) string {
+	if who != "" {
+		who = " @" + who
+	}
+	switch {
+	case resp == nil:
+		return ""
+	case resp.Error != nil && req == nil:
+		return "refused" + who + ": " + logText(resp.Error.Message, 200)
+	case resp.Error != nil:
+		return "refused" + who + " " + logText(req.Method, 60) + ": " + logText(resp.Error.Message, 200)
+	case req == nil:
+		return ""
+	}
+	result, _ := resp.Result.(map[string]any)
+	switch req.Method {
+	case "initialize":
+		var p struct {
+			ProtocolVersion string `json:"protocolVersion"`
+			ClientInfo      struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"clientInfo"`
+		}
+		json.Unmarshal(req.Params, &p)
+		client := strings.TrimSpace(p.ClientInfo.Name + " " + p.ClientInfo.Version)
+		if client == "" {
+			client = "a client that does not say what it is"
+		}
+		version, _ := result["protocolVersion"].(string)
+		return "hello" + who + ": " + logText(client, 80) + ", MCP " + version
+	case "server/discover":
+		return "hello" + who + ": MCP " + protoModern
+	case "tools/list":
+		n := 0
+		switch list := result["tools"].(type) {
+		case []map[string]any:
+			n = len(list)
+		case []any:
+			n = len(list)
+		}
+		return "list" + who + ": " + plural(n, "tool")
+	case "tools/call":
+		name, args, _ := callParams(req.Params)
+		text, failed := resultText(result)
+		line := "call" + who + " " + logText(name, 60) + " " + logArgs(args) + ": "
+		if failed {
+			return line + "error in " + tookText(took) + ": " + logText(text, 200)
+		}
+		return line + sizeText(len(text)) + " in " + tookText(took)
+	}
+	return ""
+}
+
+// resultText is what a tool result says, and whether it is an error. A
+// result made here and one read back from another hub's answer are shaped
+// alike and typed differently.
+func resultText(result map[string]any) (text string, failed bool) {
+	failed, _ = result["isError"].(bool)
+	var first map[string]any
+	switch content := result["content"].(type) {
+	case []map[string]any:
+		if len(content) > 0 {
+			first = content[0]
+		}
+	case []any:
+		if len(content) > 0 {
+			first, _ = content[0].(map[string]any)
+		}
+	}
+	text, _ = first["text"].(string)
+	return text, failed
+}
+
+// logText makes something a caller wrote fit for a line of the log.
+func logText(text string, max int) string {
+	return clip(oneLine(text), max)
+}
+
+// logArgs is a tool call's arguments as one short line.
+func logArgs(args json.RawMessage) string {
+	var compact bytes.Buffer
+	if json.Compact(&compact, args) != nil || compact.Len() == 0 || compact.String() == "null" {
+		return "{}"
+	}
+	return logText(compact.String(), 200)
+}
+
+func tookText(d time.Duration) string {
+	if d < time.Millisecond {
+		return "under 1ms"
+	}
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return d.Round(10 * time.Millisecond).String()
+}
+
+func sizeText(n int) string {
+	if n < 1000 {
+		return plural(n, "byte")
+	}
+	return strings.TrimSuffix(strconv.FormatFloat(float64(n)/1000, 'f', 1, 64), ".0") + " KB"
 }
 
 // answerModern answers a request of the stateless revision, after holding

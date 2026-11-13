@@ -166,6 +166,17 @@ a lock file and replayed from where each process last read, so a note
 recorded in one session is seen in the others and numbers are never given
 twice. A line torn by a crash is cut off at the next start.
 
+### The log
+
+One function, beside the protocol, turns a request and its answer into a
+line; HTTP, stdio and the bridge all call it, so the three read alike.
+Notifications and pings get no line. Arguments are logged as the JSON they
+arrived in, compacted and cut to 200 characters, which keeps a line break in
+a note from becoming a line break in the log; names and messages are
+flattened. stderr gets `15:04:05 <line>`; a file named with `--log` or
+`GITTY_UP_LOG` gets the date and the process id as well, is opened for
+append with mode 0600, and is never rotated or truncated by the server.
+
 ## Source layout
 
 ```text

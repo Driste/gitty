@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -144,7 +145,7 @@ func bridgeTo(t *testing.T, hubURL, token string) (*bridge, *syncBuffer) {
 	b, err := newBridge(hubURL, token, func(format string, a ...any) {
 		logs.mu.Lock()
 		defer logs.mu.Unlock()
-		logs.b.WriteString(strings.TrimSpace(format) + "\n")
+		fmt.Fprintf(&logs.b, format+"\n", a...)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -398,7 +399,7 @@ func (s *stdioSession) waitFor(name, args, want string) string {
 
 func isolateEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"GITLAB_TOKEN", envInstance, envGroup, envHub, "GITTY_BIN", "GITTY_WORKSPACE", "GITTY_UP_DATA"} {
+	for _, name := range []string{"GITLAB_TOKEN", envInstance, envGroup, envHub, "GITTY_BIN", "GITTY_WORKSPACE", "GITTY_UP_DATA", "GITTY_UP_LOG"} {
 		t.Setenv(name, "")
 	}
 }
@@ -470,6 +471,10 @@ func TestCommandStdioBridge(t *testing.T) {
 	if r := s.tool("gitty_note", `{"path":"acme/shop/web","kind":"usage","text":"Run make dev."}`); r.isError() {
 		t.Fatalf("recording a note: %s", r.text())
 	}
+	// Both ends say what passed: the session for whoever is watching it,
+	// and the hub with the name of who asked.
+	wantText(t, "the session's log", s.logs.String(), "call gitty_tree {}: ", `call gitty_note {"path":"acme/shop/web","kind":"usage","text":"Run make dev."}: `)
+	wantText(t, "the hub's log", h.logs.String(), "call @ben gitty_tree {}: ", "call @ben gitty_note ")
 	// The note is in the team's hub, signed by the token's owner.
 	wantText(t, "the hub's own outline", h.call(t, "tok-ana", "gitty_outline", `{"path":"acme/shop/web"}`).text(), "Run make dev.", "@ben")
 	if code := s.end(); code != 0 {

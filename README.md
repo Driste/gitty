@@ -814,6 +814,36 @@ The agent is answered from the first moment with what earlier sessions left,
 and with the fresh listing as soon as there is one. The server stops when the
 host closes its stdin.
 
+**Watching it.** Every exchange with the agent is one line of that log: the
+client that connected, each tool call with its arguments, how much came back
+and how long it took.
+
+```text
+12:01:10 hello: opencode 1.19.5, MCP 2025-11-25
+12:01:10 list: 5 tools
+12:01:14 call @ana gitty_search {"query":"build image"}: 1.1 KB in 2ms
+12:01:15 call @ana gitty_outline {"path":"acme/platform/ci/build"}: 1.8 KB in 1ms
+12:01:31 call @ana gitty_note {"path":"acme/shop/api","kind":"caveat","text":"The staging…"}: 96 bytes in 4ms
+12:01:40 call @ana gitty_outline {"path":"acme/nope"}: error in under 1ms: There is no project or group "acme/nope" here.
+```
+
+Hosts differ in what they do with a server's stderr, and opencode 1.19.5
+shows none of it. `--log` writes the same lines to a file as well, with the date and the
+process id, so that you can follow a server you did not start yourself:
+
+```jsonc
+"gitty": { "type": "local", "command": ["gitty", "up", "--stdio", "--log=/tmp/gitty-up.log"] }
+```
+
+```bash
+tail -f /tmp/gitty-up.log
+```
+
+`GITTY_UP_LOG=/tmp/gitty-up.log` in the host's environment does the same
+without touching its configuration. The file is only ever added to, and
+several sessions may share it. A token is never written to it. Arguments are
+cut to 200 characters.
+
 **gitlab.com** is not one organization's instance and cannot be listed whole.
 There a hub of your own covers the top-level group it is started in, and
 `--group` names others.
@@ -848,6 +878,11 @@ gitty up --url=https://gitlab.example.com --listen=0.0.0.0:7878
 12:00:01 gitty-up v1.0.0 for gitlab.example.com, serving MCP at http://[::]:7878/mcp
 12:00:09 listed gitlab.example.com in 7.9s: 4012 projects in 650 groups
 ```
+
+The same log follows, with a name on every line: `hello @ana`, `call @ben
+gitty_outline …`, and `share @dev: 14 checkouts offered, 2 wanted` when a
+`gitty` tells it what checkouts say. A team's hub therefore records who asked
+what. It goes to stderr, and to `--log` if you name a file.
 
 Put TLS in front of it with whatever already terminates TLS for you. Then
 each workspace names it once, and `gitty up --stdio` there serves from it:
@@ -885,6 +920,7 @@ turned away.
 | `--stdio` | `false` | Serve one agent over stdin and stdout instead of listening: for a host that starts the server itself. |
 | `--hub` | the workspace's | With `--stdio`: the team's hub to serve from. `GITTY_HUB` names one too. |
 | `--own` | `false` | With `--stdio`: be a hub of your own even where the workspace names a team's. |
+| `--log` | `GITTY_UP_LOG` | Also append the log to this file. stderr gets it either way. |
 | `--url` | the workspace's | The GitLab instance. Inside a gitty workspace it is taken from there. |
 | `--listen` | `127.0.0.1:7878` | Address to serve on, without `--stdio`. |
 | `--group` | every group the token sees | Cover only these groups. Repeatable. Required on gitlab.com, except with `--stdio` inside a group's directory. |

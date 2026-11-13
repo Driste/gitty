@@ -83,6 +83,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	refresh := fs.Duration("refresh", 30*time.Minute, "How often the instance is listed again")
 	quietDays := fs.Int("quiet-after", 365, "Days without activity after which a project is set aside as unmaintained (0: never)")
 	stdio := fs.Bool("stdio", false, "Serve one agent over stdin and stdout instead of listening on an address: for a host that starts the server itself")
+	logPath := fs.String("log", os.Getenv("GITTY_UP_LOG"), "Also append the log to this file. A host that starts the server keeps its stderr; this is how to watch it")
 	teamHub := fs.String("hub", "", "With --stdio: the address of the team's hub to serve from (default: the one the workspace's config names; with none, --stdio is a hub of its own)")
 	own := fs.Bool("own", false, "With --stdio: be a hub of its own even where the workspace names a team's")
 	showVersion := fs.Bool("version", false, "Print the version and exit")
@@ -138,11 +139,28 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		*teamHub = os.Getenv(envHub)
 	}
 
+	// The log: a line for everything the server does on its own account and
+	// for every exchange with a client. It goes to stderr, and to a file as
+	// well when one is named — with the date, since a file outlives the day,
+	// and the process, since several sessions may be writing to it.
+	var logFile *os.File
+	if *logPath != "" {
+		f, err := os.OpenFile(*logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return usage("--log: %v", err)
+		}
+		defer f.Close()
+		logFile = f
+	}
 	var logMu sync.Mutex
 	logf := func(format string, a ...any) {
+		line, now := fmt.Sprintf(format, a...), time.Now()
 		logMu.Lock()
 		defer logMu.Unlock()
-		fmt.Fprintf(stderr, time.Now().Format("15:04:05")+" "+format+"\n", a...)
+		fmt.Fprintf(stderr, "%s %s\n", now.Format("15:04:05"), line)
+		if logFile != nil {
+			fmt.Fprintf(logFile, "%s [%d] %s\n", now.Format("2006-01-02 15:04:05"), os.Getpid(), line)
+		}
 	}
 
 	// For one agent, from the team's hub: nothing is kept or listed here.
@@ -370,7 +388,7 @@ func runOwnHub(ctx context.Context, h *hub, groups []string, refresh time.Durati
 		}
 		json.Unmarshal(line, &msg)
 		if msg.Method != "tools/call" {
-			return answerAs(&caller{Name: "anonymous"})(ctx, line)
+			return answerAs(&caller{})(ctx, line) // nothing but a tool call is anyone's
 		}
 		select {
 		case <-known:

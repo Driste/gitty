@@ -57,6 +57,11 @@
       to plugins as `GITTY_HUB`.
 - [x] T155 Tests for both; a run under opencode as a `local` server.
 
+## Phase G — seeing what it does
+
+- [x] T160 A line per exchange: hello, list, call, refused, share.
+- [x] T161 `--log` and `GITTY_UP_LOG`: the same lines in a file.
+
 ## As built
 
 - The hub's GitLab calls are a handful of GETs over `net/http`; it does not
@@ -80,6 +85,8 @@
   `components`: 86 projects listed in 1.4 s, and the workspace's checkouts
   read 12 s after start; the agent is answered throughout. Not checked: a
   model session calling the tools, and a token against a real instance.
+- T161 exists because opencode 1.19.5 keeps none of a local server's
+  stderr: not on screen and not in its own log.
 - A hub of one's own covers public and internal projects only, like a
   team's. Covering the private projects its one user can see would be safe
   there and is not built.

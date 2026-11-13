@@ -300,6 +300,7 @@ func (b *bridge) answer(ctx context.Context, line []byte) []byte {
 		req.Header.Set("MCP-Protocol-Version", legacy)
 	}
 
+	started := time.Now()
 	resp, err := b.http.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -334,6 +335,15 @@ func (b *bridge) answer(ctx context.Context, line []byte) []byte {
 		answer["jsonrpc"] = json.RawMessage(`"2.0"`)
 		if resp.StatusCode == http.StatusUnauthorized {
 			b.logf("the hub at %s did not accept the token in GITLAB_TOKEN", b.hub)
+		}
+	}
+	// The same line the hub writes in its own log, here for whoever is
+	// watching this session.
+	var asked rpcRequest
+	var said rpcResponse
+	if json.Unmarshal(line, &asked) == nil && json.Unmarshal(body, &said) == nil {
+		if l := exchangeLine("", &asked, &said, time.Since(started)); l != "" {
+			b.logf("%s", l)
 		}
 	}
 	if msg.Method == "initialize" {
