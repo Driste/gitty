@@ -53,8 +53,12 @@ go mod tidy
 # Build the executable
 go build -o gitty .
 
+# (Optional) gitty-up, the shared context service that `gitty up` runs.
+# It is a second binary and goes next to gitty.
+go build -o gitty-up ./cmd/gitty-up
+
 # (Optional) Install globally
-sudo mv gitty /usr/local/bin/
+sudo mv gitty gitty-up /usr/local/bin/
 ```
 
 A binary built this way reports `dev` plus the commit it was built from
@@ -746,7 +750,10 @@ the instruction to open the cited file before relying on one.
 ### Running it
 
 `gitty-up` is a second binary, published with every release beside `gitty`.
-Put it next to `gitty` or anywhere on `PATH`, and `gitty up` runs it.
+Put it next to `gitty` or anywhere on `PATH`, and `gitty up` runs it. From
+source it is `go build -o gitty-up ./cmd/gitty-up`. It must be built for the
+machine it runs on: a `gitty-up` for another operating system or processor
+is reported as one that cannot be run here, with the command that builds it.
 
 ```bash
 export GITLAB_TOKEN="glpat-..."        # what the hub lists the instance with

@@ -8,8 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // Plugins.
@@ -240,10 +242,28 @@ func runPluginCommand(errOut io.Writer, name string, args []string) int {
 	}
 	code, err := execPlugin(pluginPath, append([]string{pluginPath}, args...), env)
 	if err != nil {
-		fmt.Fprintf(errOut, "Error: running %s: %v\n", pluginPath, err)
+		reportPluginWontRun(errOut, name, pluginPath, err)
 		return 2
 	}
 	return code
+}
+
+// reportPluginWontRun says why a plugin that was found could not be started.
+// The commonest reason deserves more than the system's two words for it: a
+// file that this machine cannot execute at all, which is nearly always a
+// binary built for another operating system or processor — one downloaded
+// for the wrong platform, or left over from a build somewhere else.
+func reportPluginWontRun(errOut io.Writer, name, pluginPath string, err error) {
+	if !errors.Is(err, syscall.ENOEXEC) {
+		fmt.Fprintf(errOut, "Error: running %s: %v\n", pluginPath, err)
+		return
+	}
+	bin := "gitty-" + name
+	fmt.Fprintf(errOut, "Error: %s cannot be run on this machine (%v).\n", pluginPath, err)
+	fmt.Fprintf(errOut, "It was built for another operating system or processor than this one (%s/%s), or is a script with no #! line.\n", runtime.GOOS, runtime.GOARCH)
+	if _, known := knownPlugins[name]; known {
+		fmt.Fprintf(errOut, "Replace it with the %s for this platform from %s,\nor build it here from gitty's source:\n\n    go build -o %s ./cmd/%s\n", bin, releasesURL, pluginPath, bin)
+	}
 }
 
 // reportUnknownCommand says that a command is neither built in nor provided

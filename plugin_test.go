@@ -460,6 +460,44 @@ exit 3`)
 		}
 	})
 
+	t.Run("a plugin this machine cannot run says so, and what to do", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows reports a foreign binary in its own way")
+		}
+		// What a binary built for another system looks like to this one:
+		// executable by its mode, and nothing the kernel can start.
+		foreign := filepath.Join(root, "foreign")
+		for _, name := range []string{"gitty-up", "gitty-other"} {
+			if err := os.MkdirAll(foreign, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(foreign, name), []byte("\x7fELF\x02\x01\x01not for this machine"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		env := []string{"PATH=" + foreign}
+		stdout, stderr, code := runGittyAt(t, gittyBin, root, "", env, "up")
+		if code != 2 || stdout != "" {
+			t.Errorf("exit = %d, stdout = %q; want 2 and nothing on stdout", code, stdout)
+		}
+		for _, want := range []string{
+			filepath.Join(foreign, "gitty-up") + " cannot be run on this machine",
+			"built for another operating system or processor than this one (" + runtime.GOOS + "/" + runtime.GOARCH + ")",
+			"go build -o " + filepath.Join(foreign, "gitty-up") + " ./cmd/gitty-up",
+			releasesURL,
+		} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("stderr missing %q:\n%s", want, stderr)
+			}
+		}
+		// A plugin gitty knows nothing about gets the explanation without
+		// build instructions it could not vouch for.
+		_, stderr, code = runGittyAt(t, gittyBin, root, "", env, "other")
+		if code != 2 || !strings.Contains(stderr, "cannot be run on this machine") || strings.Contains(stderr, "go build") {
+			t.Errorf("an unknown plugin that cannot run: exit %d\n%s", code, stderr)
+		}
+	})
+
 	t.Run("up without its plugin says how to get it", func(t *testing.T) {
 		stdout, stderr, code := runGittyAt(t, gittyBin, root, "", withPath, "up")
 		if code != 2 || stdout != "" {
