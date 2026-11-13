@@ -672,9 +672,12 @@ project will add jobs to its pipeline, which repository deploys the service
 it is changing. That knowledge is spread over other projects' files and over
 what the people, and lately the agents, working there have had to find out.
 
-**gitty-up** is where it is kept: one small service per instance that agents
-reach over the [Model Context Protocol](https://modelcontextprotocol.io). It
-holds three kinds of knowledge, and always says which is which:
+**gitty-up** is where it is kept, and agents reach it over the
+[Model Context Protocol](https://modelcontextprotocol.io). An agent's host
+starts it with one command, `gitty up --stdio`, the way it starts any local
+MCP server. A team can also run one for the whole instance, so that what one
+person's agent learns is there for everyone's. It holds three kinds of
+knowledge, and always says which is which:
 
 | From | What | How it gets there |
 | :--- | :--- | :--- |
@@ -747,74 +750,18 @@ only see it, who is told to leave a caveat instead. Notes are bounded in
 length and are always presented to the next agent as attributed remarks, with
 the instruction to open the cited file before relying on one.
 
-### Running it
-
-`gitty-up` is a second binary, published with every release beside `gitty`.
-Put it next to `gitty` or anywhere on `PATH`, and `gitty up` runs it. From
-source it is `go build -o gitty-up ./cmd/gitty-up`. It must be built for the
-machine it runs on: a `gitty-up` for another operating system or processor
-is reported as one that cannot be run here, with the command that builds it.
-
-```bash
-export GITLAB_TOKEN="glpat-..."        # what the hub lists the instance with
-gitty up --url=https://gitlab.example.com --listen=0.0.0.0:7878
-```
-
-```text
-12:00:01 gitty-up v1.0.0 for gitlab.example.com, serving MCP at http://[::]:7878/mcp
-12:00:09 listed gitlab.example.com in 7.9s: 4012 projects in 650 groups
-```
-
-Put TLS in front of it with whatever already terminates TLS for you.
-
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `--url` | the workspace's | The GitLab instance. Inside a gitty workspace it is taken from there. |
-| `--listen` | `127.0.0.1:7878` | Address to serve on. |
-| `--group` | every group the token sees | Cover only these groups. Repeatable. |
-| `--token` | `GITLAB_TOKEN` | Token the hub lists the instance with. `--anon` lists what is public without one. |
-| `--data` | per instance, in your data directory | Where the hub keeps what it knows: plain files, one directory. |
-| `--refresh` | `30m` | How often the instance is listed again. |
-| `--quiet-after` | `365` | Days without activity after which a project is set aside. `0` for never. |
-| `--no-auth` | `false` | Ask callers for no token. Only allowed on a loopback address: a hub for one person's machine. |
-| `--allow-origin` | | A web origin allowed to call the hub from a browser. Repeatable. |
-
-**What it covers.** Only projects and groups whose visibility is public or
-internal. Nothing the hub says can tell a user of the instance something they
-could not have browsed to. Private projects are not held at all.
-
-**Who may call it.** Every request carries a token of the instance as a
-bearer token. The hub asks the instance whose it is, remembers the answer for
-five minutes under a hash of the token, and does not keep the token. Notes
-are signed with that name. To record a note the caller must be able to see
-the project, which the hub asks the instance with the caller's own token.
-
-**What it stores.** `tree.json` (the listing), `facts/<id>.json` (one
-project's repository as gitty read it) and `notes.jsonl` (every note ever
-recorded, never rewritten). No token is in any of them. The tree and the
-facts can be rebuilt; the notes are what a backup is for.
-
 ### Connecting an agent
 
-The hub speaks MCP over HTTP at `/mcp`: the stateless revision of 2026-07-28,
-and the 2025 handshake for hosts that have not moved. A host needs the URL
-and a token of the instance in the `Authorization` header. Most take them in
-a shape like this:
+Tell the host to start `gitty up --stdio`. It is a local command, like any
+other MCP server a host runs itself. Most hosts take it in a shape like this:
 
 ```json
 {
   "mcpServers": {
-    "gitty": {
-      "type": "http",
-      "url": "https://gitty.example.com/mcp",
-      "headers": { "Authorization": "Bearer glpat-..." }
-    }
+    "gitty": { "command": "gitty", "args": ["up", "--stdio"] }
   }
 }
 ```
-
-The hub describes projects and does not hold them. An agent that wants one on
-disk runs `gitty fetch <path>` in a gitty workspace.
 
 **opencode.** In `opencode.jsonc` in the project, or in
 `~/.config/opencode/opencode.json` for every project:
@@ -824,29 +771,55 @@ disk runs `gitty fetch <path>` in a gitty workspace.
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "servers": {
-      "gitty": {
-        "type": "remote",
-        "url": "https://gitty.example.com/mcp",
-        "oauth": false,
-        "headers": { "Authorization": "Bearer {env:GITLAB_TOKEN}" }
-      }
+      "gitty": { "type": "local", "command": ["gitty", "up", "--stdio"] }
     }
   }
 }
 ```
 
-`"oauth": false` matters: the hub takes a GitLab token in a header, and
-without it opencode tries to sign in with OAuth instead. `{env:GITLAB_TOKEN}`
-is read from the environment opencode is started in. `opencode mcp list`
-should then show `gitty connected`; `failed … (401)` means the token is
-missing from that environment or the instance does not accept it, and the
-hub's own log says which caller it turned away. Tested with opencode 1.19.5
-in each of its protocol modes (`"protocol": "legacy"`, the default, `"auto"`
-and `"2026-07-28"`).
+That is all of it. `opencode mcp list` should show `gitty connected`. Tested
+with opencode 1.19.5.
 
-The `gitty` command needs no configuration, only to be on `PATH`: an agent
-runs it in its shell. What it needs is to be told when, which is what
-`AGENTS.md` is for:
+It needs three things, none of them in the host's configuration:
+
+- **`gitty` and `gitty-up` on `PATH`.** `gitty-up` is a second binary,
+  published with every release beside `gitty`. From source it is
+  `go build -o gitty-up ./cmd/gitty-up`. It must be built for the machine it
+  runs on: one for another operating system or processor is reported as
+  such, with the command that builds it.
+- **To be started inside a gitty workspace**, which is where a host starts
+  it when you open a project there. That is how it knows the instance.
+  Anywhere else, add `--url=https://gitlab.example.com` to the command.
+- **`GITLAB_TOKEN` in the environment** the host runs in, the same token
+  `gitty` uses. `--anon` does without one and sees what is public.
+
+What it serves from depends on the workspace:
+
+| The workspace's config | `gitty up --stdio` is |
+| :--- | :--- |
+| names no hub | **A hub of your own.** It lists the instance, has `gitty` tell it what your workspace's checkouts say, and keeps your agents' notes in your data directory. Every session you start, in any project of that instance, shares them. |
+| has `hub = 'https://gitty.example.com'` | **A line to the team's hub.** Every question goes there with your token, so you see what everyone's agents have learned and your notes are signed with your name. Nothing is kept on your machine. |
+
+stdout carries the protocol and nothing else. What the server has to say for
+itself goes to stderr, where the host keeps its logs:
+
+```text
+12:00:01 gitty-up v1.0.0 for gitlab.example.com, serving over stdio from a hub of your own
+12:00:01 notes are signed @ana
+12:00:04 listed gitlab.example.com in 2.9s: 4012 projects in 650 groups
+12:00:05 read the workspace's checkouts: shared=14 skipped=2 errors=0
+```
+
+The agent is answered from the first moment with what earlier sessions left,
+and with the fresh listing as soon as there is one. The server stops when the
+host closes its stdin.
+
+**gitlab.com** is not one organization's instance and cannot be listed whole.
+There a hub of your own covers the top-level group it is started in, and
+`--group` names others.
+
+The `gitty` command needs no configuration either: an agent runs it in its
+shell. What it needs is to be told when, which is what `AGENTS.md` is for:
 
 ```markdown
 ## Other projects in our GitLab
@@ -861,17 +834,96 @@ runs it in its shell. What it needs is to be told when, which is what
   record it with the server's note tool, citing the file that shows it.
 ```
 
-### Sharing what checkouts say (`gitty share`)
+### A hub for a team
 
-A workspace names its hub once:
+Without `--stdio`, `gitty up` is a service: one for the instance, left
+running, that everyone's agents share.
+
+```bash
+export GITLAB_TOKEN="glpat-..."        # what the hub lists the instance with
+gitty up --url=https://gitlab.example.com --listen=0.0.0.0:7878
+```
+
+```text
+12:00:01 gitty-up v1.0.0 for gitlab.example.com, serving MCP at http://[::]:7878/mcp
+12:00:09 listed gitlab.example.com in 7.9s: 4012 projects in 650 groups
+```
+
+Put TLS in front of it with whatever already terminates TLS for you. Then
+each workspace names it once, and `gitty up --stdio` there serves from it:
 
 ```bash
 gitty init --hub=https://gitty.example.com      # or add  hub = '...'  to .gitty/config
 ```
 
-From then on, every `gitty sync` and `gitty fetch` tells the hub what the
-checkouts say on its way out, in one line on stderr. Nothing that goes wrong
-there changes what the sync reports, and `--no-share` turns it off.
+A host that cannot start a command can reach the hub by its address instead.
+It speaks MCP over HTTP at `/mcp`: the stateless revision of 2026-07-28, and
+the 2025 handshake for hosts that have not moved. The host needs the URL and
+a token of the instance in the `Authorization` header:
+
+```json
+{
+  "mcpServers": {
+    "gitty": {
+      "type": "http",
+      "url": "https://gitty.example.com/mcp",
+      "headers": { "Authorization": "Bearer glpat-..." }
+    }
+  }
+}
+```
+
+In opencode that is `"type": "remote"` with `"url"`, the same `"headers"`
+(`"Bearer {env:GITLAB_TOKEN}"` reads the token from the environment) and
+`"oauth": false`, without which opencode tries to sign in with OAuth instead.
+`failed … (401)` in `opencode mcp list` means the token is missing or the
+instance does not accept it, and the hub's own log says which caller it
+turned away.
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--stdio` | `false` | Serve one agent over stdin and stdout instead of listening: for a host that starts the server itself. |
+| `--hub` | the workspace's | With `--stdio`: the team's hub to serve from. `GITTY_HUB` names one too. |
+| `--own` | `false` | With `--stdio`: be a hub of your own even where the workspace names a team's. |
+| `--url` | the workspace's | The GitLab instance. Inside a gitty workspace it is taken from there. |
+| `--listen` | `127.0.0.1:7878` | Address to serve on, without `--stdio`. |
+| `--group` | every group the token sees | Cover only these groups. Repeatable. Required on gitlab.com, except with `--stdio` inside a group's directory. |
+| `--token` | `GITLAB_TOKEN` | Token the hub lists the instance with. `--anon` lists what is public without one. |
+| `--data` | per instance, in your data directory | Where the hub keeps what it knows: plain files, one directory. `GITTY_UP_DATA` names it too. |
+| `--refresh` | `30m` | How often the instance is listed again. |
+| `--quiet-after` | `365` | Days without activity after which a project is set aside. `0` for never. |
+| `--no-auth` | `false` | Ask callers for no token. Only allowed on a loopback address: a hub for one person's machine. |
+| `--allow-origin` | | A web origin allowed to call the hub from a browser. Repeatable. |
+
+**What it covers.** Only projects and groups whose visibility is public or
+internal. Nothing the hub says can tell a user of the instance something they
+could not have browsed to. Private projects are not held at all.
+
+**Who may call it.** Every request to a team's hub carries a token of the
+instance as a bearer token. The hub asks the instance whose it is, remembers
+the answer for five minutes under a hash of the token, and does not keep the
+token. Notes are signed with that name. To record a note the caller must be
+able to see the project, which the hub asks the instance with the caller's
+own token. A hub of your own has one caller, you: it asks the instance your
+name once, to sign your notes with.
+
+**What it stores.** `tree.json` (the listing), `facts/<id>.json` (one
+project's repository as gitty read it) and `notes.jsonl` (every note ever
+recorded, never rewritten). No token is in any of them. The tree and the
+facts can be rebuilt; the notes are what a backup is for. Several sessions of
+your own may use one directory at once.
+
+The hub describes projects and does not hold them. An agent that wants one on
+disk runs `gitty fetch <path>` in a gitty workspace.
+
+### Sharing what checkouts say (`gitty share`)
+
+A workspace that names a team's hub tells it what its checkouts say. Every
+`gitty sync` and `gitty fetch` does so on its way out, in one line on stderr.
+Nothing that goes wrong there changes what the sync reports, and `--no-share`
+turns it off. A hub of your own needs none of this: it asks `gitty` itself
+when it starts.
+
 `gitty share` is the same step on its own, with every checkout accounted for:
 
 ```text
@@ -1026,7 +1078,7 @@ gitty's releases publish one plugin, [`gitty-up`](#the-instances-shared-context-
 The plugin starts in the directory you ran `gitty` in, with your stdin,
 stdout, stderr and environment; its exit code is the command's. On Linux and
 macOS gitty replaces itself with the plugin, so there is no process in
-between. gitty adds four environment variables, from the same workspace
+between. gitty adds five environment variables, from the same workspace
 discovery every command uses:
 
 | Variable | Value |
@@ -1035,6 +1087,7 @@ discovery every command uses:
 | `GITTY_WORKSPACE` | The workspace's root directory: the outermost one holding a `.gitty/config` for this workspace. Empty outside a workspace. |
 | `GITTY_GROUP` | Full namespace path of the group the working directory is in (inside a checkout: the group holding the project). Empty at the root of a workspace anchored at the instance's top level, and outside a workspace. |
 | `GITTY_INSTANCE` | The instance URL from the workspace config. Empty outside a workspace. |
+| `GITTY_HUB` | The hub the workspace's config names. If you set `GITTY_HUB` yourself, yours is passed on instead. Empty when there is none. |
 
 **No token is passed.** A plugin that needs the API runs `gitty`, which
 resolves credentials the way it always does (`--token`, `GITLAB_TOKEN`,

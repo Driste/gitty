@@ -91,8 +91,15 @@ type store struct {
 	facts  map[int64]*contract.Facts // by project id
 	usedBy map[int64][]use           // by target project id; rebuilt when facts or the tree change
 
-	book      *notebook
-	notesFile *os.File
+	book *notebook
+	// notesRead is how much of the notes log has been replayed. The log is
+	// only ever appended to, so everything past it is news — written by
+	// this process or by another one working from the same directory.
+	notesRead int64
+	// several is set when other processes may be using this directory at
+	// the same time: one person's machine, a server per agent session.
+	several   bool
+	factsSeen time.Time
 }
 
 func openStore(dir, instance string) (*store, error) {
@@ -114,11 +121,7 @@ func openStore(dir, instance string) (*store, error) {
 	return s, nil
 }
 
-func (s *store) close() {
-	if s.notesFile != nil {
-		s.notesFile.Close()
-	}
-}
+func (s *store) close() {}
 
 // writeFileAtomic writes a file so that a reader sees the old one or the
 // new one, never half of either.
@@ -435,58 +438,160 @@ func (s *store) rebuildUses() {
 
 // --- notes ---
 
+func (s *store) notesPath() string { return filepath.Join(s.dir, "notes.jsonl") }
+
 func (s *store) loadNotes() error {
-	path := filepath.Join(s.dir, "notes.jsonl")
-	data, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	lines := strings.Split(string(data), "\n")
-	for i, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var n note
-		if err := json.Unmarshal([]byte(line), &n); err != nil {
-			// A line cut short by a crash is the last one, and is let go;
-			// anything else is damage worth stopping for, since notes are
-			// the one thing here that cannot be rebuilt.
-			if i == len(lines)-1 {
-				break
-			}
-			return fmt.Errorf("%s line %d is damaged (%w)", path, i+1, err)
-		}
-		if n.V == notesVersion {
-			s.book.apply(&n)
-		}
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	unlock, err := s.lockNotes()
 	if err != nil {
 		return err
 	}
-	s.notesFile = f
-	if len(data) > 0 && data[len(data)-1] != '\n' {
-		if _, err := f.Write([]byte("\n")); err != nil {
-			return err
+	defer unlock()
+	return s.catchUp(true)
+}
+
+// catchUp replays what has been appended to the notes log since it was last
+// read. At start that is all of it. Later it is whatever another process on
+// the same directory has recorded in the meantime: the log is the one place
+// notes live, and every process reading it in order arrives at the same
+// state.
+//
+// A last line with no end is a write cut short. With mend, at start and
+// under the lock, it is cut off, so that the log stays one note a line; at
+// any other time it is left alone, since its writer may not have finished.
+// Callers hold the store's write lock.
+func (s *store) catchUp(mend bool) error {
+	path := s.notesPath()
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < s.notesRead {
+		// Shorter than what was read: not the log this process knew.
+		s.book, s.notesRead = newNotebook(), 0
+	}
+	if info.Size() == s.notesRead {
+		return nil
+	}
+	data := make([]byte, info.Size()-s.notesRead)
+	if _, err := f.ReadAt(data, s.notesRead); err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	for len(data) > 0 {
+		end := strings.IndexByte(string(data), '\n')
+		if end < 0 {
+			if mend {
+				return os.Truncate(path, s.notesRead)
+			}
+			return nil
 		}
+		line := strings.TrimSpace(string(data[:end]))
+		if line != "" {
+			var n note
+			if err := json.Unmarshal([]byte(line), &n); err != nil {
+				// Notes are the one thing here that cannot be rebuilt, so
+				// a line that is whole and still not a note stops the hub
+				// rather than being read past.
+				return fmt.Errorf("%s is damaged at byte %d (%w)", path, s.notesRead, err)
+			}
+			if n.V == notesVersion {
+				s.book.apply(&n)
+			}
+		}
+		s.notesRead += int64(end) + 1
+		data = data[end+1:]
 	}
 	return nil
 }
 
-// appendNote makes a note durable, then current. Callers hold the write lock.
-func (s *store) appendNote(n *note) error {
+// lockNotes takes the lock on the notes log, so that two processes on one
+// directory record one after the other and number their notes apart. It is
+// a file that exists while the lock is held: the one kind of lock every
+// platform has. One left behind by a process that died is taken over.
+func (s *store) lockNotes() (unlock func(), err error) {
+	path := filepath.Join(s.dir, "notes.lock")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			f.Close()
+			return func() { os.Remove(path) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > 30*time.Second {
+			os.Remove(path)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("the notes log in %s is locked by another gitty-up and stayed so", s.dir)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+// record makes a note durable, then current. make is given the notebook as
+// it stands once everything recorded so far, by anyone, has been read, and
+// returns the note to add. Callers hold the store's write lock.
+func (s *store) record(make func(*notebook) (*note, error)) (*note, error) {
+	unlock, err := s.lockNotes()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := s.catchUp(false); err != nil {
+		return nil, err
+	}
+	n, err := make(s.book)
+	if err != nil {
+		return nil, err
+	}
 	data, err := json.Marshal(n)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if _, err := s.notesFile.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("recording the note: %w", err)
+	f, err := os.OpenFile(s.notesPath(), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("recording the note: %w", err)
 	}
-	if err := s.notesFile.Sync(); err != nil {
-		return fmt.Errorf("recording the note: %w", err)
+	_, werr := f.Write(append(data, '\n'))
+	if werr == nil {
+		werr = f.Sync()
 	}
-	s.book.apply(n)
-	return nil
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return nil, fmt.Errorf("recording the note: %w", werr)
+	}
+	return n, s.catchUp(false)
+}
+
+// seeOthers brings in what other processes on the same directory have
+// written since this one last looked: notes, and facts their gitty sent
+// them. It does nothing for a hub that has its directory to itself.
+func (s *store) seeOthers() {
+	if !s.several {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.catchUp(false)
+	if info, err := os.Stat(filepath.Join(s.dir, "facts")); err == nil && !info.ModTime().Equal(s.factsSeen) {
+		s.factsSeen = info.ModTime()
+		s.facts = map[int64]*contract.Facts{}
+		if s.loadFacts() == nil {
+			s.rebuildUses()
+		}
+	}
 }
 
 // --- listing ---

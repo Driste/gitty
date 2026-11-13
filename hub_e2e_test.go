@@ -418,3 +418,245 @@ func TestE2EGittyUpIsAPlugin(t *testing.T) {
 		t.Errorf("gitty up without the plugin: exit %d\n%s", code, stderr)
 	}
 }
+
+// --- gitty up --stdio: the server an agent's host starts itself ---
+
+// upSession is a `gitty up --stdio` started the way a host starts it: a
+// command, a working directory, an environment, and its stdin and stdout.
+type upSession struct {
+	t      *testing.T
+	cmd    *exec.Cmd
+	in     io.WriteCloser
+	out    *bufio.Reader
+	mu     sync.Mutex
+	stderr strings.Builder
+	lines  []string // every line stdout carried
+	next   int
+	exited chan struct{}
+}
+
+func startUpStdio(t *testing.T, dir string, env []string, args ...string) *upSession {
+	t.Helper()
+	publishFixtures()
+	cmd := exec.Command(gittyWithUp(t), append([]string{"up", "--stdio"}, args...)...)
+	cmd.Dir = dir
+	cmd.Env = gittyEnv(env)
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	s := &upSession{t: t, cmd: cmd, in: in, out: bufio.NewReaderSize(out, 1<<20), exited: make(chan struct{})}
+	logged := make(chan struct{})
+	go func() {
+		defer close(logged)
+		sc := bufio.NewScanner(errPipe)
+		for sc.Scan() {
+			s.mu.Lock()
+			s.stderr.WriteString(sc.Text() + "\n")
+			s.mu.Unlock()
+		}
+	}()
+	go func() {
+		<-logged
+		cmd.Wait()
+		close(s.exited)
+	}()
+	t.Cleanup(func() { s.close() })
+	return s
+}
+
+func (s *upSession) log() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stderr.String()
+}
+
+// waitLog waits until the server has said something on stderr.
+func (s *upSession) waitLog(want string) {
+	s.t.Helper()
+	for deadline := time.Now().Add(30 * time.Second); !strings.Contains(s.log(), want); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			s.t.Fatalf("gitty up --stdio never logged %q:\n%s", want, s.log())
+		}
+	}
+}
+
+// send writes one message and returns the one line that answers it.
+func (s *upSession) send(method, params string) map[string]json.RawMessage {
+	s.t.Helper()
+	s.next++
+	msg := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":%q,"params":%s}`, s.next, method, params)
+	if _, err := io.WriteString(s.in, msg+"\n"); err != nil {
+		s.t.Fatalf("writing to gitty up --stdio: %v\n%s", err, s.log())
+	}
+	line, err := s.out.ReadString('\n')
+	if err != nil {
+		s.t.Fatalf("reading from gitty up --stdio: %v\n%s", err, s.log())
+	}
+	s.lines = append(s.lines, line)
+	var answer map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(line), &answer); err != nil || string(answer["id"]) != fmt.Sprint(s.next) {
+		s.t.Fatalf("stdout carried something that is not the answer to request %d: %q\n%s", s.next, line, s.log())
+	}
+	return answer
+}
+
+// tool calls a tool and returns its text.
+func (s *upSession) tool(name, args string) string {
+	s.t.Helper()
+	answer := s.send("tools/call", fmt.Sprintf(`{"name":%q,"arguments":%s}`, name, args))
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(answer["result"], &result); err != nil || len(result.Content) == 0 {
+		s.t.Fatalf("%s %s: %s\n%s", name, args, s.lines[len(s.lines)-1], s.log())
+	}
+	return result.Content[0].Text
+}
+
+// close ends the session the way a host does — it closes the server's
+// stdin — and returns the exit code.
+func (s *upSession) close() int {
+	s.in.Close()
+	select {
+	case <-s.exited:
+	case <-time.After(15 * time.Second):
+		s.cmd.Process.Kill()
+		<-s.exited
+		s.t.Errorf("gitty up --stdio did not exit when its stdin closed:\n%s", s.log())
+	}
+	return s.cmd.ProcessState.ExitCode()
+}
+
+// TestE2EUpStdio: one line in a host's configuration — `gitty up --stdio` —
+// and an agent has the instance's context, with nothing deployed.
+func TestE2EUpStdio(t *testing.T) {
+	skipIfShort(t)
+	fx := newLinkedFixture(t)
+	f := fx.f
+	openToAll(f)
+	delete(f.shared, "acme")
+	f.authUser = "dev"
+	f.topLevel = []apiGroup{f.groups["acme"]}
+	dev := []string{"GITLAB_TOKEN=dev-token"}
+
+	ws := initWorkspace(t, f)
+	mustGitty(t, ws, dev, "sync", "acme", "--jobs=1")
+	data := t.TempDir()
+	own := append([]string{"GITTY_UP_DATA=" + data}, dev...)
+
+	t.Log("in a workspace that names no hub, it is a hub of its own: it lists the instance and reads the workspace's checkouts")
+	// Started where a host starts it: in the project being worked on.
+	s := startUpStdio(t, filepath.Join(ws, "acme", "app", "src"), own)
+	init := s.send("initialize", `{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}`)
+	if !strings.Contains(string(init["result"]), `"name":"gitty-up"`) {
+		t.Fatalf("initialize: %s", init["result"])
+	}
+	if list := s.send("tools/list", `{}`); !strings.Contains(string(list["result"]), `"gitty_outline"`) {
+		t.Errorf("tools/list: %s", list["result"])
+	}
+	s.waitLog("read the workspace's checkouts: shared=4 skipped=0 errors=0")
+	lib := s.tool("gitty_outline", `{"path":"acme/lib"}`)
+	for _, want := range []string{
+		"Shared domain types.  [its README, at ",
+		"## Used by (1): each is a place to see how\n- acme/app · depends (package.json:4)",
+		"Its repository was read at ",
+	} {
+		if !strings.Contains(lib, want) {
+			t.Errorf("outline of acme/lib is missing %q:\n%s", want, lib)
+		}
+	}
+	if said := s.tool("gitty_note", `{"path":"acme/lib","kind":"caveat","text":"Generated types: edit the schema.","evidence":[{"file":"README.md","line":3}]}`); !strings.Contains(said, "Recorded as #1 on acme/lib (caveat).") {
+		t.Errorf("gitty_note:\n%s", said)
+	}
+	if code := s.close(); code != 0 {
+		t.Errorf("exit %d\n%s", code, s.log())
+	}
+	if log := s.log(); strings.Contains(log, "dev-token") || !strings.Contains(log, "notes are signed @dev") {
+		t.Errorf("the log:\n%s", log)
+	}
+	// It reads checkouts through gitty, and writes into none of them.
+	for _, p := range []string{"app", "lib", "ci-templates", "app-fork"} {
+		if dirty := gitOut(t, filepath.Join(ws, "acme", p), "status", "--porcelain"); dirty != "" {
+			t.Errorf("acme/%s was written to:\n%s", p, dirty)
+		}
+	}
+
+	t.Log("the next session finds what the last one learned, and learns what has changed since")
+	fx.f.pushUpdate(t, fx.app, "acme/app", "src/main.txt", "changed upstream\n")
+	mustGitty(t, ws, dev, "sync", "acme", "--jobs=1")
+	s = startUpStdio(t, ws, own)
+	if lib := s.tool("gitty_outline", `{"path":"acme/lib"}`); !strings.Contains(lib, `- caveat #1: "Generated types: edit the schema." — @dev, today · cites README.md:3 (still stands)`) {
+		t.Errorf("the note, in the next session:\n%s", lib)
+	}
+	s.waitLog("read the workspace's checkouts: shared=1 skipped=3 errors=0")
+	head := gitOut(t, filepath.Join(ws, "acme", "app"), "rev-parse", "HEAD")[:9]
+	if app := s.tool("gitty_outline", `{"path":"acme/app"}`); !strings.Contains(app, "Its repository was read at "+head) {
+		t.Errorf("the new commit of acme/app:\n%s", app)
+	}
+	s.close()
+
+	t.Log("in a workspace that names a hub, it serves from that hub, as the token's owner")
+	team := startHub(t, f, "--group=acme")
+	ws2 := t.TempDir()
+	mustGitty(t, ws2, dev, "init", "--http", "--url="+f.srv.URL, "--hub="+team.url)
+	s = startUpStdio(t, ws2, own)
+	s.waitLog("bridging to gitty-up dev at " + team.url)
+	// The team's hub has been told nothing yet, and what the other
+	// workspace's own hub learned stays in it.
+	if lib := s.tool("gitty_outline", `{"path":"acme/lib"}`); strings.Contains(lib, "Generated types") || !strings.Contains(lib, "Its repository has not been read") {
+		t.Errorf("outline from the team's hub:\n%s", lib)
+	}
+	if said := s.tool("gitty_note", `{"path":"acme/lib","kind":"usage","text":"Import the v2 package."}`); !strings.Contains(said, "Recorded as #1 on acme/lib (usage).") {
+		t.Errorf("gitty_note through the bridge:\n%s", said)
+	}
+	if lib := team.tool("dev-token", "gitty_outline", `{"path":"acme/lib"}`); !strings.Contains(lib, `"Import the v2 package." — @dev`) {
+		t.Errorf("the note, in the team's hub:\n%s", lib)
+	}
+	if code := s.close(); code != 0 {
+		t.Errorf("exit %d\n%s", code, s.log())
+	}
+
+	t.Log("--own keeps to itself even there")
+	s = startUpStdio(t, ws2, own, "--own")
+	s.waitLog("listed ")
+	if lib := s.tool("gitty_outline", `{"path":"acme/lib"}`); !strings.Contains(lib, "Generated types: edit the schema.") {
+		t.Errorf("outline from the hub of one's own:\n%s", lib)
+	}
+	s.close()
+
+	t.Log("what is wrong is said on stderr, and stdout stays the protocol's")
+	for name, c := range map[string]struct {
+		dir  string
+		env  []string
+		args []string
+		want string
+	}{
+		"no token":            {ws, nil, nil, "a token to list the instance with is required"},
+		"no token for a hub":  {ws2, nil, nil, "a GitLab token is required to speak to the hub"},
+		"outside a workspace": {t.TempDir(), dev, nil, "Start this server inside a gitty workspace"},
+	} {
+		cmd := exec.Command(gittyWithUp(t), append([]string{"up", "--stdio"}, c.args...)...)
+		cmd.Dir = c.dir
+		cmd.Env = gittyEnv(c.env)
+		var stdout, stderr strings.Builder
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		cmd.Run()
+		if code := cmd.ProcessState.ExitCode(); code != 2 || !strings.Contains(stderr.String(), c.want) || stdout.Len() != 0 {
+			t.Errorf("%s: exit %d, stdout %q\n%s", name, code, stdout.String(), stderr.String())
+		}
+	}
+}

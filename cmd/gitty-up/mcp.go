@@ -96,7 +96,7 @@ func serverInfo() map[string]any {
 	return map[string]any{"name": serverName, "title": "gitty-up", "version": version}
 }
 
-// handleMCP is the MCP endpoint.
+// handleMCP is the MCP endpoint over HTTP.
 func (h *hub) handleMCP(w http.ResponseWriter, r *http.Request) {
 	// Who is asking comes first, whatever they ask. A client that is turned
 	// away tries other ways in — an older transport opens with a GET — and
@@ -121,21 +121,36 @@ func (h *hub) handleMCP(w http.ResponseWriter, r *http.Request) {
 		writeRPCError(w, http.StatusRequestEntityTooLarge, nil, codeInvalidRequest, "the request is larger than this server reads", nil)
 		return
 	}
+	status, resp := h.answer(r.Context(), c, body, r.Header)
+	if resp == nil {
+		w.WriteHeader(status)
+		return
+	}
+	writeJSON(w, status, resp)
+}
+
+// answer handles one JSON-RPC message from a known caller and returns what
+// to say back, with the HTTP status it would travel under; nil means there
+// is nothing to say (a notification). It is the whole of the protocol, and
+// knows nothing of how the message arrived: headers is what came beside the
+// body on a transport that has such a thing, and nil on one that does not
+// (stdio), where everything a request has to say about itself is in it.
+func (h *hub) answer(ctx context.Context, c *caller, body []byte, headers http.Header) (int, *rpcResponse) {
+	fail := func(status int, id json.RawMessage, code int, msg string, data any) (int, *rpcResponse) {
+		return status, &rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg, Data: data}}
+	}
 	body = bytes.TrimSpace(body)
 	if len(body) > 0 && body[0] == '[' {
-		writeRPCError(w, http.StatusBadRequest, nil, codeInvalidRequest, "send one JSON-RPC message per request, not a batch", nil)
-		return
+		return fail(http.StatusBadRequest, nil, codeInvalidRequest, "send one JSON-RPC message at a time, not a batch", nil)
 	}
 	var req rpcRequest
 	if err := json.Unmarshal(body, &req); err != nil || req.JSONRPC != "2.0" {
-		writeRPCError(w, http.StatusBadRequest, nil, codeParse, "the body is not a JSON-RPC 2.0 message", nil)
-		return
+		return fail(http.StatusBadRequest, nil, codeParse, "that is not a JSON-RPC 2.0 message", nil)
 	}
 	if req.Method == "" || len(req.ID) == 0 || string(req.ID) == "null" {
 		// A notification, or a response to a request this server never
 		// makes: there is nothing to answer.
-		w.WriteHeader(http.StatusAccepted)
-		return
+		return http.StatusAccepted, nil
 	}
 
 	var params struct {
@@ -148,58 +163,57 @@ func (h *hub) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if raw, ok := params.Meta[metaVersion]; ok {
 		json.Unmarshal(raw, &bodyVersion)
 	}
-	headerVersion := r.Header.Get("MCP-Protocol-Version")
-
-	if bodyVersion == "" && (headerVersion == "" || isLegacy(headerVersion)) {
-		h.serveLegacy(r.Context(), w, c, &req)
-		return
+	headerVersion := ""
+	if headers != nil {
+		headerVersion = headers.Get("MCP-Protocol-Version")
 	}
-	h.serveModern(r.Context(), w, r, c, &req, params.Meta, headerVersion, bodyVersion)
+	if bodyVersion == "" && (headerVersion == "" || isLegacy(headerVersion)) {
+		return h.answerLegacy(ctx, c, &req)
+	}
+	return h.answerModern(ctx, c, &req, params.Meta, headers, headerVersion, bodyVersion)
 }
 
-// serveModern answers a request of the stateless revision, after holding
+// answerModern answers a request of the stateless revision, after holding
 // it to what that revision requires of a request.
-func (h *hub) serveModern(ctx context.Context, w http.ResponseWriter, r *http.Request, c *caller, req *rpcRequest,
-	meta map[string]json.RawMessage, headerVersion, bodyVersion string) {
-	bad := func(code int, msg string, data any) { writeRPCError(w, http.StatusBadRequest, req.ID, code, msg, data) }
-	switch {
-	case headerVersion == "":
-		bad(codeHeaderMismatch, "Header mismatch: the MCP-Protocol-Version header is required", nil)
-		return
-	case bodyVersion == "" && headerVersion != protoModern:
-		bad(codeBadVersion, "Unsupported protocol version", map[string]any{"supported": protoAll, "requested": headerVersion})
-		return
-	case bodyVersion == "":
-		bad(codeInvalidParams, "the request is missing _meta[\""+metaVersion+"\"]", nil)
-		return
-	case headerVersion != bodyVersion:
-		bad(codeHeaderMismatch, "Header mismatch: MCP-Protocol-Version header value '"+headerVersion+"' does not match body value '"+bodyVersion+"'", nil)
-		return
-	case bodyVersion != protoModern:
-		bad(codeBadVersion, "Unsupported protocol version", map[string]any{"supported": protoAll, "requested": bodyVersion})
-		return
+func (h *hub) answerModern(ctx context.Context, c *caller, req *rpcRequest, meta map[string]json.RawMessage,
+	headers http.Header, headerVersion, bodyVersion string) (int, *rpcResponse) {
+	bad := func(code int, msg string, data any) (int, *rpcResponse) {
+		return http.StatusBadRequest, &rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: code, Message: msg, Data: data}}
+	}
+	if headers != nil {
+		// What HTTP carries beside the body must agree with the body.
+		switch {
+		case headerVersion == "":
+			return bad(codeHeaderMismatch, "Header mismatch: the MCP-Protocol-Version header is required", nil)
+		case bodyVersion == "" && headerVersion != protoModern:
+			return bad(codeBadVersion, "Unsupported protocol version", map[string]any{"supported": protoAll, "requested": headerVersion})
+		case bodyVersion == "":
+			return bad(codeInvalidParams, "the request is missing _meta[\""+metaVersion+"\"]", nil)
+		case headerVersion != bodyVersion:
+			return bad(codeHeaderMismatch, "Header mismatch: MCP-Protocol-Version header value '"+headerVersion+"' does not match body value '"+bodyVersion+"'", nil)
+		}
+	}
+	if bodyVersion != protoModern {
+		return bad(codeBadVersion, "Unsupported protocol version", map[string]any{"supported": protoAll, "requested": bodyVersion})
 	}
 	if _, ok := meta[metaCapabilities]; !ok {
-		bad(codeInvalidParams, "the request is missing _meta[\""+metaCapabilities+"\"]", nil)
-		return
+		return bad(codeInvalidParams, "the request is missing _meta[\""+metaCapabilities+"\"]", nil)
 	}
-	if got := r.Header.Get("Mcp-Method"); got != req.Method {
-		bad(codeHeaderMismatch, "Header mismatch: Mcp-Method header value '"+got+"' does not match body value '"+req.Method+"'", nil)
-		return
+	if headers != nil {
+		if got := headers.Get("Mcp-Method"); got != req.Method {
+			return bad(codeHeaderMismatch, "Header mismatch: Mcp-Method header value '"+got+"' does not match body value '"+req.Method+"'", nil)
+		}
 	}
 
-	// decorate adds what every result of this revision carries.
-	decorate := func(result map[string]any) map[string]any {
+	// ok adds what every result of this revision carries.
+	ok := func(result map[string]any) (int, *rpcResponse) {
 		result["resultType"] = "complete"
 		result["_meta"] = map[string]any{metaServerInfo: serverInfo()}
-		return result
-	}
-	ok := func(result map[string]any) {
-		writeJSON(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: decorate(result)})
+		return http.StatusOK, &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
 	}
 	switch req.Method {
 	case "server/discover":
-		ok(map[string]any{
+		return ok(map[string]any{
 			"supportedVersions": protoAll,
 			"capabilities":      map[string]any{"tools": map[string]any{}},
 			"instructions":      instructions,
@@ -208,36 +222,36 @@ func (h *hub) serveModern(ctx context.Context, w http.ResponseWriter, r *http.Re
 		})
 	case "tools/list":
 		// The same for every caller, and it changes only with a release.
-		ok(map[string]any{"tools": toolList(), "ttlMs": 3_600_000, "cacheScope": "public"})
+		return ok(map[string]any{"tools": toolList(), "ttlMs": 3_600_000, "cacheScope": "public"})
 	case "tools/call":
 		name, args, err := callParams(req.Params)
 		if err != nil {
-			bad(codeInvalidParams, err.Error(), nil)
-			return
+			return bad(codeInvalidParams, err.Error(), nil)
 		}
-		if got := decodeHeaderValue(r.Header.Get("Mcp-Name")); got != name {
-			bad(codeHeaderMismatch, "Header mismatch: Mcp-Name header value '"+got+"' does not match body value '"+name+"'", nil)
-			return
+		if headers != nil {
+			if got := decodeHeaderValue(headers.Get("Mcp-Name")); got != name {
+				return bad(codeHeaderMismatch, "Header mismatch: Mcp-Name header value '"+got+"' does not match body value '"+name+"'", nil)
+			}
 		}
 		t := toolNamed(name)
 		if t == nil {
-			bad(codeInvalidParams, "Unknown tool: "+name, nil)
-			return
+			return bad(codeInvalidParams, "Unknown tool: "+name, nil)
 		}
-		ok(h.call(ctx, t, c, args))
-	default:
-		writeRPCError(w, http.StatusNotFound, req.ID, codeMethodNotFound, "Method not found: "+req.Method, nil)
+		return ok(h.call(ctx, t, c, args))
 	}
+	return http.StatusNotFound, &rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: codeMethodNotFound, Message: "Method not found: " + req.Method}}
 }
 
-// serveLegacy answers a client of the handshake revisions. The handshake
+// answerLegacy answers a client of the handshake revisions. The handshake
 // is answered and then not needed: no session is issued, and every request
 // after it is served on its own, like any other.
-func (h *hub) serveLegacy(ctx context.Context, w http.ResponseWriter, c *caller, req *rpcRequest) {
-	ok := func(result map[string]any) {
-		writeJSON(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result})
+func (h *hub) answerLegacy(ctx context.Context, c *caller, req *rpcRequest) (int, *rpcResponse) {
+	ok := func(result map[string]any) (int, *rpcResponse) {
+		return http.StatusOK, &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
 	}
-	fail := func(code int, msg string) { writeRPCError(w, http.StatusOK, req.ID, code, msg, nil) }
+	fail := func(code int, msg string) (int, *rpcResponse) {
+		return http.StatusOK, &rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: code, Message: msg}}
+	}
 	switch req.Method {
 	case "initialize":
 		var p struct {
@@ -248,31 +262,28 @@ func (h *hub) serveLegacy(ctx context.Context, w http.ResponseWriter, c *caller,
 		if isLegacy(p.ProtocolVersion) {
 			v = p.ProtocolVersion
 		}
-		ok(map[string]any{
+		return ok(map[string]any{
 			"protocolVersion": v,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      serverInfo(),
 			"instructions":    instructions,
 		})
 	case "ping":
-		ok(map[string]any{})
+		return ok(map[string]any{})
 	case "tools/list":
-		ok(map[string]any{"tools": toolList()})
+		return ok(map[string]any{"tools": toolList()})
 	case "tools/call":
 		name, args, err := callParams(req.Params)
 		if err != nil {
-			fail(codeInvalidParams, err.Error())
-			return
+			return fail(codeInvalidParams, err.Error())
 		}
 		t := toolNamed(name)
 		if t == nil {
-			fail(codeInvalidParams, "Unknown tool: "+name)
-			return
+			return fail(codeInvalidParams, "Unknown tool: "+name)
 		}
-		ok(h.call(ctx, t, c, args))
-	default:
-		fail(codeMethodNotFound, "Method not found: "+req.Method)
+		return ok(h.call(ctx, t, c, args))
 	}
+	return fail(codeMethodNotFound, "Method not found: "+req.Method)
 }
 
 func callParams(raw json.RawMessage) (name string, args json.RawMessage, err error) {
@@ -304,6 +315,7 @@ func (h *hub) call(ctx context.Context, t *tool, c *caller, args json.RawMessage
 	if len(bytes.TrimSpace(args)) == 0 || string(bytes.TrimSpace(args)) == "null" {
 		args = json.RawMessage("{}")
 	}
+	h.st.seeOthers()
 	out, err := t.run(ctx, h, c, args)
 	if err != nil {
 		var ask *errAsk

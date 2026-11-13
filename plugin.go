@@ -26,7 +26,7 @@ import (
 // can add a command but never replace one.
 //
 // A plugin starts in the directory the user ran gitty in, with the user's
-// environment plus four variables describing what gitty's own workspace
+// environment plus a few variables describing what gitty's own workspace
 // discovery found (see pluginEnv). No credential is among them: a plugin that
 // needs the API runs gitty, which resolves a token the way it always does.
 
@@ -39,6 +39,8 @@ const (
 	envPluginWorkspace = "GITTY_WORKSPACE" // the workspace's root directory
 	envPluginGroup     = "GITTY_GROUP"     // namespace path of the group the working directory is in
 	envPluginInstance  = "GITTY_INSTANCE"  // the instance URL from the workspace config
+	// The hub this workspace shares with is passed as GITTY_HUB (envHub):
+	// the caller's own value if they set one, the workspace config's if not.
 )
 
 // pluginNameRe is what a command must look like to be looked up as a plugin.
@@ -176,12 +178,15 @@ func isBuiltinCommand(name string) bool {
 }
 
 // pluginEnv builds the environment a plugin starts with: the caller's, with
-// the four GITTY_ variables set from what discovery finds for wd.
+// the GITTY_ variables set from what discovery finds for wd.
 //
 // The variables are always set, so a plugin can tell "started by gitty,
 // outside any workspace" (GITTY_BIN set, GITTY_WORKSPACE empty) from "not
 // started by gitty" (neither set), and a value inherited from an enclosing
-// gitty can never leak through. Being outside a workspace is not an error
+// gitty can never leak through. The one exception is GITTY_HUB, which is
+// the user's to set — it names a hub wherever gitty reads one — and so is
+// only filled in, from the workspace's config, when they have not.
+// Being outside a workspace is not an error
 // here — whether a workspace is needed is the plugin's business — but a
 // workspace that exists and was refused or could not be read is returned as
 // a note for the user, since the plugin would otherwise only be able to say
@@ -193,19 +198,27 @@ func pluginEnv(base []string, exe, wd string) (env []string, note error) {
 		envPluginGroup:     "",
 		envPluginInstance:  "",
 	}
+	hub := ""
 	if loc, err := locateWorkspace(wd); err == nil {
 		root, rootCfg := workspaceRoot(loc.ConfigDir, loc.Config)
 		values[envPluginWorkspace] = root
 		values[envPluginGroup] = loc.Group()
 		values[envPluginInstance] = rootCfg.URL
+		hub = rootCfg.Hub
 	} else if !errors.Is(err, errNoWorkspace) {
 		note = err
 	}
 
-	env = make([]string, 0, len(base)+len(values))
+	env = make([]string, 0, len(base)+len(values)+1)
 	for _, kv := range base {
-		if name, _, ok := strings.Cut(kv, "="); ok {
+		if name, value, ok := strings.Cut(kv, "="); ok {
 			if _, ours := values[name]; ours {
+				continue
+			}
+			if name == envHub {
+				if value != "" {
+					hub = value
+				}
 				continue
 			}
 		}
@@ -214,6 +227,7 @@ func pluginEnv(base []string, exe, wd string) (env []string, note error) {
 	for _, name := range []string{envPluginBin, envPluginWorkspace, envPluginGroup, envPluginInstance} {
 		env = append(env, name+"="+values[name])
 	}
+	env = append(env, envHub+"="+hub)
 	return env, note
 }
 

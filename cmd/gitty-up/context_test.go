@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"gitty/internal/contract"
 )
@@ -455,40 +458,95 @@ func TestNotesAreBounded(t *testing.T) {
 	}
 }
 
-// A log cut short by a crash loses its last line and nothing else.
+// A log cut short by a crash loses its last line and nothing else, and goes
+// on being a log: the torn end is cut off, not written after.
 func TestNotesLogSurvivesATornLine(t *testing.T) {
 	h := stocked(t, true)
 	h.call(t, "", "gitty_note", `{"path":"acme/shop/web","kind":"account","text":"kept"}`)
-	h.st.close()
 	path := filepath.Join(h.dir, "notes.jsonl")
 	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	f.WriteString(`{"v":1,"seq":2,"slot":"acc`)
 	f.Close()
-	again, err := openStore(h.dir, h.fake.srv.URL)
-	if err != nil {
-		t.Fatalf("a torn last line must not stop the hub: %v", err)
+
+	for round := 1; round <= 2; round++ {
+		again, err := openStore(h.dir, h.fake.srv.URL)
+		if err != nil {
+			t.Fatalf("start %d after a torn write: %v", round, err)
+		}
+		if a := again.book.current(nodeKey{nodeKindProject, 20}, slotAccount); a == nil || a.Text != "kept" {
+			t.Errorf("start %d: account = %+v", round, a)
+		}
+		again.mu.Lock()
+		_, err = again.record(func(b *notebook) (*note, error) {
+			return b.prepare(again.project("acme/shop/api"), nodeKindProject, noteRequest{Slot: slotCaveat, Text: fmt.Sprintf("after %d", round)}, "x", 0, testNow)
+		})
+		again.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	if a := again.book.current(nodeKey{nodeKindProject, 20}, slotAccount); a == nil || a.Text != "kept" {
-		t.Errorf("account = %+v", a)
+	log, _ := os.ReadFile(path)
+	if strings.Contains(string(log), `"slot":"acc`+"\n") || strings.Count(string(log), "\n") != 3 {
+		t.Errorf("the log should hold three whole notes and no torn one:\n%s", log)
 	}
-	// The next note starts on a line of its own.
-	again.mu.Lock()
-	n, err := again.book.prepare(again.project("acme/shop/api"), nodeKindProject, noteRequest{Slot: slotAccount, Text: "after"}, "x", 0, testNow)
-	if err == nil {
-		err = again.appendNote(n)
+	// A line that is whole and still not a note is damage, and is said.
+	os.WriteFile(path, append([]byte("not a note\n"), log...), 0o644)
+	if _, err := openStore(h.dir, h.fake.srv.URL); err == nil || !strings.Contains(err.Error(), "damaged") {
+		t.Errorf("a damaged line in the log: %v", err)
 	}
-	again.mu.Unlock()
-	again.close()
-	if err != nil {
-		t.Fatal(err)
+}
+
+// Two servers on one directory — one person, two agent sessions — see each
+// other's notes and facts, and never give two notes the same number.
+func TestSeveralServersShareOneDirectory(t *testing.T) {
+	a := stocked(t, true)
+	a.st.several = true
+	b := openTestHub(t, a.fake, a.dir, true)
+	b.st.several = true
+
+	a.call(t, "", "gitty_note", `{"path":"acme/shop/web","kind":"account","text":"said in the first session"}`)
+	if out := b.call(t, "", "gitty_outline", `{"path":"acme/shop/web"}`).text(); !strings.Contains(out, "said in the first session") {
+		t.Errorf("the second session does not see the first one's note:\n%s", out)
 	}
-	third, err := openStore(h.dir, h.fake.srv.URL)
-	if err == nil {
-		defer third.close()
+	said := b.call(t, "", "gitty_note", `{"path":"acme/shop/web","kind":"caveat","text":"said in the second"}`).text()
+	wantText(t, "the second session's note", said, "Recorded as #2")
+	said = a.call(t, "", "gitty_note", `{"path":"acme/shop/web","kind":"account","text":"said again in the first"}`).text()
+	wantText(t, "numbered after both", said, "Recorded as #3", "in place of #1")
+	out := b.call(t, "", "gitty_outline", `{"path":"acme/shop/web"}`).text()
+	wantText(t, "both sessions agree", out, "said again in the first", "said in the second")
+	refuseText(t, "both sessions agree", out, "said in the first session")
+
+	// Facts one session's gitty sent are there for the other.
+	a.mustPut(t, facts(22, "acme/shop/dusty", "d1", 1, link("acme/shop/api", contract.KindDepends, "go.mod:4", "")))
+	os.Chtimes(filepath.Join(a.dir, "facts"), testNow, testNow.Add(time.Hour)) // a coarse clock must not hide the change
+	if out := b.call(t, "", "gitty_outline", `{"path":"acme/shop/api"}`).text(); !strings.Contains(out, "- acme/shop/dusty · depends (go.mod:4)") {
+		t.Errorf("the second session does not see facts sent to the first:\n%s", out)
 	}
-	if err == nil || !strings.Contains(err.Error(), "damaged") {
-		// The torn line is now in the middle: that is damage, and is said.
-		t.Errorf("a damaged line in the middle of the log: %v", err)
+
+	// Many at once, from both: every note gets a number of its own.
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			hub := a
+			if i%2 == 1 {
+				hub = b
+			}
+			hub.call(t, "", "gitty_note", fmt.Sprintf(`{"path":"acme/shop/api","kind":"caveat","text":"at once %d"}`, i))
+		}(i)
+	}
+	wg.Wait()
+	log, _ := os.ReadFile(filepath.Join(a.dir, "notes.jsonl"))
+	seen := map[string]bool{}
+	for _, m := range regexp.MustCompile(`"seq":(\d+)`).FindAllStringSubmatch(string(log), -1) {
+		if seen[m[1]] {
+			t.Errorf("two notes share the number %s:\n%s", m[1], log)
+		}
+		seen[m[1]] = true
+	}
+	if len(seen) != 15 {
+		t.Errorf("the log holds %d notes, want 15", len(seen))
 	}
 }
 
@@ -499,11 +557,12 @@ func TestCommandLine(t *testing.T) {
 		var out, errOut strings.Builder
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // nothing here is meant to get as far as serving
-		code := run(ctx, args, &out, &errOut)
+		code := run(ctx, args, strings.NewReader(""), &out, &errOut)
 		return code, out.String() + errOut.String()
 	}
-	t.Setenv("GITLAB_TOKEN", "")
-	t.Setenv(envInstance, "")
+	for _, name := range []string{"GITLAB_TOKEN", envInstance, envGroup, envHub, "GITTY_BIN", "GITTY_WORKSPACE"} {
+		t.Setenv(name, "")
+	}
 	tests := []struct {
 		args []string
 		code int
@@ -519,6 +578,14 @@ func TestCommandLine(t *testing.T) {
 		{[]string{"--url=https://gitlab.example.com", "--anon", "--refresh=5s"}, 2, "at least 1m"},
 		{[]string{"--url=https://gitlab.example.com", "--anon", "extra"}, 2, "unexpected argument"},
 		{[]string{"--help"}, 0, "Usage: gitty up"},
+		{[]string{"--url=https://gitlab.com", "--anon"}, 2, "name the groups to cover with --group"},
+		{[]string{"--url=https://gitlab.com", "--anon", "--stdio"}, 2, "name the groups to cover with --group"},
+		{[]string{"--url=https://gitlab.example.com", "--anon", "--hub=https://hub.example.com"}, 2, "are for --stdio"},
+		{[]string{"--stdio", "--own", "--hub=https://hub.example.com"}, 2, "cannot be combined"},
+		{[]string{"--stdio"}, 2, "Start this server inside a gitty workspace"},
+		{[]string{"--stdio", "--hub=https://hub.example.com"}, 2, "a GitLab token is required to speak to the hub"},
+		{[]string{"--stdio", "--hub=http://hub.example.com", "--token=x"}, 2, "plain http"},
+		{[]string{"--stdio", "--hub=nonsense", "--anon"}, 2, "not the address of a hub"},
 	}
 	for _, tt := range tests {
 		if code, out := run(tt.args...); code != tt.code || !strings.Contains(out, tt.want) {

@@ -261,11 +261,10 @@ func runNote(ctx context.Context, h *hub, c *caller, raw json.RawMessage) (strin
 		}
 		req.Evidence = append(req.Evidence, ev)
 	}
-	n, err := s.book.prepare(target, kind, req, c.Name, level, h.now())
+	n, err := s.record(func(b *notebook) (*note, error) {
+		return b.prepare(target, kind, req, c.Name, level, h.now())
+	})
 	if err != nil {
-		return "", err
-	}
-	if err := s.appendNote(n); err != nil {
 		return "", err
 	}
 

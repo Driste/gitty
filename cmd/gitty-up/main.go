@@ -5,9 +5,12 @@
 // walks by reasoning.
 //
 // It is started as `gitty up` — gitty finds this binary beside itself or on
-// PATH and runs it in its own place — once for an instance, and left
-// running. Agents reach it by URL; `gitty`, told where it is, sends it what
-// it reads from the checkouts it manages.
+// PATH and runs it in its own place. Started once for an instance and left
+// running, agents reach it by URL, and `gitty`, told where it is, sends it
+// what it reads from the checkouts it manages. Started with --stdio by an
+// agent's host, it serves that one agent over stdin and stdout: from the
+// team's hub when the workspace names one, and as a hub of its own when not
+// (see stdio.go).
 //
 // It reads no repository itself. What it knows of a repository was sent by
 // a gitty that had it checked out, and what it knows beyond that was either
@@ -20,6 +23,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -40,13 +44,18 @@ import (
 // way gitty's is; the two are released together.
 var version = "dev"
 
-// envInstance is set by gitty when it starts a plugin inside a workspace.
-const envInstance = "GITTY_INSTANCE"
+// What gitty says about where it started this plugin, and one thing the user
+// may say themselves.
+const (
+	envInstance = "GITTY_INSTANCE" // the workspace's instance
+	envGroup    = "GITTY_GROUP"    // the group the working directory is in
+	envHub      = "GITTY_HUB"      // the hub the workspace names, or the user does
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 // repeated collects a flag given several times, or once with commas.
@@ -62,7 +71,7 @@ func (r *repeated) Set(v string) error {
 	return nil
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("gitty up", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	instance := fs.String("url", os.Getenv(envInstance), "The GitLab instance (default: the workspace's, when started as `gitty up` inside one)")
@@ -73,17 +82,23 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	noAuth := fs.Bool("no-auth", false, "Do not ask callers for a token. Only allowed on a loopback address: for one person's own machine")
 	refresh := fs.Duration("refresh", 30*time.Minute, "How often the instance is listed again")
 	quietDays := fs.Int("quiet-after", 365, "Days without activity after which a project is set aside as unmaintained (0: never)")
+	stdio := fs.Bool("stdio", false, "Serve one agent over stdin and stdout instead of listening on an address: for a host that starts the server itself")
+	teamHub := fs.String("hub", "", "With --stdio: the address of the team's hub to serve from (default: the one the workspace's config names; with none, --stdio is a hub of its own)")
+	own := fs.Bool("own", false, "With --stdio: be a hub of its own even where the workspace names a team's")
 	showVersion := fs.Bool("version", false, "Print the version and exit")
 	var groups, origins repeated
 	fs.Var(&groups, "group", "Cover only this top-level group or subgroup (repeatable, or comma-separated). Default: every group the token sees")
 	fs.Var(&origins, "allow-origin", "A web origin allowed to call the hub from a browser (repeatable)")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: gitty up [--url=<instance>] [--listen=<addr>] [--group=<path>]... [flags]")
-		fmt.Fprintln(stderr, "\nRuns the instance's shared context: what its projects are, what they provide,")
-		fmt.Fprintln(stderr, "what uses what, and what agents working there have noted. Agents reach it")
-		fmt.Fprintln(stderr, "over MCP at http://<addr>/mcp, with a token of the instance as a bearer token.")
-		fmt.Fprintln(stderr, "gitty sends it what it reads from checkouts when a workspace's config names it:")
-		fmt.Fprintln(stderr, "\n    hub = 'http://<addr>'")
+		fmt.Fprintln(stderr, "Usage: gitty up --stdio [flags]                                   for an agent's host to start")
+		fmt.Fprintln(stderr, "       gitty up [--url=<instance>] [--listen=<addr>] [flags]      as a service for a team")
+		fmt.Fprintln(stderr, "\nServes the instance's shared context over MCP: what its projects are, what")
+		fmt.Fprintln(stderr, "they provide, what uses what, and what agents working there have noted.")
+		fmt.Fprintln(stderr, "\nWith --stdio it serves one agent over stdin and stdout, started by the agent's")
+		fmt.Fprintln(stderr, "host inside a gitty workspace. It serves from the team's hub if the workspace's")
+		fmt.Fprintln(stderr, "config names one (hub = 'https://...'), and is a hub of its own if not.")
+		fmt.Fprintln(stderr, "\nWithout it, it is that team hub: agents reach it at http://<addr>/mcp with a")
+		fmt.Fprintln(stderr, "token of the instance as a bearer token, and gitty sends it what checkouts say.")
 		fmt.Fprintln(stderr, "\nFlags:")
 		fs.PrintDefaults()
 	}
@@ -104,14 +119,54 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() > 0 {
 		return usage("unexpected argument %q", fs.Arg(0))
 	}
-	if *instance == "" {
-		return usage("which instance? Pass --url=https://gitlab.example.com, or run `gitty up` inside a gitty workspace")
-	}
 	if *anon && *token != "" {
 		return usage("--anon and --token cannot be combined")
 	}
 	if *token == "" && !*anon {
 		*token = os.Getenv("GITLAB_TOKEN")
+	}
+	if !*stdio && (*teamHub != "" || *own) {
+		return usage("--hub and --own are for --stdio; without --stdio this is a hub itself, and listens on --listen")
+	}
+	if *own && *teamHub != "" {
+		return usage("--own and --hub cannot be combined")
+	}
+	// Which hub a workspace uses is in its config, and gitty passes it on.
+	// Someone running the team's hub from inside such a workspace is not
+	// asking to be served by it.
+	if *stdio && !*own && *teamHub == "" {
+		*teamHub = os.Getenv(envHub)
+	}
+
+	var logMu sync.Mutex
+	logf := func(format string, a ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		fmt.Fprintf(stderr, time.Now().Format("15:04:05")+" "+format+"\n", a...)
+	}
+
+	// For one agent, from the team's hub: nothing is kept or listed here.
+	if *stdio && *teamHub != "" {
+		if *token == "" && !*anon {
+			return usage("a GitLab token is required to speak to the hub at %s (GITLAB_TOKEN, in the environment the host starts this server in); --anon sends none", *teamHub)
+		}
+		b, err := newBridge(*teamHub, *token, logf)
+		if err != nil {
+			return usage("%v", err)
+		}
+		go b.check(ctx)
+		if err := serveStdio(ctx, stdin, stdout, b.answer); err != nil {
+			logf("%v", err)
+			return 1
+		}
+		return 0
+	}
+
+	if *instance == "" {
+		if *stdio {
+			return usage("which instance? Start this server inside a gitty workspace (the host's working directory for it), or pass --url=https://gitlab.example.com")
+		}
+		return usage("which instance? Pass --url=https://gitlab.example.com, or run `gitty up` inside a gitty workspace")
 	}
 	if *token == "" && !*anon {
 		return usage("a token to list the instance with is required (--token or GITLAB_TOKEN); --anon lists what is public without one")
@@ -127,15 +182,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return usage("--no-auth lets anyone who can reach the hub read it and write to it, so it is only allowed on a loopback address (127.0.0.1), not %q", host)
 	}
 
-	var logMu sync.Mutex
-	logf := func(format string, a ...any) {
-		logMu.Lock()
-		defer logMu.Unlock()
-		fmt.Fprintf(stderr, time.Now().Format("15:04:05")+" "+format+"\n", a...)
-	}
 	gl, err := newGitLab(*instance, *token, logf)
 	if err != nil {
 		return usage("%v", err)
+	}
+	// An organization's own instance is covered whole. gitlab.com is not
+	// one organization's, and has more groups than can be listed: there the
+	// groups are named, or are the one the workspace is in.
+	if len(groups) == 0 && strings.EqualFold(gl.host, "gitlab.com") {
+		top, _, _ := strings.Cut(os.Getenv(envGroup), "/")
+		if !*stdio || top == "" {
+			return usage("gitlab.com is not one organization's instance and cannot be listed whole: name the groups to cover with --group")
+		}
+		groups = repeated{top}
+		logf("gitlab.com is listed a group at a time: covering %s, where this was started (--group names others)", top)
 	}
 	dir := *data
 	if dir == "" {
@@ -151,9 +211,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	defer st.close()
 
 	h := &hub{
-		st: st, gl: gl, auth: newAuthenticator(gl, *noAuth),
+		st: st, gl: gl, auth: newAuthenticator(gl, *noAuth || *stdio),
 		quietAfter: time.Duration(*quietDays) * 24 * time.Hour,
 		now:        time.Now, logf: logf,
+	}
+	if *stdio {
+		return runOwnHub(ctx, h, groups, *refresh, *token, *anon, dir, stdin, stdout)
 	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -249,4 +312,110 @@ func defaultDataDir(host string) (string, error) {
 	}
 	safe := strings.NewReplacer(":", "_", "/", "_").Replace(host)
 	return filepath.Join(base, "gitty-up", safe), nil
+}
+
+// identifyWait is how long a hub of one's own waits to learn whose token it
+// was started with. The instance is asked while the client is greeted, and
+// only a tool call — the first thing done in someone's name — waits for the
+// answer, and not for long: an instance that is down is no reason to keep
+// an agent from what is already known.
+var identifyWait = 5 * time.Second
+
+// runOwnHub serves one agent over stdio from a hub of its own: this
+// person's, kept in their data directory and shared by every session they
+// start. It lists the instance and has gitty tell it what the workspace's
+// checkouts say, now and each time the listing is taken again; the agent is
+// answered from the start, with whatever is known so far.
+func runOwnHub(ctx context.Context, h *hub, groups []string, refresh time.Duration, token string, anon bool,
+	dir string, stdin io.Reader, stdout io.Writer) int {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	h.st.several = true
+
+	env := readStdioEnv()
+	h.logf("gitty-up %s for %s, serving over stdio from a hub of your own", version, h.gl.host)
+	h.logf("data in %s: %d projects, %d with their repository read", dir, len(h.st.projects), len(h.st.facts))
+	if env.gittyBin == "" || env.workspace == "" {
+		h.logf("not started by gitty inside a workspace: the listing and notes are served, and no checkout is read")
+	}
+
+	// Notes are signed. Here the caller is whoever started the server: the
+	// instance is asked for their name, once.
+	me, refused, known := &caller{Name: "anonymous"}, false, make(chan struct{})
+	go func() {
+		defer close(known)
+		if anon {
+			return
+		}
+		asked, cancel := context.WithTimeout(ctx, identifyWait)
+		defer cancel()
+		u, err := h.gl.whoIs(asked, token)
+		switch status := statusOf(err); {
+		case err == nil && u.Username != "":
+			me = &caller{Name: u.Username, ID: u.ID, External: u.External, token: token}
+			h.logf("notes are signed @%s", me.Name)
+		case err == nil, status == http.StatusUnauthorized, status == http.StatusForbidden:
+			h.logf("%s does not accept the token this server was started with (GITLAB_TOKEN): stopping", h.gl.host)
+			refused = true
+			stop()
+		case ctx.Err() == nil:
+			h.logf("could not ask %s whose token this is (%v): notes are signed \"me\"", h.gl.host, err)
+			me = &caller{Name: "me", token: token}
+		}
+	}()
+	answerAs := h.answerLine
+	answer := func(ctx context.Context, line []byte) []byte {
+		var msg struct {
+			Method string `json:"method"`
+		}
+		json.Unmarshal(line, &msg)
+		if msg.Method != "tools/call" {
+			return answerAs(&caller{Name: "anonymous"})(ctx, line)
+		}
+		select {
+		case <-known:
+			return answerAs(me)(ctx, line)
+		case <-ctx.Done():
+			return nil
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			started := time.Now()
+			if err := h.st.list(ctx, h.gl, groups, time.Now()); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				h.logf("listing %s failed: %v (keeping what is held; trying again in %s)", h.gl.host, err, refresh)
+			} else {
+				h.st.mu.RLock()
+				h.logf("listed %s in %s: %d projects in %d groups", h.gl.host, time.Since(started).Round(time.Millisecond), len(h.st.projects), len(h.st.groups))
+				h.st.mu.RUnlock()
+				if env.gittyBin != "" && env.workspace != "" {
+					h.shareWorkspace(ctx, env.gittyBin, env.workspace, token, anon)
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(refresh):
+			}
+		}
+	}()
+
+	code := 0
+	if err := serveStdio(ctx, stdin, stdout, answer); err != nil {
+		h.logf("%v", err)
+		code = 1
+	}
+	stop()
+	wg.Wait()
+	if <-known; refused {
+		code = 2
+	}
+	return code
 }

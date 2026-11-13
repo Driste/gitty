@@ -46,6 +46,17 @@
 - [x] T140 `gitty up` on gitlab.com groups, anonymous; share from a real
       workspace; walk it over HTTP.
 
+## Phase F — a local command
+
+- [x] T150 The protocol answers a message without knowing its transport.
+- [x] T151 The notes log is safe for several processes on one directory.
+- [x] T152 `gitty up --stdio`: lines in, lines out, stop when stdin closes.
+- [x] T153 A hub of one's own: background listing, the user's name asked
+      once, `gitty share` through a loopback door after each listing.
+- [x] T154 A bridge to the team's hub; gitty passes the workspace's `hub`
+      to plugins as `GITTY_HUB`.
+- [x] T155 Tests for both; a run under opencode as a `local` server.
+
 ## As built
 
 - The hub's GitLab calls are a handful of GETs over `net/http`; it does not
@@ -64,6 +75,14 @@
   groups, in 18 s once pages were fetched side by side (86 s one at a time).
   The whole group tree of that listing is one answer of 31 KB, about 7,800
   tokens. Sharing a workspace of six checkouts takes 0.6 s.
+- T155: opencode 1.19.5 starts `gitty up --stdio` as a `local` server and
+  reports it connected. Against gitlab.com, anonymous, in a workspace under
+  `components`: 86 projects listed in 1.4 s, and the workspace's checkouts
+  read 12 s after start; the agent is answered throughout. Not checked: a
+  model session calling the tools, and a token against a real instance.
+- A hub of one's own covers public and internal projects only, like a
+  team's. Covering the private projects its one user can see would be safe
+  there and is not built.
 - Not built: reading policy scopes, OAuth for MCP clients, private
   projects, verification on the hub's side that a commit it is sent is the
   default branch's (gitty checks this before sending; the hub trusts an

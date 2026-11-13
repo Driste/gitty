@@ -56,6 +56,14 @@ as the tree the instance already is, that the next agent walks by reasoning.
 - Q: When an agent's account and a repository disagree? → A: **The
   repository is the authority.**
 
+### Session 2026-11-13
+
+- Q: Must a hub be deployed before an agent can use any of this? → A: **No.
+  A host starts it with a local command**, the way it starts any MCP server
+  it runs itself: `gitty up --stdio`. Where the workspace names a team's
+  hub, that command serves from it. Where it names none, the command is a
+  hub of the user's own.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Find what the organization already has (Priority: P1)
@@ -295,6 +303,21 @@ group, the service's outline names all three under the right headings.
   no command left to refresh it, the workspace index MUST keep itself: it
   lists the instance again when its listing is a day old and the instance
   can be reached.
+
+- **FR-016**: `gitty up --stdio` MUST serve MCP over stdin and stdout, one
+  message a line, with nothing but the protocol on stdout, and stop when its
+  stdin closes. It MUST need no configuration in the host beyond the command
+  itself: the instance comes from the workspace it is started in and the
+  token from `GITLAB_TOKEN`.
+- **FR-017**: Started in a workspace whose config names a hub, `gitty up
+  --stdio` MUST serve from that hub with the user's own token, keep nothing
+  locally, and hold the token to FR-007's rule: https, or this machine.
+- **FR-018**: Started where no hub is named, `gitty up --stdio` MUST be a
+  hub of the user's own: it lists the instance, has `gitty` submit what the
+  workspace's checkouts say (FR-007's rule for what counts), signs notes
+  with the name the instance gives the user's token, and keeps everything
+  in the user's data directory, which several sessions MUST be able to use
+  at once. The handshake MUST NOT wait on the instance.
 
 ### Key Entities
 

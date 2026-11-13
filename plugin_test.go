@@ -243,6 +243,32 @@ func TestPluginEnv(t *testing.T) {
 		}
 	})
 
+	t.Run("the workspace's hub is passed on, and the user's own wins", func(t *testing.T) {
+		hubbed := filepath.Join(root, "hubbed")
+		writeConfigAt(t, hubbed, Config{URL: instance, HTTP: true, RootPath: "acme", Hub: "https://hub.example.com"})
+		for _, tt := range []struct {
+			name, wd, want string
+			base           []string
+		}{
+			{"from the config", hubbed, "https://hub.example.com", base},
+			{"the user's own", hubbed, "https://mine.example.com", append([]string{envHub + "=https://mine.example.com"}, base...)},
+			{"an empty one of the user's is none", hubbed, "https://hub.example.com", append([]string{envHub + "="}, base...)},
+			{"a workspace that names none", deep, "", base},
+			{"the user's own, outside any workspace", root, "https://mine.example.com", append([]string{envHub + "=https://mine.example.com"}, base...)},
+		} {
+			env, _ := pluginEnv(tt.base, "/opt/gitty/gitty", tt.wd)
+			n := 0
+			for _, kv := range env {
+				if strings.HasPrefix(kv, envHub+"=") {
+					n++
+				}
+			}
+			if got, _ := envValue(env, envHub); got != tt.want || n != 1 {
+				t.Errorf("%s: %s = %q, set %d times; want %q, once", tt.name, envHub, got, n, tt.want)
+			}
+		}
+	})
+
 	t.Run("outside any workspace", func(t *testing.T) {
 		env, note := pluginEnv(base, "/opt/gitty/gitty", root)
 		if note != nil {

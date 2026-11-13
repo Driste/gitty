@@ -138,6 +138,34 @@ note it also asks, with the caller's token, whether they can see the node and
 how they stand on it. `--no-auth` skips all of this and is refused on
 anything but a loopback address.
 
+### MCP over stdio
+
+`gitty up --stdio` is the same protocol with lines for a transport: one
+JSON-RPC message a line each way, answered in order, and no headers, so a
+request of 2026-07-28 is held only to what its body says. `mcp.go` answers a
+message without knowing how it arrived; HTTP and stdio are two callers of it.
+
+What it serves from is decided once, at start:
+
+- **A team's hub** (`--hub`, else `GITTY_HUB`, which gitty sets from the
+  workspace's config). Each line is POSTed to that hub's `/mcp` with the
+  user's token and the headers HTTP requires, built from the message; the
+  answer is passed back as it is. An answer the hub could not tie to its
+  question is given the question's id. Nothing is listed or stored here.
+- **A hub of one's own** (no hub named, or `--own`). The same store, in the
+  user's data directory, with one caller. The instance is listed in the
+  background and asked once whose token this is; only the first tool call
+  waits for that name, briefly. After each listing the server opens a
+  loopback listener under an unguessable path and runs `gitty share` at it,
+  so checkouts reach it through the same door, and the same rules, as a
+  team's hub. On gitlab.com, which cannot be listed whole, it covers the
+  top-level group it was started in.
+
+Several sessions share one data directory. The notes log is appended under
+a lock file and replayed from where each process last read, so a note
+recorded in one session is seen in the others and numbers are never given
+twice. A line torn by a crash is cut off at the next start.
+
 ## Source layout
 
 ```text
@@ -148,7 +176,9 @@ cmd/gitty-up/
   standing.go  use, upkeep, order
   render.go    tree, browse, search, outline as text
   notes.go     slots and their rules
-  mcp.go       JSON-RPC over HTTP, both protocol eras
+  mcp.go       JSON-RPC, both protocol eras, whatever carried the message
+  stdio.go     --stdio: lines for a transport, the bridge to a team's hub,
+               the door gitty shares through
   api.go       /v1/want, /v1/facts, /v1/info for gitty
 internal/contract/contract.go   + Facts, Provided, the hub's wire types, KindDeploys
 scan.go        + provides, deployment configuration
@@ -167,6 +197,7 @@ Removed: `cmd/gitty-mcp/`, `context.go`, `briefing.go`, `indexcmd.go`, the
 | **C** | `gitty share`, the `hub` key, share after sync and fetch |
 | **D** | Retire `gitty-mcp` and the local context commands; docs; release |
 | **E** | Live check against gitlab.com |
+| **F** | `gitty up --stdio`: a local command for a host to start |
 
 ## Not in this plan
 
